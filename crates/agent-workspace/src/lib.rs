@@ -28,7 +28,10 @@ mod runtime_facts;
 mod storage_faults;
 
 pub use agent_contracts::{ArtifactLocator, MAX_ARTIFACT_REFERENCE_BYTES};
-pub use broker::WorkspaceOutputBroker;
+pub use broker::{
+    WINDOW_TRUNCATED_METADATA_KEY, WorkspaceOutputBroker,
+    invalidate_file_read_window_after_body_clip,
+};
 pub use confined::{ConfinedDir, ConfinedFile};
 pub use handles::{ArtifactStoreHandle, ConfinedWorkspaceHandle};
 pub use journal::WorkspaceEffectRecovery;

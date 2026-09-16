@@ -22,6 +22,12 @@ use crate::{MAX_ARTIFACT_REFERENCE_BYTES, Workspace};
 /// marker that names the field, the original size and (when present) the
 /// artifact reference, so truncation is always honest and the full content
 /// stays reachable.
+///
+/// The marker itself is inside the declared budget: the returned string is
+/// never longer than `limit` characters, even when `limit` cannot hold the
+/// whole marker (degenerate budgets such as 0 or 1). In that case the most
+/// honest prefix of the marker that fits is returned and no body content
+/// is kept, so the cap always wins over the preview.
 fn truncate_with_marker(value: &str, limit: usize, field: &str, location: Option<&str>) -> String {
     let char_count = value.chars().count();
     if char_count <= limit {
@@ -38,13 +44,47 @@ fn truncate_with_marker(value: &str, limit: usize, field: &str, location: Option
         "\n...[output broker truncated {field} from {char_count} chars to the {limit}-char cap.{reference}]...\n"
     );
     let marker_chars = marker.chars().count();
-    let content_budget = limit.saturating_sub(marker_chars);
+    if marker_chars > limit {
+        return marker.chars().take(limit).collect();
+    }
+    let content_budget = limit - marker_chars;
     let head_budget = content_budget / 2;
     let tail_budget = content_budget.saturating_sub(head_budget);
     let head: String = value.chars().take(head_budget).collect();
     let mut tail: Vec<char> = value.chars().rev().take(tail_budget).collect();
     tail.reverse();
     format!("{head}{marker}{}", tail.into_iter().collect::<String>())
+}
+
+/// Metadata key stamped by every trusted conversion that cuts the
+/// model-facing body of an output declaring a file-read window.
+/// `file_read_window_from_output` consumers treat this flag as "the
+/// declared range is an upper bound, not proof the model saw it".
+pub const WINDOW_TRUNCATED_METADATA_KEY: &str = "window_truncated";
+
+/// A trusted conversion that changes the model-visible body must update the
+/// projection facts that body used to prove (E1). When an output whose
+/// metadata declares a file-read window (`start_line`/`end_line`/
+/// `covers_file`) has its body clipped after capture, the declared range no
+/// longer spans the model-visible bytes: stamp
+/// [`WINDOW_TRUNCATED_METADATA_KEY`] so downstream window derivation
+/// downgrades the window to incomplete and revokes its whole-file coverage.
+///
+/// The source version identity (`path`/`revision`) is untouched. Outputs
+/// that declare no file-read window are left alone, and the stamp is
+/// idempotent for producers that already reported their own clipping.
+/// Shared by the composition-root broker and the runtime last-line guard so
+/// both trusted clipping exits uphold the same rule.
+pub fn invalidate_file_read_window_after_body_clip(output: &mut ToolOutput) {
+    let claims_window = ["start_line", "end_line", "covers_file"]
+        .iter()
+        .any(|key| output.metadata.get(*key).is_some());
+    if !claims_window {
+        return;
+    }
+    if let Some(object) = output.metadata.as_object_mut() {
+        object.insert(WINDOW_TRUNCATED_METADATA_KEY.to_string(), Value::Bool(true));
+    }
 }
 
 /// Bound the metadata value: keep it as-is when its serialized size fits,
@@ -112,7 +152,6 @@ impl OutputBroker for WorkspaceOutputBroker {
         // 1. Every field gets its own cap; the marker names what was cut.
         output.summary =
             truncate_with_marker(&output.summary, MAX_TOOL_SUMMARY_CHARS, "summary", None);
-        output.metadata = bound_metadata(std::mem::take(&mut output.metadata));
 
         // 2. A producer-supplied locator is untrusted. For content that stays
         //    inline, keep only a normalized, current-run, pinned-readable
@@ -121,6 +160,7 @@ impl OutputBroker for WorkspaceOutputBroker {
         //    below receives a fresh broker-owned spill and replaces it.
         let char_count = output.model_content.chars().count();
         let mut broker_spilled = false;
+        let mut body_clipped = false;
         if char_count > content_cap {
             output.artifact_ref = self
                 .workspace
@@ -139,9 +179,19 @@ impl OutputBroker for WorkspaceOutputBroker {
                 "model_content",
                 output.artifact_ref.as_deref(),
             );
+            body_clipped = true;
         } else if let Some(reference) = output.artifact_ref.take() {
             output.artifact_ref = self.normalized_reference_for_run(run_id, &reference).await;
         }
+
+        // 2b. The clip changed the model-visible body: revoke the projection
+        //     coverage the original body proved (E1). This happens BEFORE the
+        //     metadata cap below, so the bounded metadata is re-checked with
+        //     the stamp included and the envelope budget holds afterwards.
+        if body_clipped {
+            invalidate_file_read_window_after_body_clip(&mut output);
+        }
+        output.metadata = bound_metadata(std::mem::take(&mut output.metadata));
 
         // 3. Decoded-total cap: even when each field individually fits, the
         //    combined model-facing view must stay bounded. Trim content
@@ -175,6 +225,10 @@ impl OutputBroker for WorkspaceOutputBroker {
                 "model_content",
                 output.artifact_ref.as_deref(),
             );
+            // The same trusted clip, the same invalidation rule — and the
+            // stamped metadata must satisfy its budget again.
+            invalidate_file_read_window_after_body_clip(&mut output);
+            output.metadata = bound_metadata(std::mem::take(&mut output.metadata));
         }
         output
     }
@@ -485,5 +539,214 @@ mod tests {
             MAX_TOOL_MODEL_CONTENT_CHARS,
             "a declaration can never exceed the global hard cap"
         );
+    }
+
+    /// E1: when the broker clips the model-visible body of an output that
+    /// declares a file-read window, the stale window facts must be
+    /// invalidated in the same trusted exit — otherwise an incomplete
+    /// preview could later act as whole-file coverage and hide historical
+    /// bodies. The source version identity stays untouched.
+    #[tokio::test]
+    async fn clipping_the_body_invalidates_the_declared_file_read_window() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace);
+        let content = format!("HEAD{}TAIL", "x".repeat(MAX_TOOL_MODEL_CONTENT_CHARS * 2));
+        let bounded = broker
+            .bound(
+                RunId::new(),
+                None,
+                output(
+                    content,
+                    "done".into(),
+                    json!({
+                        "path": "src/big.rs",
+                        "revision": "rev-1",
+                        "start_line": 1,
+                        "end_line": 400,
+                        "covers_file": true,
+                    }),
+                    None,
+                ),
+            )
+            .await;
+        assert!(bounded.model_content.contains("output broker truncated"));
+        assert_eq!(
+            bounded.metadata[WINDOW_TRUNCATED_METADATA_KEY],
+            json!(true),
+            "the clipped body must not keep whole-file authority"
+        );
+        // Source version identity is untouched.
+        assert_eq!(bounded.metadata["path"], json!("src/big.rs"));
+        assert_eq!(bounded.metadata["revision"], json!("rev-1"));
+        assert_eq!(bounded.metadata["start_line"], json!(1));
+        assert_eq!(bounded.metadata["end_line"], json!(400));
+        assert_eq!(bounded.metadata["covers_file"], json!(true));
+    }
+
+    /// Control for the E1 rule: an untruncated read keeps its window facts
+    /// exactly as the producer stamped them, so correct dedup downstream is
+    /// not disabled.
+    #[tokio::test]
+    async fn untruncated_window_metadata_is_never_stamped() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace);
+        let bounded = broker
+            .bound(
+                RunId::new(),
+                None,
+                output(
+                    "small body".into(),
+                    "done".into(),
+                    json!({
+                        "path": "src/small.rs",
+                        "revision": "rev-1",
+                        "start_line": 1,
+                        "end_line": 10,
+                        "covers_file": true,
+                    }),
+                    None,
+                ),
+            )
+            .await;
+        assert_eq!(bounded.model_content, "small body");
+        assert!(
+            bounded
+                .metadata
+                .get(WINDOW_TRUNCATED_METADATA_KEY)
+                .is_none()
+        );
+    }
+
+    /// The rule is scoped to outputs that declare a file-read window; a
+    /// generic tool result gains no keys from being truncated.
+    #[tokio::test]
+    async fn clipping_a_non_window_output_adds_no_window_keys() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace);
+        let bounded = broker
+            .bound(
+                RunId::new(),
+                None,
+                output(
+                    "y".repeat(MAX_TOOL_MODEL_CONTENT_CHARS * 2),
+                    "done".into(),
+                    json!({"k": "v"}),
+                    None,
+                ),
+            )
+            .await;
+        assert!(bounded.model_content.contains("output broker truncated"));
+        assert_eq!(bounded.metadata, json!({"k": "v"}));
+    }
+
+    /// After the invalidation stamp the metadata must satisfy its own
+    /// envelope budget again (updated metadata re-checked, not assumed).
+    #[tokio::test]
+    async fn the_window_stamp_keeps_metadata_within_its_budget() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace);
+        // Pad the metadata to sit just under its cap, so the stamp would
+        // push it over if the budget were not re-checked.
+        let padding = MAX_TOOL_METADATA_BYTES
+            - serde_json::to_string(&json!({
+                "path": "src/big.rs",
+                "revision": "rev-1",
+                "start_line": 1,
+                "end_line": 400,
+                "covers_file": true,
+                "window_truncated": true,
+            }))
+            .unwrap()
+            .len()
+            - 8;
+        let content = "z".repeat(MAX_TOOL_MODEL_CONTENT_CHARS * 2);
+        let bounded = broker
+            .bound(
+                RunId::new(),
+                None,
+                output(
+                    content,
+                    "done".into(),
+                    json!({
+                        "path": "src/big.rs",
+                        "revision": "rev-1",
+                        "start_line": 1,
+                        "end_line": 400,
+                        "covers_file": true,
+                        "pad": "p".repeat(padding),
+                    }),
+                    None,
+                ),
+            )
+            .await;
+        let metadata_bytes = serde_json::to_string(&bounded.metadata).unwrap().len();
+        assert!(
+            metadata_bytes <= MAX_TOOL_METADATA_BYTES,
+            "stamped metadata must stay within its {MAX_TOOL_METADATA_BYTES}-byte budget, got {metadata_bytes}"
+        );
+    }
+
+    /// Degenerate declared budgets: the marker itself is inside the cap, so
+    /// the returned length never exceeds the budget the tool declared.
+    #[test]
+    fn truncate_with_marker_never_exceeds_a_degenerate_budget() {
+        let value = "abc123".repeat(8);
+        let marker_only_budget = 1_000;
+        // A limit that cannot hold the marker alone.
+        assert_eq!(
+            truncate_with_marker(&value, 0, "model_content", None)
+                .chars()
+                .count(),
+            0
+        );
+        assert_eq!(
+            truncate_with_marker(&value, 1, "model_content", None)
+                .chars()
+                .count(),
+            1
+        );
+        // Around the exact marker length (without an artifact reference the
+        // marker is deterministic; measure it from a large-limit call).
+        let marker_len = truncate_with_marker(&value, marker_only_budget, "model_content", None)
+            .chars()
+            .count();
+        for limit in [marker_len - 1, marker_len, marker_len + 1] {
+            let bounded = truncate_with_marker(&value, limit, "model_content", None);
+            assert!(
+                bounded.chars().count() <= limit,
+                "limit {limit}: returned {} chars must not exceed the declared budget",
+                bounded.chars().count()
+            );
+        }
+        // A location reference widens the marker; the cap still wins.
+        let wide = truncate_with_marker(&value, 128, "model_content", Some("artifact://full"));
+        assert!(wide.chars().count() <= 128);
+    }
+
+    /// The broker honors even a declared budget of 1 without overshooting.
+    #[tokio::test]
+    async fn a_declared_budget_of_one_bounds_the_content_to_one_char() {
+        let (workspace, _dir) = workspace().await;
+        let broker = WorkspaceOutputBroker::new(workspace.clone());
+        let run_id = RunId::new();
+        let content = "abc".repeat(64);
+        let bounded = broker
+            .bound(
+                run_id,
+                Some(1),
+                output(content.clone(), "done".into(), Value::Null, None),
+            )
+            .await;
+        assert_eq!(
+            bounded.model_content.chars().count(),
+            1,
+            "the declared budget is the hard bound"
+        );
+        assert!(
+            bounded.artifact_ref.is_some(),
+            "the full body stays reachable through the spill"
+        );
+        let bytes = read_spilled(&workspace, run_id).await;
+        assert_eq!(String::from_utf8(bytes).unwrap(), content);
     }
 }

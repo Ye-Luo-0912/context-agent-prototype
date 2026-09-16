@@ -4181,4 +4181,102 @@ stale={stale_bytes:?}"
             "working set provenance applies even without rehydration"
         );
     }
+
+    /// E1 cross-layer regression: a full same-version read whose
+    /// model-facing body the REAL `WorkspaceOutputBroker` clipped to a
+    /// head/tail preview must stop claiming whole-file coverage. History
+    /// holds a short necessary middle window of the SAME revision; while
+    /// the stale `covers_file` metadata survives the clip, the assembler
+    /// prices the middle history as covered and omits it, so the sentinel
+    /// vanishes from the final input with no honest gap report. The test
+    /// never hand-writes `window_truncated`: the window fact must come
+    /// from the trusted conversion that actually cut the body.
+    #[tokio::test]
+    async fn broker_clipped_full_read_does_not_hide_the_middle_window_history() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = std::sync::Arc::new(
+            agent_workspace::Workspace::open(dir.path())
+                .await
+                .expect("open workspace"),
+        );
+        let broker = agent_workspace::WorkspaceOutputBroker::new(workspace);
+
+        // A whole-file read of 400 lines (~34k chars): over the
+        // 16,000-char model-content cap even though 400 lines is the
+        // line budget, with the sentinel line in the middle exactly
+        // where a head/tail preview cuts.
+        let mut full_body = String::new();
+        for line in 1..=400 {
+            if line == 200 {
+                full_body.push_str("L200 MIDDLE-SENTINEL fn required_middle_window() {}\n");
+            } else {
+                full_body.push_str(&format!("L{line} {}\n", "f".repeat(80)));
+            }
+        }
+        let output = agent_contracts::ToolOutput {
+            call_id: "read-full".into(),
+            tool_name: "fs.read".into(),
+            ok: true,
+            summary: "read".into(),
+            model_content: full_body,
+            artifact_ref: None,
+            metadata: serde_json::json!({
+                "path": "src/big.rs",
+                "revision": "rev-full-1",
+                "start_line": 1,
+                "end_line": 400,
+                "covers_file": true,
+            }),
+        };
+        let bounded = {
+            use agent_contracts::OutputBroker as _;
+            broker
+                .bound(agent_contracts::RunId::new(), None, output)
+                .await
+        };
+        // The broker really did clip the body and keep the middle out of
+        // the model-facing preview.
+        assert!(
+            bounded.model_content.chars().count() <= agent_contracts::MAX_TOOL_MODEL_CONTENT_CHARS,
+            "the broker must bound the preview"
+        );
+        assert!(
+            !bounded.model_content.contains("MIDDLE-SENTINEL"),
+            "preview must cut the middle for this scenario to be the E1 one"
+        );
+        assert!(
+            bounded.artifact_ref.is_some(),
+            "the full body is spilled and reachable"
+        );
+
+        // History: a short necessary middle-window body of the SAME
+        // revision, saved before the full read.
+        let mut file = item("L195..L205 MIDDLE-SENTINEL fn required_middle_window() {}");
+        file.kind = ContextKind::ToolObservation;
+        file.source = Some("tool:fs.read".into());
+        file.file_path = Some("src/big.rs".into());
+        file.file_revision = Some("rev-full-1".into());
+        file.file_start_line = Some(195);
+        file.file_end_line = Some(205);
+        let history = materialized_with(vec![file], ContextMapView::default());
+        let mut turn = TurnFrame::new("read the whole file");
+        turn.push_tool_result(bounded, None, agent_contracts::ToolExecutionFacts::empty());
+
+        let assembler = PromptAssembler::new("policy");
+        let assembled = assembler.assemble(None, None, None, &history, &turn, Vec::new());
+        let working = assembled
+            .context_frame
+            .iter()
+            .find(|message| message.content.contains("SELECTED WORKING CONTEXT"))
+            .expect("working set");
+        // The head/tail preview is not whole-file coverage: the middle
+        // window's body must stay in the final input.
+        assert!(
+            working.content.contains("MIDDLE-SENTINEL"),
+            "a broker-clipped preview must not be treated as whole-file \
+             coverage; the middle-window history is the only copy of the \
+             sentinel in this request: {}",
+            working.content
+        );
+    }
 }

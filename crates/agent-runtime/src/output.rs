@@ -8,6 +8,7 @@
 //! stream.
 
 use agent_contracts::{MAX_TOOL_MODEL_CONTENT_CHARS, ToolOutput};
+use agent_workspace::invalidate_file_read_window_after_body_clip;
 
 /// Provider/model error text reaches events and the user; cap it so a
 /// hostile or buggy provider cannot flood the journal with one message.
@@ -44,6 +45,10 @@ pub(crate) fn bound_tool_output(mut output: ToolOutput) -> ToolOutput {
     tail.reverse();
 
     output.model_content = format!("{head}{marker}{}", tail.into_iter().collect::<String>());
+    // E1: this guard is a trusted conversion that changed the model-visible
+    // body, so it upholds the same projection rule as the composition-root
+    // broker — a clipped file-read window stops proving coverage.
+    invalidate_file_read_window_after_body_clip(&mut output);
     output
 }
 
@@ -97,6 +102,49 @@ mod tests {
         assert!(bounded.model_content.ends_with("END"));
         assert!(bounded.model_content.contains("runtime truncated"));
         assert!(bounded.model_content.contains("artifact://full"));
+    }
+
+    /// E1: the last-line guard is a trusted conversion that changed the
+    /// model-visible body, so it upholds the same projection rule as the
+    /// broker — a declared file-read window on a clipped body stops
+    /// proving coverage, while the source version identity stays intact.
+    #[test]
+    fn runtime_guard_invalidates_the_declared_window_of_a_clipped_body() {
+        let content = format!("HEAD{}TAIL", "x".repeat(MAX_TOOL_MODEL_CONTENT_CHARS * 2));
+        let mut bounded = output(content, Some("artifact://full".into()));
+        bounded.tool_name = "fs.read".into();
+        bounded.metadata = serde_json::json!({
+            "path": "src/big.rs",
+            "revision": "rev-1",
+            "start_line": 1,
+            "end_line": 400,
+            "covers_file": true,
+        });
+        let bounded = bound_tool_output(bounded);
+        assert!(bounded.model_content.contains("runtime truncated"));
+        assert_eq!(
+            bounded.metadata["window_truncated"],
+            serde_json::json!(true)
+        );
+        assert_eq!(bounded.metadata["path"], serde_json::json!("src/big.rs"));
+        assert_eq!(bounded.metadata["revision"], serde_json::json!("rev-1"));
+        assert_eq!(bounded.metadata["covers_file"], serde_json::json!(true));
+    }
+
+    /// Control: outputs that declare no file-read window gain no stamp, so
+    /// the guard changes nothing beyond the clipped body itself.
+    #[test]
+    fn runtime_guard_leaves_non_window_metadata_untouched() {
+        let content = "x".repeat(MAX_TOOL_MODEL_CONTENT_CHARS + 1);
+        let mut bounded = output(content, None);
+        bounded.metadata = serde_json::json!({"k": "v"});
+        let bounded = bound_tool_output(bounded);
+        assert!(bounded.model_content.contains("runtime truncated"));
+        assert_eq!(
+            bounded.metadata,
+            serde_json::json!({"k": "v"}),
+            "no file-read window declared: no invalidation stamp"
+        );
     }
 
     #[test]
