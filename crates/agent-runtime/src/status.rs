@@ -34,6 +34,12 @@ pub struct StatusProjection {
     started: bool,
     completed: bool,
     turns_completed: u64,
+    /// Cancelled turns observed. A cancel is a real terminal fact for the
+    /// turn: the in-flight operation it fenced must stop being reported as
+    /// running, otherwise `/status` keeps claiming work that the runtime
+    /// already abandoned. Counted separately from `turns_completed` so a
+    /// cancellation is never folded into a completion.
+    turns_cancelled: u64,
     model_rounds: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -65,6 +71,15 @@ impl StatusProjection {
             RuntimeEvent::RunCompleted => self.completed = true,
             RuntimeEvent::TurnCompleted => {
                 self.turns_completed = self.turns_completed.saturating_add(1);
+                self.in_flight = None;
+            }
+            // A cancelled turn is terminal for the turn: it must not keep
+            // reporting an in-flight operation. It is deliberately NOT
+            // counted as a completed turn, and it never marks the task
+            // durably completed — `=/done`/`TaskCompleted` remains the only
+            // closure authority.
+            RuntimeEvent::TurnCancelled { .. } => {
+                self.turns_cancelled = self.turns_cancelled.saturating_add(1);
                 self.in_flight = None;
             }
             RuntimeEvent::ModelStarted { .. } => {
@@ -177,6 +192,12 @@ impl StatusProjection {
         self.completed
     }
 
+    /// How many turns were cancelled. Exposed so a host can distinguish
+    /// "stopped because it was cancelled" from "stopped because it finished".
+    pub fn cancelled_turns(&self) -> u64 {
+        self.turns_cancelled
+    }
+
     pub fn unresolved_ack_debts(&self) -> usize {
         self.unresolved_ack_debts
     }
@@ -204,6 +225,12 @@ impl StatusProjection {
             "status: {lifecycle} | turns={} | model_rounds={} | in_flight={in_flight}",
             self.turns_completed, self.model_rounds
         ));
+        if self.turns_cancelled > 0 {
+            lines.push(format!(
+                "cancelled turns: {} (terminal; not counted as completed)",
+                self.turns_cancelled
+            ));
+        }
         lines.push(format!(
             "tokens: in={} out={} (cached_in={})",
             self.input_tokens, self.output_tokens, self.cached_input_tokens
@@ -277,6 +304,66 @@ mod tests {
             projection.fold(event);
         }
         projection
+    }
+
+    /// A cancelled turn is a terminal fact: the projection must stop
+    /// reporting an in-flight operation, must not count the turn as
+    /// completed, and must not mark the task durably completed.
+    #[test]
+    fn a_cancelled_turn_is_terminal_and_never_reads_as_completed() {
+        let task_id = TaskId::new();
+        let cancelled = fold_all(&[
+            RuntimeEvent::FocusChanged {
+                task_id,
+                goal: "long migration".into(),
+            },
+            RuntimeEvent::ModelStarted {
+                turn_id: agent_contracts::TurnId::new(),
+                operation_id: agent_contracts::OperationId::new(),
+                generation: 1,
+                surface_revision: 0,
+                model_round: 1,
+                prompt_layers: Default::default(),
+                turn_checkpoint: Default::default(),
+            },
+            RuntimeEvent::TurnCancelled {
+                turn_id: agent_contracts::TurnId::new(),
+                task_id: Some(task_id),
+                operation_id: None,
+                cancelled_generation: 1,
+                effective_generation: 1,
+                reason: agent_contracts::TurnCancellationReason::Requested,
+            },
+        ]);
+        let lines = cancelled.lines();
+        let status_line = lines
+            .iter()
+            .find(|line| line.starts_with("status:"))
+            .expect("status line");
+        assert!(
+            status_line.contains("in_flight=none"),
+            "a cancelled turn must not keep claiming an in-flight operation: {status_line}"
+        );
+        assert!(
+            status_line.contains("turns=0"),
+            "a cancelled turn is not a completed turn: {status_line}"
+        );
+        assert_eq!(cancelled.cancelled_turns(), 1);
+        assert!(!cancelled.completed());
+        let task_line = lines
+            .iter()
+            .find(|line| line.starts_with("task:"))
+            .expect("task line");
+        assert!(
+            task_line.contains("awaiting operator review"),
+            "cancelling a turn never closes the task durably: {task_line}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("cancelled turns: 1")),
+            "the snapshot must name the cancellation: {lines:?}"
+        );
     }
 
     /// M16-02: an active task without a durable completion is displayed

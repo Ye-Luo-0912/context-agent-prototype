@@ -61,6 +61,18 @@ const MAX_CARD_LINE_CHARS: usize = 160;
 /// Per-file read cap for a projection resync (32 MiB), enforced by the
 /// reader before allocation.
 const RESYNC_FILE_BYTES: usize = 32 * 1024 * 1024;
+/// How many applied `(RunId, seq)` identities the view remembers. Exact
+/// once-only application is what stops a redelivered broadcast event from
+/// re-counting tokens or re-activating a superseded operation; the bound
+/// keeps a long session's memory flat. Identities old enough to be evicted
+/// are still covered by the contiguous replay watermark.
+const MAX_APPLIED_EVENTS: usize = 8192;
+/// How many transcript rows are remembered by event identity so a replay
+/// cannot append the same row twice. Bounded per `MAX_APPLIED_EVENTS`
+/// reasoning: the durable transcript itself is capped at
+/// `MAX_RENDERED_MESSAGES` rows, so this only needs to outlive the window
+/// a resync can re-read.
+const MAX_SHOWN_MESSAGE_EVENTS: usize = 4096;
 
 /// One file a mutating tool wrote this session, identified by the
 /// structured `metadata.path` the tool stamped — never parsed from prose.
@@ -296,8 +308,11 @@ pub struct AppState {
     /// superseded turn and is dropped — the fence against a cancelled
     /// turn's late text leaking into the next turn's transcript.
     current_op: Option<(TurnId, OperationId, u64)>,
-    /// Queued 然后 Applied 共用 input_id，避免用户气泡重复。
-    last_shown_input_id: Option<RuntimeInputId>,
+    /// Whether the transcript's last row is a bubble this turn's stream
+    /// opened. `AssistantMessage` may only *finalize* such a row; without
+    /// this, a later turn's reply would overwrite an earlier turn's row
+    /// whenever the two happened to be adjacent.
+    streaming_row_open: bool,
     /// The input id currently sitting in the runtime's single dialogue
     /// queue slot, so its later `Applied` record can be named as the
     /// queued input running rather than a silent status flip.
@@ -322,6 +337,26 @@ pub struct AppState {
     /// journal by a resync. Live events at or below it are skipped by the
     /// projection fold so a post-resync replay never double-counts.
     resynced_through_seq: Option<u64>,
+    /// Every `(RunId, seq)` already folded into this view — live or
+    /// replayed. An event is applied **at most once**, so a redelivered
+    /// broadcast event can neither double-count tokens nor re-activate a
+    /// superseded operation. Bounded FIFO; see `MAX_APPLIED_EVENTS`.
+    applied_events: std::collections::VecDeque<(RunId, u64)>,
+    applied_index: std::collections::HashSet<(RunId, u64)>,
+    /// Event identities whose transcript row was already appended. Keyed by
+    /// the event, never by the message text: two legitimate replies with
+    /// identical wording are two events and must both appear.
+    shown_message_events: std::collections::VecDeque<(RunId, u64)>,
+    shown_message_index: std::collections::HashSet<(RunId, u64)>,
+    /// Input ids whose user bubble was already appended (queued then
+    /// applied share one id, and a replay must not duplicate the bubble).
+    shown_input_ids: std::collections::HashSet<RuntimeInputId>,
+    /// Set when the journal replay could not verify a contiguous prefix —
+    /// a bad line, a short read or an unreadable file. The view then says
+    /// so instead of presenting a partial picture as complete.
+    pub view_partial: bool,
+    /// Why the view is partial, for `/status`.
+    pub view_partial_reason: Option<String>,
 }
 
 impl AppState {
@@ -347,7 +382,7 @@ impl AppState {
             input_tokens: 0,
             output_tokens: 0,
             current_op: None,
-            last_shown_input_id: None,
+            streaming_row_open: false,
             queued_input_id: None,
             current_task: None,
             unresolved_ack_debts: 0,
@@ -356,6 +391,13 @@ impl AppState {
             result_card: ResultCard::default(),
             state_dir: None,
             resynced_through_seq: None,
+            applied_events: std::collections::VecDeque::new(),
+            applied_index: std::collections::HashSet::new(),
+            shown_message_events: std::collections::VecDeque::new(),
+            shown_message_index: std::collections::HashSet::new(),
+            shown_input_ids: std::collections::HashSet::new(),
+            view_partial: false,
+            view_partial_reason: None,
             status_projection: agent_runtime::status::StatusProjection::default(),
         }
     }
@@ -376,6 +418,19 @@ impl AppState {
         }
         if let Some(approval) = &self.pending_approval {
             lines.push(format!("pending approval: {}", approval.tool_name));
+        }
+        // Honest coverage: a replay that could not verify a contiguous
+        // prefix says so instead of presenting a partial picture as the
+        // whole story. Nothing here drives effects.
+        if self.view_partial {
+            lines.push(format!(
+                "view: PARTIAL — {}",
+                self.view_partial_reason
+                    .as_deref()
+                    .unwrap_or("journal replay could not be verified")
+            ));
+        } else if self.resynced_through_seq.is_some() {
+            lines.push("view: replayed from the durable journal (contiguous)".into());
         }
         lines
     }
@@ -432,13 +487,30 @@ impl AppState {
         // museum of the oldest ones.
         files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
         files.truncate(16);
-        self.status_projection = agent_runtime::status::StatusProjection::default();
+        // Rebuild this run's event-derived view from the durable journal:
+        // reset the folded fields to their pre-run baseline and forget this
+        // run's applied identities so the replay re-applies its events
+        // through the SAME fold the live path uses. The transcript is
+        // append-only and the local view state (draft, scroll, panel
+        // toggle, an approval on screen) is not event-derived, so neither
+        // is touched here.
+        self.reset_event_derived_view();
+        self.forget_applied_for_run(self.run_id);
+        self.resynced_through_seq = None;
+        self.view_partial = false;
+        self.view_partial_reason = None;
         let mut folded = 0usize;
+        let mut min_seq: Option<u64> = None;
         let mut max_seq: Option<u64> = None;
+        let mut parsed: u64 = 0;
+        let mut bad_lines: u64 = 0;
         let mut partial = false;
+        let mut partial_reason: Option<String> = None;
         for (_, path) in &files {
             let Ok(file) = tokio::fs::File::open(path).await else {
                 partial = true;
+                partial_reason
+                    .get_or_insert_with(|| format!("unreadable journal {}", path.display()));
                 continue;
             };
             // The size cap is enforced by the reader, before any
@@ -451,10 +523,14 @@ impl AppState {
                 .is_err()
             {
                 partial = true;
+                partial_reason.get_or_insert_with(|| format!("failed reading {}", path.display()));
                 continue;
             }
             if bytes.len() > RESYNC_FILE_BYTES {
                 partial = true;
+                partial_reason.get_or_insert_with(|| {
+                    format!("journal {} exceeds the read cap", path.display())
+                });
                 bytes.truncate(RESYNC_FILE_BYTES);
                 // Keep only complete lines from the truncated prefix.
                 if let Some(pos) = bytes.iter().rposition(|byte| *byte == b'\n') {
@@ -464,9 +540,18 @@ impl AppState {
                 }
             }
             for line in String::from_utf8_lossy(&bytes).lines() {
+                if line.trim().is_empty() {
+                    continue;
+                }
                 let Ok(envelope) =
                     serde_json::from_str::<agent_contracts::RuntimeEventEnvelope>(line)
                 else {
+                    // A line we could not parse is unverified coverage, not
+                    // an absence of events: say so instead of silently
+                    // treating the max sequence as a continuous watermark.
+                    bad_lines += 1;
+                    partial = true;
+                    partial_reason.get_or_insert_with(|| "journal line failed to parse".into());
                     continue;
                 };
                 // Current run only: other runs' tasks, consumptions and
@@ -474,68 +559,49 @@ impl AppState {
                 if envelope.run_id != self.run_id {
                     continue;
                 }
-                self.status_projection.fold(&envelope.event);
-                // The journal is the durable transcript. A Lagged live
-                // receiver may have dropped User/Assistant/Tool rows even
-                // though they were written to JSONL; fold them back so the
-                // Conversation pane can show the dialogue that ran.
-                self.recover_dialogue_event(&envelope.event);
-                folded += 1;
-                max_seq = max_seq.max(Some(envelope.seq));
+                // Same fold rule as the live path — one reducer, so a
+                // replayed view cannot be built by different rules.
+                if self.claim_event(envelope.run_id, envelope.seq) {
+                    self.apply_event(envelope.clone());
+                    folded += 1;
+                    parsed += 1;
+                    min_seq = Some(min_seq.map_or(envelope.seq, |min| min.min(envelope.seq)));
+                    max_seq = Some(max_seq.map_or(envelope.seq, |max| max.max(envelope.seq)));
+                }
             }
         }
-        // Replay watermark: durable events of this run at or below the
-        // folded sequence were just counted from disk; the live broadcast
-        // may still deliver them, and re-folding would double-count.
-        self.resynced_through_seq = max_seq;
-        (folded, partial)
+        // Contiguity: a span that does not account for every sequence means
+        // the journal has a hole, so no contiguous coverage may be claimed.
+        // The exact-once identity set still prevents any double-apply; the
+        // watermark is only the stronger claim that a whole prefix was
+        // durably verified, and it is withheld when it cannot be made.
+        if let (Some(min), Some(max)) = (min_seq, max_seq) {
+            let span = max.saturating_sub(min).saturating_add(1);
+            if span != parsed {
+                partial = true;
+                partial_reason.get_or_insert_with(|| {
+                    format!("journal sequences are not contiguous ({parsed} of {span})")
+                });
+            }
+        }
+        if partial {
+            self.view_partial = true;
+            self.view_partial_reason = Some(
+                partial_reason.unwrap_or_else(|| "journal replay could not be verified".into()),
+            );
+        } else {
+            // Replay watermark: durable events of this run at or below the
+            // folded sequence were just counted from disk; the live
+            // broadcast may still deliver them, and re-folding would
+            // double-count. Only a verified contiguous prefix is claimed.
+            self.resynced_through_seq = max_seq;
+        }
+        let _ = bad_lines;
+        (folded, self.view_partial)
     }
 
     pub fn push_system(&mut self, content: String) {
         self.push_message(UiRole::System, content);
-    }
-
-    /// Fold one durable dialogue event into the Conversation pane.
-    /// Used after a broadcast Lagged so JSONL-backed user/assistant/tool
-    /// rows reappear even if the live receiver never saw them. SYSTEM
-    /// banners stay as they are; this only fills missing dialogue.
-    fn recover_dialogue_event(&mut self, event: &RuntimeEvent) {
-        match event {
-            RuntimeEvent::UserMessageAccepted { input } if input.appears_in_user_transcript() => {
-                let already_shown = input
-                    .input_id
-                    .is_some_and(|id| self.last_shown_input_id == Some(id))
-                    || self.messages.iter().any(|message| {
-                        message.role == UiRole::User && message.content == input.preview
-                    });
-                if !already_shown {
-                    if let Some(id) = input.input_id {
-                        self.last_shown_input_id = Some(id);
-                    }
-                    self.push_message(UiRole::User, input.preview.clone());
-                }
-            }
-            RuntimeEvent::AssistantMessage { content } => {
-                if !content.is_empty()
-                    && !self.messages.iter().any(|message| {
-                        message.role == UiRole::Assistant && message.content == *content
-                    })
-                {
-                    self.push_message(UiRole::Assistant, content.clone());
-                }
-            }
-            RuntimeEvent::ToolFinished { output, .. } => {
-                let text = tool_transcript_text(output);
-                if !self
-                    .messages
-                    .iter()
-                    .any(|message| message.role == UiRole::Tool && message.content == text)
-                {
-                    self.push_message(UiRole::Tool, text);
-                }
-            }
-            _ => {}
-        }
     }
 
     /// Append one transcript row, draining the oldest rows beyond the
@@ -543,6 +609,8 @@ impl AppState {
     /// can reintroduce an unbounded list.
     fn push_message(&mut self, role: UiRole, content: String) {
         self.messages.push(UiMessage { role, content });
+        // A freshly appended row is not a streamed bubble any more.
+        self.streaming_row_open = false;
         let overflow = self.messages.len().saturating_sub(MAX_RENDERED_MESSAGES);
         if overflow > 0 {
             self.messages.drain(..overflow);
@@ -652,19 +720,105 @@ impl AppState {
         }
     }
 
-    pub fn apply_runtime_event(&mut self, envelope: RuntimeEventEnvelope) {
-        // Post-resync dedup: durable events at or below the resync
-        // watermark were already folded from the journal; re-folding the
-        // live replay of the same events would double-count the status
-        // projection. (Transcript rendering below is unaffected — only the
-        // fold is skipped.)
-        let already_folded = envelope.run_id == self.run_id
-            && self
-                .resynced_through_seq
-                .is_some_and(|watermark| envelope.seq <= watermark);
-        if !already_folded {
-            self.status_projection.fold(&envelope.event);
+    /// Claim `(run_id, seq)` for application. Returns false when this event
+    /// was already folded, either because the journal replay covered it (at
+    /// or below the verified contiguous watermark) or because it is a
+    /// redelivery of an event this view already applied.
+    fn claim_event(&mut self, run_id: RunId, seq: u64) -> bool {
+        if run_id == self.run_id
+            && let Some(watermark) = self.resynced_through_seq
+            && seq <= watermark
+        {
+            return false;
         }
+        let key = (run_id, seq);
+        if !self.applied_index.insert(key) {
+            return false;
+        }
+        self.applied_events.push_back(key);
+        while self.applied_events.len() > MAX_APPLIED_EVENTS {
+            if let Some(evicted) = self.applied_events.pop_front() {
+                self.applied_index.remove(&evicted);
+            }
+        }
+        true
+    }
+
+    /// Claim `(run_id, seq)` as the identity of a transcript row. The
+    /// transcript outlives a projection rebuild, so this memory is
+    /// deliberately NOT cleared by a resync: a replay re-applies events but
+    /// must never append a row the operator already has.
+    fn claim_message_row(&mut self, run_id: RunId, seq: u64) -> bool {
+        let key = (run_id, seq);
+        if !self.shown_message_index.insert(key) {
+            return false;
+        }
+        self.shown_message_events.push_back(key);
+        while self.shown_message_events.len() > MAX_SHOWN_MESSAGE_EVENTS {
+            if let Some(evicted) = self.shown_message_events.pop_front() {
+                self.shown_message_index.remove(&evicted);
+            }
+        }
+        true
+    }
+
+    /// Forget this run's applied identities so a journal replay re-applies
+    /// its events. Used only by a rebuild, which first resets the folded
+    /// fields; the transcript's row identities are intentionally kept.
+    fn forget_applied_for_run(&mut self, run_id: RunId) {
+        self.applied_events.retain(|key| key.0 != run_id);
+        self.applied_index.retain(|key| key.0 != run_id);
+    }
+
+    /// Reset every event-derived field to its pre-run baseline so a journal
+    /// replay can rebuild it through the same fold the live path uses.
+    /// Purely local view state (draft input, scroll positions, the context
+    /// panel toggle, an approval currently on screen) is not event-derived
+    /// and is left alone, as is the append-only transcript.
+    fn reset_event_derived_view(&mut self) {
+        self.status_projection = agent_runtime::status::StatusProjection::default();
+        self.status = "idle".into();
+        self.tool_status = "none".into();
+        self.busy = false;
+        self.streaming = false;
+        self.current_op = None;
+        self.streaming_row_open = false;
+        self.input_tokens = 0;
+        self.output_tokens = 0;
+        self.current_task = None;
+        self.unresolved_ack_debts = 0;
+        self.last_checkpoint = None;
+        self.result_card = ResultCard::default();
+        self.queued_input_id = None;
+        self.context = ContextDiagnostics::default();
+        self.context_selected.clear();
+        self.context_transitions.clear();
+    }
+
+    /// Test-only view of the replay watermark.
+    #[cfg(test)]
+    fn resync_watermark_for_test(&self) -> Option<u64> {
+        self.resynced_through_seq
+    }
+
+    pub fn apply_runtime_event(&mut self, envelope: RuntimeEventEnvelope) {
+        // One shared rule for live consumption and replay: an event is
+        // applied at most once, in full. Skipping the WHOLE fold (not just
+        // the projection) is what stops a redelivered terminal event from
+        // re-activating a superseded operation or re-counting its tokens.
+        if !self.claim_event(envelope.run_id, envelope.seq) {
+            return;
+        }
+        self.apply_event(envelope);
+    }
+
+    /// The single event fold. Live consumption and journal replay both go
+    /// through here, so a replayed view cannot be built by a different rule
+    /// than the live one.
+    fn apply_event(&mut self, envelope: RuntimeEventEnvelope) {
+        let run_id = envelope.run_id;
+        let seq = envelope.seq;
+        self.status_projection.fold(&envelope.event);
         match envelope.event {
             RuntimeEvent::RunStarted => self.status = "ready".into(),
             // EXEC-3 (E07): restore succeeded, but some protected evidence
@@ -678,13 +832,14 @@ impl AppState {
             }
             RuntimeEvent::UserMessageAccepted { input } => {
                 if input.appears_in_user_transcript() {
-                    let already_shown = input
-                        .input_id
-                        .is_some_and(|id| self.last_shown_input_id == Some(id));
+                    // Row identity is the input id when the runtime stamped
+                    // one (a queued input and its later applied record share
+                    // it); otherwise this event. Never the message text.
+                    let already_shown = match input.input_id {
+                        Some(id) => !self.shown_input_ids.insert(id),
+                        None => !self.claim_message_row(run_id, seq),
+                    };
                     if !already_shown {
-                        if let Some(id) = input.input_id {
-                            self.last_shown_input_id = Some(id);
-                        }
                         self.push_message(UiRole::User, input.preview.clone());
                     }
                     if input.is_applied() {
@@ -997,25 +1152,34 @@ impl AppState {
                 self.streaming = true;
                 self.status = "model (streaming)".into();
                 match self.messages.last_mut() {
-                    Some(last) if last.role == UiRole::Assistant => last.content.push_str(&delta),
-                    _ => self.push_message(UiRole::Assistant, delta),
+                    Some(last) if last.role == UiRole::Assistant && self.streaming_row_open => {
+                        last.content.push_str(&delta);
+                    }
+                    _ => {
+                        self.push_message(UiRole::Assistant, delta);
+                    }
                 }
+                self.streaming_row_open = true;
             }
             RuntimeEvent::AssistantMessage { content } => {
                 self.streaming = false;
-                if self
-                    .messages
-                    .iter()
-                    .any(|message| message.role == UiRole::Assistant && message.content == content)
-                {
-                    // Already recovered from the journal after a Lagged
-                    // receiver; do not add a second bubble.
-                } else {
-                    match self.messages.last_mut() {
-                        Some(last) if last.role == UiRole::Assistant => last.content = content,
-                        _ => self.push_message(UiRole::Assistant, content),
+                // Dedup by event identity, never by the reply text: two
+                // turns may legitimately answer with identical wording and
+                // both must stay in the transcript.
+                if self.claim_message_row(run_id, seq) {
+                    // Only finalize a row this turn's own stream opened. An
+                    // earlier turn's row must never be overwritten just
+                    // because it happens to be the last one.
+                    if self.streaming_row_open
+                        && let Some(last) = self.messages.last_mut()
+                        && last.role == UiRole::Assistant
+                    {
+                        last.content = content;
+                    } else {
+                        self.push_message(UiRole::Assistant, content);
                     }
                 }
+                self.streaming_row_open = false;
             }
             RuntimeEvent::OperationAccepted { .. } => {
                 // This is an authority/discovery event for authorized
@@ -1066,11 +1230,10 @@ impl AppState {
                     });
                 }
                 let text = tool_transcript_text(&output);
-                if !self
-                    .messages
-                    .iter()
-                    .any(|message| message.role == UiRole::Tool && message.content == text)
-                {
+                // Identity-deduped like the other transcript rows: a
+                // replayed tool result must not append a second row, but
+                // two distinct calls that printed the same summary must.
+                if self.claim_message_row(run_id, seq) {
                     self.push_message(UiRole::Tool, text);
                 }
             }
@@ -2417,5 +2580,255 @@ mod resync_tests {
                     && message.content.contains("Prototype")),
             "session SYSTEM banners must remain"
         );
+    }
+
+    fn run_envelope(run_id: RunId, seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
+            run_id,
+            seq,
+            timestamp_ms: seq,
+            event,
+        }
+    }
+
+    fn model_used(input_tokens: u64, output_tokens: u64) -> RuntimeEvent {
+        RuntimeEvent::ModelUsed {
+            input_tokens,
+            output_tokens,
+            attempts: 1,
+            retries: 0,
+            cached_input_tokens: 0,
+            usage_identity: agent_contracts::UsageIdentity::Observed,
+            role: agent_contracts::ModelCallRole::Main,
+            usage: None,
+        }
+    }
+
+    fn model_started(turn: TurnId, op: OperationId, generation: u64) -> RuntimeEvent {
+        RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: op,
+            generation,
+            surface_revision: 0,
+            model_round: 1,
+            prompt_layers: Default::default(),
+            turn_checkpoint: Default::default(),
+        }
+    }
+
+    fn journal_line(app: &AppState, seq: u64, event: RuntimeEvent) -> String {
+        serde_json::to_string(&run_envelope(app.run_id, seq, event)).unwrap()
+    }
+
+    /// A redelivered broadcast event was already folded: it must neither
+    /// double-count tokens nor re-activate the operation it named. The old
+    /// watermark only skipped the *projection* fold, so the local fields
+    /// were still mutated; this is the regression for that split.
+    #[test]
+    fn a_redelivered_event_neither_double_counts_nor_reactivates_an_operation() {
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        let stale_turn = TurnId::new();
+        let stale_op = OperationId::new();
+        app.apply_runtime_event(run_envelope(run_id, 1, RuntimeEvent::RunStarted));
+        app.apply_runtime_event(run_envelope(run_id, 2, model_used(700, 20)));
+        app.apply_runtime_event(run_envelope(run_id, 3, RuntimeEvent::TurnCompleted));
+        app.apply_runtime_event(run_envelope(
+            run_id,
+            4,
+            model_started(stale_turn, stale_op, 1),
+        ));
+        app.apply_runtime_event(run_envelope(run_id, 5, RuntimeEvent::TurnCompleted));
+        let tokens_before = (app.input_tokens, app.output_tokens);
+        assert_eq!(tokens_before, (700, 20));
+        assert!(app.current_op.is_none());
+
+        // The broadcast redelivers what the view already applied.
+        app.apply_runtime_event(run_envelope(run_id, 2, model_used(700, 20)));
+        app.apply_runtime_event(run_envelope(
+            run_id,
+            4,
+            model_started(stale_turn, stale_op, 1),
+        ));
+
+        assert_eq!(
+            (app.input_tokens, app.output_tokens),
+            tokens_before,
+            "a redelivered ModelUsed must not be counted twice"
+        );
+        assert!(
+            app.current_op.is_none(),
+            "a redelivered ModelStarted must not re-activate a superseded operation"
+        );
+        assert_eq!(app.status, "idle");
+        assert!(!app.busy);
+    }
+
+    /// Content is not event identity. Two turns that legitimately answer
+    /// with the same words are two events and both rows must survive.
+    #[test]
+    fn identical_replies_in_different_turns_stay_as_two_rows() {
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        for seq in 1..=2u64 {
+            app.apply_runtime_event(run_envelope(
+                run_id,
+                seq,
+                RuntimeEvent::AssistantMessage {
+                    content: "已写入笔记。".into(),
+                },
+            ));
+        }
+        let rows = app
+            .messages
+            .iter()
+            .filter(|message| {
+                message.role == UiRole::Assistant && message.content == "已写入笔记。"
+            })
+            .count();
+        assert_eq!(
+            rows, 2,
+            "identical wording in two turns must not be deduped"
+        );
+    }
+
+    /// A replay produces the same view the live path had — not just a
+    /// re-folded projection with stale local fields left behind.
+    #[tokio::test]
+    async fn a_replayed_view_equals_the_live_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        std::fs::create_dir_all(&traces).unwrap();
+        let run_id = RunId::new();
+        let turn = TurnId::new();
+        let op = OperationId::new();
+        let events: Vec<RuntimeEvent> = vec![
+            RuntimeEvent::RunStarted,
+            RuntimeEvent::FocusChanged {
+                task_id: TaskId::new(),
+                goal: "replay me".into(),
+            },
+            model_started(turn, op, 1),
+            model_used(700, 20),
+            RuntimeEvent::AssistantMessage {
+                content: "done".into(),
+            },
+            RuntimeEvent::TurnCompleted,
+        ];
+        let mut live = AppState::new(run_id);
+        let mut lines = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            let seq = (index as u64) + 1;
+            lines.push(journal_line(&live, seq, event.clone()));
+            live.apply_runtime_event(run_envelope(run_id, seq, event.clone()));
+        }
+        std::fs::write(traces.join("run.jsonl"), lines.join("\n")).unwrap();
+
+        // The replaying view missed the early events; it then recovers from
+        // the journal and the broadcast redelivers everything it covered.
+        let mut replayed = AppState::new(run_id);
+        replayed.apply_runtime_event(run_envelope(
+            run_id,
+            5,
+            RuntimeEvent::AssistantMessage {
+                content: "done".into(),
+            },
+        ));
+        let (folded, partial) = replayed.resync_projection(&traces).await;
+        assert!(!partial);
+        assert_eq!(folded, 6);
+        for (index, event) in events.iter().enumerate() {
+            replayed.apply_runtime_event(run_envelope(run_id, (index as u64) + 1, event.clone()));
+        }
+
+        assert_eq!(
+            (replayed.input_tokens, replayed.output_tokens),
+            (live.input_tokens, live.output_tokens),
+            "the replayed account must equal the live one"
+        );
+        assert_eq!(replayed.status, live.status);
+        assert_eq!(replayed.busy, live.busy);
+        assert_eq!(replayed.current_op, live.current_op);
+        assert!(
+            replayed
+                .status_projection
+                .lines()
+                .join("\n")
+                .contains("tokens: in=700"),
+            "the replayed projection must carry the same account"
+        );
+        let rows = |app: &AppState| {
+            app.messages
+                .iter()
+                .filter(|message| message.role == UiRole::Assistant && message.content == "done")
+                .count()
+        };
+        assert_eq!(rows(&live), 1);
+        assert_eq!(
+            rows(&replayed),
+            1,
+            "the replay must not append a second copy of an already-shown row"
+        );
+    }
+
+    /// A journal line we cannot parse is unverified coverage: the view must
+    /// say it is partial instead of presenting itself as the whole story.
+    #[tokio::test]
+    async fn an_unparseable_journal_line_keeps_the_view_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        std::fs::create_dir_all(&traces).unwrap();
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        let lines = [
+            journal_line(&app, 1, RuntimeEvent::RunStarted),
+            journal_line(&app, 2, model_used(700, 20)),
+            "{ this is not a runtime event }".to_string(),
+            journal_line(&app, 4, RuntimeEvent::TurnCompleted),
+        ];
+        std::fs::write(traces.join("run.jsonl"), lines.join("\n")).unwrap();
+        let (folded, partial) = app.resync_projection(&traces).await;
+        assert!(partial, "a bad line must mark the replay partial");
+        assert_eq!(folded, 3);
+        assert!(app.view_partial);
+        let reason = app.view_partial_reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("parse") || reason.contains("contiguous"),
+            "the reason must name the cause: {reason}"
+        );
+        let rendered = app.render_status().join("\n");
+        assert!(
+            rendered.contains("PARTIAL"),
+            "/status must not present a partial view as complete: {rendered}"
+        );
+    }
+
+    /// A hole in the journal means no contiguous prefix was verified, so the
+    /// view must not claim one — and the events it did fold must still not
+    /// be applicable a second time.
+    #[tokio::test]
+    async fn a_journal_gap_is_never_claimed_as_contiguous_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        let traces = dir.path().join("traces");
+        std::fs::create_dir_all(&traces).unwrap();
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        let lines = [
+            journal_line(&app, 1, RuntimeEvent::RunStarted),
+            journal_line(&app, 2, model_used(700, 20)),
+            journal_line(&app, 4, RuntimeEvent::TurnCompleted),
+        ];
+        std::fs::write(traces.join("run.jsonl"), lines.join("\n")).unwrap();
+        let (folded, partial) = app.resync_projection(&traces).await;
+        assert_eq!(folded, 3);
+        assert!(partial, "a sequence gap must not be reported as complete");
+        assert!(app.view_partial);
+        assert!(
+            app.resync_watermark_for_test().is_none(),
+            "no contiguous coverage may be claimed across a gap"
+        );
+        // The gap did not make already-folded events applicable again.
+        app.apply_runtime_event(run_envelope(run_id, 2, model_used(700, 20)));
+        assert_eq!((app.input_tokens, app.output_tokens), (700, 20));
     }
 }
