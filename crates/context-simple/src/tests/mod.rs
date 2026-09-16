@@ -23,4 +23,5 @@ mod scope;
 mod scope_retirement;
 mod search;
 mod search_continuation;
+mod spill_claim_integrity;
 mod stored_metadata;

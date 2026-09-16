@@ -1419,8 +1419,23 @@ impl SimpleContextEngine {
         let started = std::time::Instant::now();
         for (index, (item_id, hash, bytes)) in plan.writes.into_iter().enumerate() {
             let path = crate::store::external_card_path(&dir, item_id, &hash);
-            // 内容寻址幂等：文件已存在即卡片已是同一字节，无需重写。
-            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            // B2（首次认领校验）：路径名里的哈希由本次计划的字节导出，所以
+            // 已存在的文件只有读回与计划字节一致才是这张卡的有效 claim
+            // （内容寻址幂等，免重写）。同名异字节（崩溃残片、截断、异物、
+            // 目录占位）不可认领——认领会让 checkpoint 把坏引用记进
+            // manifest 并把条目排出 inline 段，恢复时才发现。长度不同的
+            // 文件不可能一致，不做整读；可读但不一致或不可读时走下面的
+            // 安全原子写入（修复或首次写入），写入失败（目录占位、权限、
+            // 磁盘故障）保持内联——宁可 checkpoint 大，不可记坏引用。
+            let existing_matches = match tokio::fs::metadata(&path).await {
+                Ok(meta) if meta.is_file() && meta.len() == bytes.len() as u64 => {
+                    tokio::fs::read(&path)
+                        .await
+                        .is_ok_and(|existing| existing == bytes)
+                }
+                _ => false,
+            };
+            if existing_matches {
                 io.written.push((item_id, hash.clone()));
                 io.spilled.push((item_id, hash));
                 continue;
