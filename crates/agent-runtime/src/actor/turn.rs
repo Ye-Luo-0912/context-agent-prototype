@@ -3579,6 +3579,57 @@ impl RuntimeActor {
             .await;
     }
 
+    /// QB (review Q2): settle one live model round's reported usage through
+    /// the shared account, INDEPENDENT of the business-acceptance branch.
+    /// The stale/`Failed`/`Cancelled` arms already book through this channel
+    /// (`mark_usage_settled`/accounted dedup); a `ModelOutput` whose
+    /// consumption ACK later fails is the same billed call, so its counters
+    /// settle here — once, before the business result can be refused.
+    ///
+    /// Returns `true` when the settlement is complete. `false` means the
+    /// account write itself failed: the booking is NOT claimed, the
+    /// operation stays improvable by one late evidence row, and the runtime
+    /// fences (recoverable settlement obligation) instead of claiming a
+    /// clean round.
+    pub(super) async fn settle_model_round_usage(
+        &mut self,
+        operation_id: OperationId,
+        usage: &agent_contracts::ModelUsage,
+    ) -> bool {
+        if self.usage_settled(operation_id) {
+            return true;
+        }
+        if let Err(error) = self
+            .core
+            .emit_event(RuntimeEvent::ModelUsed {
+                input_tokens: usage.input_tokens.unwrap_or(0),
+                output_tokens: usage.output_tokens.unwrap_or(0),
+                cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
+                attempts: usage.attempts.max(1),
+                retries: usage.retries,
+                usage_identity: usage.usage_identity(),
+                role: agent_contracts::ModelCallRole::Main,
+                usage: Some(usage.clone()),
+            })
+            .await
+        {
+            // The account write failed: this is not a settled booking and
+            // must not be reported as one. Keep the obligation recoverable —
+            // the operation is deliberately left NOT settled so exactly one
+            // late evidence row can still supply the counters — and fence
+            // the runtime like every other unprovable mandatory write.
+            tracing::warn!(%error, "model usage settlement could not be journaled");
+            self.fail_round_preparation("model_usage_settled_event", error)
+                .await;
+            return false;
+        }
+        // Booked AND settled: the account holds a real value for this
+        // operation and no further evidence may be layered on top of it.
+        self.mark_usage_accounted(operation_id);
+        self.mark_usage_settled(operation_id);
+        true
+    }
+
     pub(super) async fn cancel_turn(
         &mut self,
         reason: TurnCancellationReason,

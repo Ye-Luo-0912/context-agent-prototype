@@ -5,6 +5,7 @@
 mod barrier;
 mod budget;
 mod busy;
+mod context_ack_usage;
 mod context_commit;
 mod final_pack;
 mod focus;

@@ -37,7 +37,8 @@ use std::{
 
 use agent_contracts::{
     AgentError, AgentResult, CacheWritePolicy, ModelCapabilities, ModelChunk, ModelEventSink,
-    ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelRole, ModelTransport, RetryAfterMillis,
+    ModelOutput, ModelProtocolErrorKind, ModelRequest, ModelRole, ModelTransport, ModelUsage,
+    RetryAfterMillis,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt};
@@ -467,6 +468,24 @@ impl From<AgentError> for ProtocolError {
     }
 }
 
+/// QB (review Q3): the ONE usage-settlement exit per network attempt. An
+/// error leaving a stream read is sealed with the attempt accumulator's
+/// final snapshot — the provider already billed those bytes — unless the
+/// error already carries this attempt's evidence (cancel branch, terminal
+/// arms): an already-settled error is never added to again. A snapshot with
+/// no reported counter leaves the plain typed error untouched, so a
+/// usage-less failure keeps its Unknown semantics instead of an invented
+/// empty envelope.
+fn seal_attempt_usage(error: ProtocolError, usage: Option<ModelUsage>) -> ProtocolError {
+    if error.error.reported_usage().is_some() {
+        return error;
+    }
+    ProtocolError {
+        error: AgentError::failed_with_usage(usage.unwrap_or_default(), error.error),
+        endpoint_unsupported: error.endpoint_unsupported,
+    }
+}
+
 impl OpenAiProvider {
     async fn send_wire_request(
         &self,
@@ -530,169 +549,186 @@ impl OpenAiProvider {
         );
 
         let max_stream_bytes = self.config.max_stream_bytes;
-        let mut total_bytes = 0usize;
+        // QB (review Q3): the attempt's read loop is separated from its
+        // usage settlement. Every exit below funnels into this one
+        // accumulator, and `seal_attempt_usage` closes it exactly once.
         let mut accumulator = StreamAccumulator::default();
-        let mut framer = SseEventFramer::new(max_stream_bytes);
-        let mut saw_done = false;
-        // A stream that stops delivering bytes without closing is a stalled
-        // connection, not a slow model: bound the silent gap so the turn
-        // fails retryable instead of hanging until the peer gives up.
-        let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
-        loop {
-            tokio::select! {
-                _ = request.cancel.cancelled() => {
-                    // C4 (R6): counters this in-flight attempt already
-                    // reported stay evidence. The retry wrapper unwraps the
-                    // plain cancellation and settles the numbers on its
-                    // terminal stage record.
-                    let usage = accumulator.usage.clone().unwrap_or_default();
-                    return Err(ProtocolError::from(AgentError::failed_with_usage(
-                        usage,
-                        AgentError::Cancelled,
-                    )));
-                }
-                _ = tokio::time::sleep_until(idle_deadline) => {
-                    return Err(ProtocolError::transport(
-                        true,
-                        format!(
-                            "provider stream stalled: no bytes for {:?}",
-                            self.config.timeout
-                        ),
-                    ));
-                }
-                line = lines.next() => {
-                    idle_deadline = tokio::time::Instant::now() + self.config.timeout;
-                    match line {
-                        Some(Ok(line)) => {
-                            // Every decoded line counts toward the stream
-                            // cap (line content plus its newline): a
-                            // provider that streams without end is refused
-                            // instead of growing the accumulator forever.
-                            total_bytes = total_bytes.saturating_add(line.len() + 1);
-                            if total_bytes > max_stream_bytes {
+        let read = async {
+            let mut total_bytes = 0usize;
+            let mut framer = SseEventFramer::new(max_stream_bytes);
+            let mut saw_done = false;
+            // A stream that stops delivering bytes without closing is a stalled
+            // connection, not a slow model: bound the silent gap so the turn
+            // fails retryable instead of hanging until the peer gives up.
+            let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
+            loop {
+                tokio::select! {
+                    _ = request.cancel.cancelled() => {
+                        // C4 (R6): counters this in-flight attempt already
+                        // reported stay evidence. The retry wrapper unwraps the
+                        // plain cancellation and settles the numbers on its
+                        // terminal stage record.
+                        let usage = accumulator.usage.clone().unwrap_or_default();
+                        return Err(ProtocolError::from(AgentError::failed_with_usage(
+                            usage,
+                            AgentError::Cancelled,
+                        )));
+                    }
+                    _ = tokio::time::sleep_until(idle_deadline) => {
+                        return Err(ProtocolError::transport(
+                            true,
+                            format!(
+                                "provider stream stalled: no bytes for {:?}",
+                                self.config.timeout
+                            ),
+                        ));
+                    }
+                    line = lines.next() => {
+                        idle_deadline = tokio::time::Instant::now() + self.config.timeout;
+                        match line {
+                            Some(Ok(line)) => {
+                                // Every decoded line counts toward the stream
+                                // cap (line content plus its newline): a
+                                // provider that streams without end is refused
+                                // instead of growing the accumulator forever.
+                                total_bytes = total_bytes.saturating_add(line.len() + 1);
+                                if total_bytes > max_stream_bytes {
+                                    return Err(ProtocolError::transport(
+                                        false,
+                                        format!(
+                                            "stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"
+                                        ),
+                                    ));
+                                }
+                                match framer.push_line(&line) {
+                                    Ok(Some(event)) => {
+                                        if event.data == "[DONE]" {
+                                            saw_done = true;
+                                            break;
+                                        }
+                                        match parse_wire_chunk(&event.data)
+                                            .map_err(ProtocolError::from)?
+                                        {
+                                            Some(chunk) => {
+                                                diagnostics::observe_chat_response(observer, &event.data);
+                                                for event in accumulator.apply(&chunk)
+                                                    .map_err(ProtocolError::from)?
+                                                {
+                                                    sink.on_chunk(codec.remap_chunk(event)).await.map_err(ProtocolError::from)?;
+                                                }
+                                            }
+                                            None => tracing::debug!(%event.data, "ignoring unknown Chat Completions extension event"),
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(message) => {
+                                        return Err(ProtocolError::transport(false, message));
+                                    }
+                                }
+                            }
+                            Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
                                 return Err(ProtocolError::transport(
                                     false,
                                     format!(
-                                        "stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"
+                                        "SSE line exceeded the {max_stream_bytes} byte cap before framing"
                                     ),
                                 ));
                             }
-                            match framer.push_line(&line) {
-                                Ok(Some(event)) => {
+                            Some(Err(error)) => {
+                                return Err(ProtocolError::transport(
+                                    true,
+                                    format!("stream error: {error}"),
+                                ));
+                            }
+                            None => {
+                                // The stream closed without a trailing blank
+                                // line; flush a residual event per the SSE spec.
+                                if let Some(event) = framer.finish() {
                                     if event.data == "[DONE]" {
                                         saw_done = true;
-                                        break;
-                                    }
-                                    match parse_wire_chunk(&event.data)
-                                        .map_err(ProtocolError::from)?
+                                    } else if let Some(chunk) =
+                                        parse_wire_chunk(&event.data).map_err(ProtocolError::from)?
                                     {
-                                        Some(chunk) => {
-                                            diagnostics::observe_chat_response(observer, &event.data);
-                                            for event in accumulator.apply(&chunk)
-                                                .map_err(ProtocolError::from)?
-                                            {
-                                                sink.on_chunk(codec.remap_chunk(event)).await.map_err(ProtocolError::from)?;
-                                            }
+                                        diagnostics::observe_chat_response(observer, &event.data);
+                                        for event in accumulator.apply(&chunk)
+                                            .map_err(ProtocolError::from)?
+                                        {
+                                            sink.on_chunk(codec.remap_chunk(event))
+                                                .await
+                                                .map_err(ProtocolError::from)?;
                                         }
-                                        None => tracing::debug!(%event.data, "ignoring unknown Chat Completions extension event"),
                                     }
                                 }
-                                Ok(None) => {}
-                                Err(message) => {
-                                    return Err(ProtocolError::transport(false, message));
-                                }
+                                break;
                             }
-                        }
-                        Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
-                            return Err(ProtocolError::transport(
-                                false,
-                                format!(
-                                    "SSE line exceeded the {max_stream_bytes} byte cap before framing"
-                                ),
-                            ));
-                        }
-                        Some(Err(error)) => {
-                            return Err(ProtocolError::transport(
-                                true,
-                                format!("stream error: {error}"),
-                            ));
-                        }
-                        None => {
-                            // The stream closed without a trailing blank
-                            // line; flush a residual event per the SSE spec.
-                            if let Some(event) = framer.finish() {
-                                if event.data == "[DONE]" {
-                                    saw_done = true;
-                                } else if let Some(chunk) =
-                                    parse_wire_chunk(&event.data).map_err(ProtocolError::from)?
-                                {
-                                    diagnostics::observe_chat_response(observer, &event.data);
-                                    for event in accumulator.apply(&chunk)
-                                        .map_err(ProtocolError::from)?
-                                    {
-                                        sink.on_chunk(codec.remap_chunk(event))
-                                            .await
-                                            .map_err(ProtocolError::from)?;
-                                    }
-                                }
-                            }
-                            break;
                         }
                     }
                 }
             }
-        }
 
-        // COST-7 (R3-12): read the accumulated usage BEFORE any failure
-        // return — a stream the provider already billed must not have its
-        // known counters downgraded to unknown by the failure itself.
-        let usage = accumulator.usage.clone().unwrap_or_default();
+            // COST-7 (R3-12): read the accumulated usage BEFORE any failure
+            // return — a stream the provider already billed must not have its
+            // known counters downgraded to unknown by the failure itself.
+            let usage = accumulator.usage.clone().unwrap_or_default();
 
-        // finish_reason = length means the model hit its output cap: the
-        // accumulated text is a truncated prefix, not a complete answer
-        // (PROVIDER-02).
-        if accumulator.take_output_limit() {
-            return Err(ProtocolError::from(AgentError::failed_with_usage(
-                usage,
-                AgentError::ModelOutputLimit {
-                    reason: "Chat Completions stream ended with finish_reason=length;                          the model output was truncated"
-                        .into(),
-                },
-            )));
-        }
-        if let Some(message) = accumulator.take_terminal_error() {
-            return Err(ProtocolError::from(AgentError::failed_with_usage(
-                usage,
-                AgentError::Transport {
-                    retryable: true,
-                    message,
-                },
-            )));
-        }
-        if !saw_done {
-            return Err(ProtocolError::from(AgentError::failed_with_usage(
-                usage,
-                AgentError::Transport {
-                    retryable: true,
-                    message: "Chat Completions stream ended before the [DONE] marker".into(),
-                },
-            )));
-        }
-        let (content, tool_calls) = accumulator.finalize().map_err(|error| {
-            ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
-        })?;
-        let tool_calls = codec.remap_calls(tool_calls);
-        // C4 (R6): a Done-sink failure must not discard the usage this
-        // (billed) attempt already reported.
-        sink.on_chunk(ModelChunk::Done).await.map_err(|error| {
-            ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
-        })?;
+            // finish_reason = length means the model hit its output cap: the
+            // accumulated text is a truncated prefix, not a complete answer
+            // (PROVIDER-02).
+            if accumulator.take_output_limit() {
+                return Err(ProtocolError::from(AgentError::failed_with_usage(
+                    usage,
+                    AgentError::ModelOutputLimit {
+                        reason: "Chat Completions stream ended with finish_reason=length;                          the model output was truncated"
+                            .into(),
+                    },
+                )));
+            }
+            if let Some(message) = accumulator.take_terminal_error() {
+                return Err(ProtocolError::from(AgentError::failed_with_usage(
+                    usage,
+                    AgentError::Transport {
+                        retryable: true,
+                        message,
+                    },
+                )));
+            }
+            if !saw_done {
+                return Err(ProtocolError::from(AgentError::failed_with_usage(
+                    usage,
+                    AgentError::Transport {
+                        retryable: true,
+                        message: "Chat Completions stream ended before the [DONE] marker".into(),
+                    },
+                )));
+            }
+            // Take the accumulated state out by value: the outer accumulator
+            // stays a borrowed, drained shell, so the outer seal below can
+            // still read (now empty) usage without a borrow conflict. Every
+            // failure from here on already travels with this attempt's
+            // snapshot, so nothing can be double-added.
+            let (content, tool_calls) =
+                std::mem::take(&mut accumulator)
+                    .finalize()
+                    .map_err(|error| {
+                        ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
+                    })?;
+            let tool_calls = codec.remap_calls(tool_calls);
+            // C4 (R6): a Done-sink failure must not discard the usage this
+            // (billed) attempt already reported.
+            sink.on_chunk(ModelChunk::Done).await.map_err(|error| {
+                ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
+            })?;
 
-        Ok(ModelOutput {
-            content,
-            tool_calls,
-            usage,
-        })
+            Ok(ModelOutput {
+                content,
+                tool_calls,
+                usage,
+            })
+        };
+        match read.await {
+            Ok(output) => Ok(output),
+            Err(error) => Err(seal_attempt_usage(error, accumulator.usage.clone())),
+        }
     }
 
     async fn complete_responses_stream(
@@ -734,48 +770,91 @@ impl OpenAiProvider {
             LinesCodec::new_with_max_length(self.config.max_stream_bytes.max(1)),
         );
         let max_stream_bytes = self.config.max_stream_bytes;
-        let mut total_bytes = 0usize;
+        // QB (review Q3): same settlement split as the Chat path — one
+        // accumulator per attempt, one sealing exit for every failure.
         let mut accumulator = ResponsesAccumulator::default();
-        let mut framer = SseEventFramer::new(max_stream_bytes);
-        // Same stalled-connection bound as the chat path: fail retryable
-        // instead of hanging on a silent peer.
-        let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
-        loop {
-            tokio::select! {
-                _ = request.cancel.cancelled() => {
-                    // C4 (R6): see the Chat path — keep the in-flight
-                    // attempt's reported counters as evidence.
-                    let usage = accumulator.usage().unwrap_or_default();
-                    return Err(ProtocolError::from(AgentError::failed_with_usage(
-                        usage,
-                        AgentError::Cancelled,
-                    )));
-                }
-                _ = tokio::time::sleep_until(idle_deadline) => {
-                    return Err(ProtocolError::transport(
-                        true,
-                        format!(
-                            "provider stream stalled: no bytes for {:?}",
-                            self.config.timeout
-                        ),
-                    ));
-                }
-                line = lines.next() => {
-                    idle_deadline = tokio::time::Instant::now() + self.config.timeout;
-                    match line {
-                        Some(Ok(line)) => {
-                            total_bytes = total_bytes.saturating_add(line.len() + 1);
-                            if total_bytes > max_stream_bytes {
+        let read = async {
+            let mut total_bytes = 0usize;
+            let mut framer = SseEventFramer::new(max_stream_bytes);
+            // Same stalled-connection bound as the chat path: fail retryable
+            // instead of hanging on a silent peer.
+            let mut idle_deadline = tokio::time::Instant::now() + self.config.timeout;
+            loop {
+                tokio::select! {
+                    _ = request.cancel.cancelled() => {
+                        // C4 (R6): see the Chat path — keep the in-flight
+                        // attempt's reported counters as evidence.
+                        let usage = accumulator.usage().unwrap_or_default();
+                        return Err(ProtocolError::from(AgentError::failed_with_usage(
+                            usage,
+                            AgentError::Cancelled,
+                        )));
+                    }
+                    _ = tokio::time::sleep_until(idle_deadline) => {
+                        return Err(ProtocolError::transport(
+                            true,
+                            format!(
+                                "provider stream stalled: no bytes for {:?}",
+                                self.config.timeout
+                            ),
+                        ));
+                    }
+                    line = lines.next() => {
+                        idle_deadline = tokio::time::Instant::now() + self.config.timeout;
+                        match line {
+                            Some(Ok(line)) => {
+                                total_bytes = total_bytes.saturating_add(line.len() + 1);
+                                if total_bytes > max_stream_bytes {
+                                    return Err(ProtocolError::transport(
+                                        false,
+                                        format!("stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"),
+                                    ));
+                                }
+                                match framer.push_line(&line) {
+                                    Ok(Some(frame)) => {
+                                        if frame.data == "[DONE]" { break; }
+                                        let event = parse_responses_event(&frame.data)
+                                            .map_err(ProtocolError::from)?;
+                                        crate::sse::validate_sse_event_routing(
+                                            frame.event.as_deref(),
+                                            &event,
+                                        )
+                                        .map_err(ProtocolError::from)?;
+                                        diagnostics::observe_response(observer, "responses", &event);
+                                        for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
+                                            sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
+                                        }
+                                        if accumulator.is_completed() {
+                                            break;
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(message) => {
+                                        return Err(ProtocolError::transport(false, message));
+                                    }
+                                }
+                            }
+                            Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
                                 return Err(ProtocolError::transport(
                                     false,
-                                    format!("stream exceeded the {max_stream_bytes} byte cap; provider response is not bounded"),
+                                    format!("SSE line exceeded the {max_stream_bytes} byte cap before framing"),
                                 ));
                             }
-                            match framer.push_line(&line) {
-                                Ok(Some(frame)) => {
-                                    if frame.data == "[DONE]" { break; }
+                            Some(Err(error)) => {
+                                return Err(ProtocolError::transport(true, format!("stream error: {error}")));
+                            }
+                            None => {
+                                // Stream closed without a trailing blank line;
+                                // flush a residual event per the SSE spec.
+                                if let Some(frame) = framer.finish()
+                                    && frame.data != "[DONE]"
+                                {
                                     let event = parse_responses_event(&frame.data)
                                         .map_err(ProtocolError::from)?;
+                                    // The EOF-flushed residual frame goes
+                                    // through the same event/data routing
+                                    // consistency check as every blank-line
+                                    // terminated frame (PROVIDER-03).
                                     crate::sse::validate_sse_event_routing(
                                         frame.event.as_deref(),
                                         &event,
@@ -785,97 +864,67 @@ impl OpenAiProvider {
                                     for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
                                         sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
                                     }
-                                    if accumulator.is_completed() {
-                                        break;
-                                    }
                                 }
-                                Ok(None) => {}
-                                Err(message) => {
-                                    return Err(ProtocolError::transport(false, message));
-                                }
+                                break;
                             }
-                        }
-                        Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
-                            return Err(ProtocolError::transport(
-                                false,
-                                format!("SSE line exceeded the {max_stream_bytes} byte cap before framing"),
-                            ));
-                        }
-                        Some(Err(error)) => {
-                            return Err(ProtocolError::transport(true, format!("stream error: {error}")));
-                        }
-                        None => {
-                            // Stream closed without a trailing blank line;
-                            // flush a residual event per the SSE spec.
-                            if let Some(frame) = framer.finish()
-                                && frame.data != "[DONE]"
-                            {
-                                let event = parse_responses_event(&frame.data)
-                                    .map_err(ProtocolError::from)?;
-                                // The EOF-flushed residual frame goes
-                                // through the same event/data routing
-                                // consistency check as every blank-line
-                                // terminated frame (PROVIDER-03).
-                                crate::sse::validate_sse_event_routing(
-                                    frame.event.as_deref(),
-                                    &event,
-                                )
-                                .map_err(ProtocolError::from)?;
-                                diagnostics::observe_response(observer, "responses", &event);
-                                for chunk in accumulator.apply(&event).map_err(ProtocolError::from)? {
-                                    sink.on_chunk(codec.remap_chunk(chunk)).await.map_err(ProtocolError::from)?;
-                                }
-                            }
-                            break;
                         }
                     }
                 }
             }
-        }
 
-        // COST-7 (R3-12): the usage evidence is read before any failure
-        // return and travels with the typed failure when the provider
-        // already reported counters.
-        let usage = accumulator.usage().unwrap_or_default();
+            // COST-7 (R3-12): the usage evidence is read before any failure
+            // return and travels with the typed failure when the provider
+            // already reported counters.
+            let usage = accumulator.usage().unwrap_or_default();
 
-        if let Some(error) = accumulator.take_terminal_error() {
-            let source = match error.kind {
-                ResponseStreamErrorKind::OutputLimit => AgentError::ModelOutputLimit {
-                    reason: error.message,
-                },
-                ResponseStreamErrorKind::Model => AgentError::Model(error.message),
-                ResponseStreamErrorKind::Transport => AgentError::Transport {
-                    retryable: error.retryable,
-                    message: error.message,
-                },
-            };
-            return Err(ProtocolError::from(AgentError::failed_with_usage(
-                usage, source,
-            )));
-        }
-        if !accumulator.is_completed() {
-            return Err(ProtocolError::from(AgentError::failed_with_usage(
+            if let Some(error) = accumulator.take_terminal_error() {
+                let source = match error.kind {
+                    ResponseStreamErrorKind::OutputLimit => AgentError::ModelOutputLimit {
+                        reason: error.message,
+                    },
+                    ResponseStreamErrorKind::Model => AgentError::Model(error.message),
+                    ResponseStreamErrorKind::Transport => AgentError::Transport {
+                        retryable: error.retryable,
+                        message: error.message,
+                    },
+                };
+                return Err(ProtocolError::from(AgentError::failed_with_usage(
+                    usage, source,
+                )));
+            }
+            if !accumulator.is_completed() {
+                return Err(ProtocolError::from(AgentError::failed_with_usage(
+                    usage,
+                    AgentError::Transport {
+                        retryable: true,
+                        message: "Responses stream ended before the response.completed marker"
+                            .into(),
+                    },
+                )));
+            }
+            // Same take-by-value as the Chat path: every failure from here
+            // on already carries this attempt's snapshot.
+            let (content, tool_calls, usage) = std::mem::take(&mut accumulator)
+                .finalize()
+                .map_err(|error| {
+                    ProtocolError::from(AgentError::failed_with_usage(usage, error))
+                })?;
+            let tool_calls = codec.remap_calls(tool_calls);
+            // C4 (R6): a Done-sink failure must not discard the usage this
+            // (billed) attempt already reported.
+            sink.on_chunk(ModelChunk::Done).await.map_err(|error| {
+                ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
+            })?;
+            Ok(ModelOutput {
+                content,
+                tool_calls,
                 usage,
-                AgentError::Transport {
-                    retryable: true,
-                    message: "Responses stream ended before the response.completed marker".into(),
-                },
-            )));
+            })
+        };
+        match read.await {
+            Ok(output) => Ok(output),
+            Err(error) => Err(seal_attempt_usage(error, accumulator.usage())),
         }
-        let (content, tool_calls, usage) = accumulator
-            .finalize()
-            .map_err(|error| ProtocolError::from(AgentError::failed_with_usage(usage, error)))?;
-        let tool_calls = codec.remap_calls(tool_calls);
-        // C4 (R6): a Done-sink failure must not discard the usage this
-        // (billed) attempt already reported.
-        sink.on_chunk(ModelChunk::Done).await.map_err(|error| {
-            ProtocolError::from(AgentError::failed_with_usage(usage.clone(), error))
-        })?;
-        Ok(ModelOutput {
-            content,
-            tool_calls,
-            usage,
-        })
     }
 }
 
@@ -2451,5 +2500,401 @@ Connection: close
             provider.capabilities().context_window,
             Some(DEFAULT_DECLARED_CONTEXT_WINDOW)
         );
+    }
+
+    // ------------------------------------------------------------------
+    // QB (review Q3): every early exit of one network attempt settles the
+    // accumulator's snapshot exactly once. The fixture is the review's
+    // counterexample: a legal usage-only chunk (`choices: []` plus explicit
+    // input/output/cache counters) arrives first, then the failure mode is
+    // injected before [DONE].
+    // ------------------------------------------------------------------
+
+    /// The review's usage-only frame: no choices, explicit counters only.
+    const USAGE_ONLY_CHUNK: &str = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":60}}}\n\n";
+
+    fn assert_usage_sealed(error: &AgentError) {
+        let usage = error
+            .reported_usage()
+            .expect("the counters the provider already reported must be sealed into the error");
+        assert_eq!(usage.input_tokens, Some(90));
+        assert_eq!(usage.output_tokens, Some(30));
+        assert_eq!(usage.cached_input_tokens, Some(60));
+    }
+
+    /// Writes response headers plus `prefix`, then holds the connection open
+    /// without sending another byte: the stream stalls by construction.
+    async fn serve_prefix_then_stall(prefix: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            if !prefix.is_empty() {
+                socket.write_all(prefix.as_bytes()).await.unwrap();
+            }
+            // No body, no close: the stream stalls by construction.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        addr
+    }
+
+    /// Writes headers promising more body bytes than it sends, delivers
+    /// `prefix`, then closes the write side: the client drains the usage
+    /// frame and its next stream read fails with a real I/O error (truncated
+    /// body), not a clean end-of-stream.
+    async fn serve_prefix_then_truncate(prefix: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                prefix.len() + 4096
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(prefix.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+            // Let the client drain the usage frame before the truncation
+            // becomes observable, then close the write side. The declared
+            // Content-Length stays undelivered, so the body read errors.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            socket.shutdown().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        addr
+    }
+
+    /// QB: usage frame, then the stream stalls into the idle bound.
+    #[tokio::test]
+    async fn chat_usage_then_idle_timeout_keeps_the_reported_counters() {
+        let addr = serve_prefix_then_stall(USAGE_ONLY_CHUNK).await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.timeout = Duration::from_millis(150);
+        let provider = OpenAiProvider::with_client(
+            config,
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert_usage_sealed(&error);
+        let source = error.failure_source();
+        assert!(
+            matches!(
+                source,
+                AgentError::Transport {
+                    retryable: true,
+                    ..
+                }
+            ) && source.to_string().contains("stalled"),
+            "the stall classification must survive the settlement: {source}"
+        );
+    }
+
+    /// QB: usage frame, then a malformed wire frame before [DONE].
+    #[tokio::test]
+    async fn chat_usage_then_malformed_frame_keeps_the_reported_counters() {
+        let addr = serve_sse_once(concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":60}}}\n\n",
+            "data: {\"choices\": [}\n\n",
+        ))
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert_usage_sealed(&error);
+        assert!(
+            matches!(
+                error.failure_source(),
+                AgentError::ModelProtocol {
+                    kind: ModelProtocolErrorKind::MalformedEvent,
+                    ..
+                }
+            ),
+            "the malformed-event class must survive the settlement: {error:?}"
+        );
+    }
+
+    /// QB: usage frame, then the stream dies with a real read error.
+    #[tokio::test]
+    async fn chat_usage_then_stream_io_error_keeps_the_reported_counters() {
+        let addr = serve_prefix_then_truncate(USAGE_ONLY_CHUNK).await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        // Keep the idle bound far above the reset so this exercises the
+        // stream-error exit, not the stall exit.
+        config.timeout = Duration::from_secs(2);
+        let provider = OpenAiProvider::with_client(
+            config,
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert_usage_sealed(&error);
+        let source = error.failure_source();
+        assert!(
+            matches!(
+                source,
+                AgentError::Transport {
+                    retryable: true,
+                    ..
+                }
+            ) && source.to_string().contains("stream error"),
+            "the stream-error classification must survive: {source}"
+        );
+    }
+
+    /// QB: usage frame, then the stream crosses its total byte cap.
+    #[tokio::test]
+    async fn chat_usage_then_stream_cap_keeps_the_reported_counters() {
+        let filler = "x".repeat(340);
+        let addr = serve_sse_once(Box::leak(
+            format!("{USAGE_ONLY_CHUNK}data: {filler}\n\n",).into_boxed_str(),
+        ))
+        .await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.max_stream_bytes = 400;
+        let provider =
+            OpenAiProvider::with_client(config, Client::builder().no_proxy().build().unwrap());
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert_usage_sealed(&error);
+        let source = error.failure_source();
+        assert!(
+            matches!(
+                source,
+                AgentError::Transport {
+                    retryable: false,
+                    ..
+                }
+            ) && source.to_string().contains("byte cap"),
+            "the non-retryable cap classification must survive: {source}"
+        );
+    }
+
+    /// QB: usage frame, then the sink refuses the next delta.
+    #[derive(Debug, Default)]
+    struct RefusingSink;
+
+    #[async_trait]
+    impl ModelEventSink for RefusingSink {
+        async fn on_chunk(&self, _chunk: ModelChunk) -> AgentResult<()> {
+            Err(AgentError::Transport {
+                retryable: true,
+                message: "sink failed after the usage frame".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_usage_then_sink_error_keeps_the_reported_counters() {
+        let addr = serve_sse_once(concat!(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":30,\"prompt_tokens_details\":{\"cached_tokens\":60}}}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        ))
+        .await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RefusingSink;
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert_usage_sealed(&error);
+        assert!(
+            matches!(
+                error.failure_source(),
+                AgentError::Transport {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "the sink failure must stay the source error: {error:?}"
+        );
+    }
+
+    /// QB: the same failure shapes WITHOUT any reported usage keep the plain
+    /// typed error — an empty envelope never becomes fake evidence.
+    #[tokio::test]
+    async fn chat_usageless_failures_stay_plain() {
+        let addr = serve_sse_once("data: {\"choices\": [}\n\n").await;
+        let provider = OpenAiProvider::with_client(
+            dummy_config(format!("http://{addr}/v1")),
+            Client::builder().no_proxy().build().unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            error.reported_usage().is_none(),
+            "a usage-less malformed frame stays plain: {error:?}"
+        );
+
+        let addr = serve_prefix_then_stall("").await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.timeout = Duration::from_millis(150);
+        let provider = OpenAiProvider::with_client(
+            config,
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        assert!(
+            error.reported_usage().is_none(),
+            "a usage-less stall stays plain: {error:?}"
+        );
+    }
+
+    /// QB: the Responses loop gets the same settlement — a `response.failed`
+    /// frame the accumulator already billed, then a stall before [DONE].
+    #[tokio::test]
+    async fn responses_usage_then_idle_timeout_keeps_the_reported_counters() {
+        let failed_frame = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream exploded\"},\"usage\":{\"input_tokens\":55,\"output_tokens\":7}}}\n\n",
+        );
+        let addr =
+            serve_prefix_then_stall(Box::leak(failed_frame.to_string().into_boxed_str())).await;
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.protocol = OpenAiProtocol::Responses;
+        config.timeout = Duration::from_millis(150);
+        let provider = OpenAiProvider::with_client(
+            config,
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        );
+        let sink = RecordingSink::default();
+        let error = provider
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap_err();
+        let usage = error
+            .reported_usage()
+            .expect("the billed failed response keeps its usage through the stall");
+        assert_eq!(usage.input_tokens, Some(55));
+        assert_eq!(usage.output_tokens, Some(7));
+        let source = error.failure_source();
+        assert!(
+            matches!(
+                source,
+                AgentError::Transport {
+                    retryable: true,
+                    ..
+                }
+            ) && source.to_string().contains("stalled"),
+            "the stall classification must survive the settlement: {source}"
+        );
+    }
+
+    /// QB, acceptance row: through a real RetryingTransport, the first
+    /// attempt's cost (usage then stall) and the final success's cost settle
+    /// exactly once each — the retry total is the sum, never a re-add.
+    #[tokio::test]
+    async fn retrying_transport_sums_first_failure_and_final_success_exactly_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let head =
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+            // Attempt 1: usage frame, then stall into the idle bound. The
+            // stalled connection is parked in its own task so the listener
+            // can already serve the retry.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket
+                .write_all(
+                    b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":90,\"completion_tokens\":30}}\n\n",
+                )
+                .await
+                .unwrap();
+            // Hold the connection open (no close, no bytes) inside the park
+            // task so this attempt stalls into the idle bound while the
+            // listener can already serve the retry.
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(socket);
+            });
+
+            // Attempt 2: a complete, billed stream.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 16 * 1024];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = dummy_config(format!("http://{addr}/v1"));
+        config.timeout = Duration::from_millis(150);
+        let provider = OpenAiProvider::with_client(
+            config,
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap(),
+        );
+        let transport = RetryingTransport::new(provider, 2, Duration::from_millis(1))
+            .with_jitter(|delay, _| delay);
+        let sink = RecordingSink::default();
+        let output = transport
+            .complete_stream(fs_list_request(), &sink)
+            .await
+            .unwrap();
+        // 90 (failed attempt, settled once) + 10 (success), never re-added.
+        assert_eq!(output.usage.input_tokens, Some(100));
+        assert_eq!(output.usage.output_tokens, Some(32));
+        assert_eq!(output.usage.attempts, 2);
     }
 }

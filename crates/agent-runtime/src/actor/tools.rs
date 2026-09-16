@@ -1085,6 +1085,18 @@ impl RuntimeActor {
                     agent_contracts::completion_validity(&content, &tool_calls, &usage)
                         == ModelCompletionValidity::StructurallyEmpty
                         && !persistable_delta;
+                // QB (review Q2): the round's known cost settles BEFORE the
+                // business-acceptance branch. A consumption-ACK failure (any
+                // internal/consistency fault) still refuses the tool dispatch
+                // and the unreliable result below, but the provider already
+                // billed this call — the account keeps the reported counters
+                // exactly once through the shared settlement channel.
+                if !self
+                    .settle_model_round_usage(completion.operation.operation_id, &usage)
+                    .await
+                {
+                    return;
+                }
                 if let Some(ack) = context_ack
                     && let Err(error) = self.core.acknowledge_context_consumption(ack).await
                 {
@@ -1098,19 +1110,6 @@ impl RuntimeActor {
                     self.state.turn = None;
                     return;
                 }
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::ModelUsed {
-                        input_tokens: usage.input_tokens.unwrap_or(0),
-                        output_tokens: usage.output_tokens.unwrap_or(0),
-                        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
-                        attempts: usage.attempts.max(1),
-                        retries: usage.retries,
-                        usage_identity: usage.usage_identity(),
-                        role: agent_contracts::ModelCallRole::Main,
-                        usage: Some(usage.clone()),
-                    })
-                    .await;
                 if structurally_empty {
                     let retries = self
                         .state
