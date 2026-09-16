@@ -213,29 +213,29 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 - 方向：会话循环 Result 与统一 cleanup 分开，异常/正常同一入口：停止接收→worker 停机回执→join→诚实结算（queued/已取走/已送 Runtime/未知分开，不把 abort 冒充未执行或回滚）；终端 guard、Runtime 清理、worker 各自责任不混；O3 的 pending 计数改纯诊断并修增减时机。
 - 验收：worker 受控等待＋队列有待派发时，UiSink/UiSource 抛错与正常 quit 分别执行：stop 屏障后不偷派、worker 被回收、terminal 仍恢复、慢存储/已发命令的取消安全结算。
 
-## 第八批（`980bbc77` 续审：E1 先行；E2 与 E3/E4 并行；C 续继续）
+## 第八批（`980bbc77` 续审）——已全部关闭（2026-09-17，回执：[E1_E2_E3_E4_C_RECEIPT](reviews/2026-09-16-review-980bbc77/E1_E2_E3_E4_C_RECEIPT.md)）
 
 审查基线 `980bbc77`（报告：[REVIEW.md](reviews/2026-09-16-review-980bbc77/REVIEW.md)，任务：[NEXT_ACTIONS.md](reviews/2026-09-16-review-980bbc77/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-980bbc77/COVERAGE.md)）。主线：**转换后的表示不能沿用转换前才成立的证明**——正文截断、整数规范化、编译与测试覆盖皆如此。上一轮 QA/QB/QC/QD 实现保留，不按旧问题重开。
 
-### E1 — 输出裁剪与投影覆盖（P1，agent-workspace＋agent-runtime）——先行
+### E1 — 输出裁剪与投影覆盖（P1，agent-workspace＋agent-runtime）——已关闭（`c6241318`）
 用户动作：读大文件后，Agent 能辨别哪些正文真正在本次输入中；缺失中部不被历史去重隐藏。
 - 现状：`FsReadTool::execute` 返回真实窗口事实；`WorkspaceOutputBroker::bound` 与 Runtime 兜底截断 `model_content` 却不更新 `covers_file`/`window_truncated`；`file_read_window_from_output` 据旧 metadata 判定完整窗口 → `omit_selected_file_body` 错误省略历史必要正文。
 - 方向：**任何改变模型可见正文的可信转换必须同步重算/失效覆盖声明**；源版本身份不变；metadata 与总预算更新后再次满足约束；不解析截断提示文字、不以 `artifact_ref` 存在替代全文可见、不全禁用正确去重。顺手补 `truncate_with_marker` 在 budget≤marker 长度的小预算边界。
 - 验收：真实跨层反例（历史中部短窗口→同版本全读超限→经纪截断→组装后 sentinel 不得报完整覆盖）；Runtime 兜底、正常未截断读、同版本不相交窗口对照。`cargo test -p agent-workspace --lib`、`-p agent-runtime --lib`、`-p agent-compose`。
 
-### E2 — 参数语义与摘要域一致（P2，agent-contracts＋agent-core）
+### E2 — 参数语义与摘要域一致（P2，agent-contracts＋agent-core）——已关闭（`effd09aa`）
 用户动作：两个实际可区分的长整数参数不共享同一 operation 参数身份。
 - 现状：integer profile 用 `as_i64` 校验，JCS `write_number` 经 `as_f64` 序列化——n=9007199254740992/…993 同摘要；Core 用该摘要做准入/发布/执行身份而派发携带原始参数。
 - 方向：明确数值域并文档化（拒绝非无损整数或收紧安全子集；长整数走版本化 schema 字符串）；授权、摘要、执行消费同一语义值；`minimum/maximum/enum` 同域；保留既有持久摘要兼容，不加 `expect` 把拒绝变 panic；常规 1/1.0 等价、键排序、历史向量按既有契约保持。Core 权限/意图检查不动。
 - 验收：`SchemaProfile → ArgumentDigest → Core 参数绑定` 全链，覆盖 2^53 附近、正负非精确整数、跨语言向量。`cargo test -p agent-contracts`、`-p agent-core`、`-p agent-platform-protocol`。
 
-### E3 — Linux 分片纳入 agent-host 测试（P2，CI）
+### E3 — Linux 分片纳入 agent-host 测试（P2，CI）——已关闭（`7b48f97c`）
 `cargo test` 分片并集漏 `-p agent-host`（check/build 不等于运行其测试）。把 agent-host 纳入负载合适的 Linux 分片，确认 sibling fixture 构建要求；用 workspace metadata 做「预期测试包集合 = 分片并集＋显式排除」的轻量一致性断言。Ubuntu .NET job 的宿主跨进程测试照旧存在，不夸大缺口。
 
-### E4 — mkfifo 测试的 CString 修正（P2，测试设施）
+### E4 — mkfifo 测试的 CString 修正（P2，测试设施）——已关闭（`7b48f97c`）
 `agent-workspace/src/runtime_facts.rs` 的 Unix 测试把未 NUL 终止的字节传给 `libc::mkfifo`。改 `CString::new(OsStrExt::as_bytes())`＋保持分配存活；核对创建文件是预期位置的 FIFO 后再跑原不阻塞回归。本地以 `cargo check -p agent-workspace --target x86_64-unknown-linux-gnu --tests` 编译校验，实际运行归 CI。
 
-### C（续）— 实际请求序列的供应商 KV 与任务总成本（继续）
+### C（续）— 实际请求序列的供应商 KV 与任务总成本——本地阶段已关闭（`9d798c44`）；端点侧归 T8
 复用既有 HTTP 捕获设施走连续真实请求：固定任务/工具契约/profile/预算，依次引入状态计数变动、合法新证据、同版本不同窗口、文件修改、工具撤销、协议 checkpoint、取消后迟到用量；对比最终 wire 的边界 digest、首差异类别与正文完整性；E1 大文件裁剪场景必须纳入（E1 合入后补跑）。本地阶段证明 layout/wire/账目语义；真实端点 accepted/hit/收费保持 NOT_RUN。
 
 ### T8 相关——KV 本地序列验收（待做，与 T8 同线）
