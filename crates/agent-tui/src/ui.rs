@@ -154,49 +154,36 @@ fn approval_scroll_offset(detail: &[String], inner_w: u16, inner_h: u16, holdbac
 /// source of truth for the approval scroll bound so the viewport edge matches
 /// the rendered layout — no separate "total width ÷ width" estimate.
 fn wrapped_rows(lines: &[String], inner_width: u16) -> usize {
-    let width = inner_width.max(1) as usize;
-    lines
-        .iter()
-        .map(|line| display_width(line).max(1).div_ceil(width))
-        .sum()
+    wrapped_line_count(
+        lines.iter().map(|line| Line::from(line.clone())),
+        inner_width,
+    )
 }
 
-/// Terminal display column width of `s`. ASCII is 1 column; East-Asian wide /
-/// fullwidth ranges are 2; everything else (combining, narrow) is 1. This is
-/// the width rule ratatui uses for layout, so cursor placement and wrapping
-/// agree with what is actually drawn. (`unicode-width` would give the same
-/// answer; it is a transitive dependency here and is intentionally not added
-/// to keep this change to the three named source files, so we inline the
-/// focused wide-char table instead.)
+/// R8: the number of rows the widget will actually draw at `inner_width`.
+/// This asks ratatui's own `Paragraph` via `line_count` instead of dividing a
+/// line's display width by the pane width: the real wrapper breaks on WORD
+/// boundaries, so it can need MORE rows than that division suggests, and an
+/// under-estimate clamps the scroll bound short of the content's tail. One
+/// wrapping rule, consumed by both the bound and the renderer.
+fn wrapped_line_count(lines: impl Iterator<Item = Line<'static>>, inner_width: u16) -> usize {
+    let paragraph =
+        Paragraph::new(Text::from(lines.collect::<Vec<_>>())).wrap(Wrap { trim: false });
+    // `line_count` counts the text area; our callers already pass the pane's
+    // inner width, and the counting paragraph carries no block.
+    paragraph.line_count(inner_width.max(1)).max(1)
+}
+
+/// Terminal display column width of `s`.
+///
+/// R8: this delegates to `unicode-width` — the same crate the renderer's
+/// layout is built on — instead of a hand-written wide-char table. A local
+/// table cannot be equivalent: it scores combining marks and zero-width
+/// joiners as one column, so `e` + U+0301 would count 2 columns, and a valid
+/// emoji ZWJ sequence would be summed character by character rather than
+/// measured as the single glyph it renders as.
 fn display_width(s: &str) -> usize {
-    s.chars().map(char_display_width).sum()
-}
-
-fn char_display_width(c: char) -> usize {
-    if c.is_ascii() {
-        1
-    } else if is_wide(c) {
-        2
-    } else {
-        1
-    }
-}
-
-fn is_wide(c: char) -> bool {
-    let u = c as u32;
-    (0x1100..=0x115F).contains(&u)
-        || (0x2E80..=0x303E).contains(&u)
-        || (0x3041..=0x33FF).contains(&u)
-        || (0x3400..=0x4DBF).contains(&u)
-        || (0x4E00..=0x9FFF).contains(&u)
-        || (0xA000..=0xA4CF).contains(&u)
-        || (0xAC00..=0xD7A3).contains(&u)
-        || (0xF900..=0xFAFF).contains(&u)
-        || (0xFE30..=0xFE4F).contains(&u)
-        || (0xFF00..=0xFF60).contains(&u)
-        || (0xFFE0..=0xFFE6).contains(&u)
-        || (0x1F300..=0x1FAFF).contains(&u)
-        || (0x20000..=0x3FFFD).contains(&u)
+    unicode_width::UnicodeWidthStr::width(s)
 }
 
 fn render_context_panel(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &AppState) {
@@ -306,11 +293,16 @@ pub(crate) fn conversation_scroll(
 }
 
 fn wrapped_row_count(lines: &[Line<'_>], inner_width: u16) -> usize {
-    let width = inner_width.max(1) as usize;
-    lines
-        .iter()
-        .map(|line| line.width().max(1).div_ceil(width))
-        .sum()
+    // R8: same source of truth as the approval panel — the widget's own count.
+    let owned = lines.iter().map(|line| {
+        Line::from(
+            line.spans
+                .iter()
+                .map(|span| Span::raw(span.content.clone().into_owned()))
+                .collect::<Vec<_>>(),
+        )
+    });
+    wrapped_line_count(owned, inner_width)
 }
 
 /// Visible Conversation rows for a given pane size. Tests use a width
@@ -438,6 +430,66 @@ mod render_tests {
             rows.push(row);
         }
         rows
+    }
+
+    fn render_cursor(app: &AppState, width: u16, height: u16) -> (u16, u16) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, app))
+            .expect("draw");
+        let pos = terminal.get_cursor_position().expect("cursor is placed");
+        (pos.x, pos.y)
+    }
+
+    /// R8: with a pane narrow enough for only ONE word per row, ratatui's word
+    /// wrapper needs more rows than `display_width / width` suggests (three
+    /// 6-char words in a 10-column pane: 3 rows, not 2). When the bound was
+    /// derived from the division it came out SHORT, the scroll clamp was
+    /// reduced to match, and the tail sentinel stayed unreachable no matter how
+    /// often the operator paged.
+    #[test]
+    fn a_narrow_pane_still_reaches_the_approval_tail_when_words_wrap() {
+        let mut app = AppState::new(RunId::new());
+        // 12 lines of three 6-char words: the real wrapper needs 3 rows each
+        // (36 total), while the plain division says 2 (24) — so the clamp came
+        // out 12 rows short and everything past row 24 was unreachable.
+        let mut detail: Vec<String> = (0..12)
+            .map(|_| "aaaaaa bbbbbb cccccc".to_string())
+            .collect();
+        // A marker short enough to occupy exactly one rendered row.
+        detail.push("ZZ-END".into());
+        app.pending_approval = Some(crate::state::PendingApproval {
+            request_id: "req-tail".into(),
+            tool_name: "fs.write".into(),
+            detail,
+            truncated: false,
+        });
+        // Terminal width 12 -> the approval pane's inner width is 10.
+        app.approval_scroll = u16::MAX;
+        let rows = render_rows(&app, 12, 24);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains("ZZ-END"),
+            "the tail row must be reachable by paging to the bottom: {joined}"
+        );
+    }
+
+    /// R8: a combining mark is part of the previous glyph, not a second column.
+    /// The hand-written table scored it as one column, so the cursor drifted one
+    /// column right on text like "e" + U+0301.
+    #[test]
+    fn a_combining_mark_does_not_advance_the_input_cursor() {
+        let mut app = AppState::new(RunId::new());
+        app.input = "e\u{0301}".into();
+        let composed = render_cursor(&app, 40, 24);
+        app.input = "ee".into();
+        let plain = render_cursor(&app, 40, 24);
+        assert_eq!(
+            plain.0,
+            composed.0 + 1,
+            "a combining mark must not advance the cursor like a second character"
+        );
     }
 
     fn approval_request(n: usize, value: impl Fn(usize) -> String) -> ApprovalRequest {

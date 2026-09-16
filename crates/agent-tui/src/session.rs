@@ -147,6 +147,11 @@ enum SessionCommand {
     Restore {
         target: String,
     },
+    /// R6: ordinary user text. It has user-meaningful order like any other
+    /// command, so it shares the lane instead of racing it.
+    Input {
+        text: String,
+    },
 }
 
 /// A view fact a command resolved off the draw loop. The loop applies it, so
@@ -166,10 +171,13 @@ async fn run_command_worker(
     notice_tx: tokio::sync::mpsc::Sender<String>,
     view_tx: tokio::sync::mpsc::Sender<ViewFact>,
     checkpoint_dir: PathBuf,
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     use agent_runtime::{ContinueOutcome, SuspendOutcome};
 
     while let Some(command) = commands.recv().await {
+        // This submission is now executing, not queued.
+        pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         match command {
             SessionCommand::Work { goal } => {
                 match crate::work::start_long_task(&handle, goal).await {
@@ -312,6 +320,13 @@ async fn run_command_worker(
                     }
                 }
             }
+            SessionCommand::Input { text } => {
+                // R6: ordinary text rides the same lane, so a correction
+                // typed after `/task B` cannot overtake it.
+                if let Err(error) = handle.user_message(text).await {
+                    let _ = notice_tx.try_send(format!("input not accepted: {error}"));
+                }
+            }
         }
     }
 }
@@ -336,27 +351,51 @@ fn identity_mismatch_notice(
     )
 }
 
-/// Submit one command, in order, or say why it was not accepted. A full
-/// queue is reported rather than silently dropped: the operator must know
-/// that a typed action did not reach the runtime.
-fn submit_command(
-    commands: &tokio::sync::mpsc::Sender<SessionCommand>,
-    app: &mut AppState,
-    command: SessionCommand,
-) -> bool {
-    match commands.try_send(command) {
-        Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
-            app.push_system(format!(
-                "command queue is full ({COMMAND_QUEUE_CAP}); {command:?} was NOT submitted — wait for the pending commands to finish"
-            ));
-            false
-        }
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            app.push_system("command worker is gone; the command was not submitted".into());
-            false
+/// The ordered command lane: one bounded queue, one consumer, plus a count of
+/// submissions that have not started executing yet. The session owns this
+/// value's lifetime so it can stop accepting work and name what never ran
+/// instead of dropping the sender and assuming the queue was cancelled.
+#[derive(Clone)]
+pub(crate) struct CommandLane {
+    tx: tokio::sync::mpsc::Sender<SessionCommand>,
+    pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CommandLane {
+    /// Submit one command, in order, or say why it was not accepted. A full
+    /// lane is reported rather than silently dropped: the operator must know
+    /// that a typed action did not reach the runtime.
+    fn submit(&self, app: &mut AppState, command: SessionCommand) -> bool {
+        let shown = format!("{command:?}");
+        match self.tx.try_send(command) {
+            Ok(()) => {
+                self.pending
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                app.push_system(format!(
+                    "command queue is full ({COMMAND_QUEUE_CAP}); {shown} was NOT submitted — wait for the pending commands to finish"
+                ));
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                app.push_system("command worker is gone; the command was not submitted".into());
+                false
+            }
         }
     }
+
+    /// How many submissions have not started executing.
+    fn pending(&self) -> usize {
+        self.pending.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Submit one command through the lane. Thin wrapper so dispatch sites read
+/// the same as before the lane carried a pending counter.
+fn submit_command(lane: &CommandLane, app: &mut AppState, command: SessionCommand) -> bool {
+    lane.submit(app, command)
 }
 
 /// Drive one interactive session to completion. Returns when the operator
@@ -403,19 +442,27 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
     // comes back through this channel: printing to stdout directly would
     // corrupt the alternate-screen frame.
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel::<String>(NOTICE_CHANNEL_CAP);
-    // U6: one bounded, ordered lane for commands that act on the runtime's
-    // task identity or touch the disk. A single worker drains it in
-    // submission order, so the operator's typing order is the order the
-    // runtime receives.
+    // U6/R6: one bounded, ordered lane for everything with user-meaningful
+    // order — task identity commands, the slow storage commands, AND ordinary
+    // text. A single worker drains it in submission order, so the operator's
+    // typing order is the order the runtime receives.
     let (command_tx, command_rx) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_QUEUE_CAP);
     let (view_tx, mut view_rx) = tokio::sync::mpsc::channel::<ViewFact>(8);
-    tokio::spawn(run_command_worker(
+    let lane = CommandLane {
+        tx: command_tx,
+        pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    // The session owns the worker's handle: on exit it stops accepting and
+    // reports work that never started, instead of dropping the sender and
+    // assuming the queue was cancelled.
+    let command_worker = tokio::spawn(run_command_worker(
         command_rx,
         handle.clone(),
         runtime.checkpoint_plane(),
         notice_tx.clone(),
         view_tx,
         checkpoint_dir.clone(),
+        std::sync::Arc::clone(&lane.pending),
     ));
 
     loop {
@@ -552,7 +599,7 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
                     &handle,
                     interactive.as_ref(),
                     &notice_tx,
-                    &command_tx,
+                    &lane,
                     &checkpoint_dir,
                 )
                 .await?;
@@ -570,6 +617,26 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
         }
     }
 
+    // R6: the session owns the command worker. Stop accepting new work, then
+    // cancel what never started and NAME it — dropping the sender alone would
+    // leave the operator to assume the queued actions were cancelled. An
+    // in-flight command is abandoned with the session on purpose: the operator
+    // asked to quit, and the runtime's own ordered shutdown settles task state.
+    let unexecuted = lane.pending();
+    drop(lane);
+    command_worker.abort();
+    let _ = command_worker.await;
+    if unexecuted > 0 {
+        // Best-effort transcript record: the session is ending, so this line
+        // is not guaranteed to be drawn (the terminal is restored next).
+        app.push_system(format!(
+            "{unexecuted} queued command(s) never executed — the session ended first"
+        ));
+        eprintln!(
+            "warning: {unexecuted} queued command(s) never executed — the session ended first"
+        );
+    }
+
     Ok(())
 }
 
@@ -585,7 +652,7 @@ async fn dispatch_command(
     handle: &RuntimeHandle,
     interactive: Option<&InteractiveHandle>,
     notice_tx: &tokio::sync::mpsc::Sender<String>,
-    commands: &tokio::sync::mpsc::Sender<SessionCommand>,
+    commands: &CommandLane,
     checkpoint_dir: &std::path::Path,
 ) -> anyhow::Result<bool> {
     if trimmed == "/quit" {
@@ -913,14 +980,19 @@ async fn dispatch_command(
     // The command reply plus the `UserInput` lifecycle events own the
     // visible disposition (queued / applied / rejected) — the UI no
     // longer drops input on its own busy guess.
-    let handle = handle.clone();
-    let notice_tx = notice_tx.clone();
-    let input = trimmed.to_string();
-    tokio::spawn(async move {
-        if let Err(error) = handle.user_message(input).await {
-            let _ = notice_tx.try_send(format!("input not accepted: {error}"));
-        }
-    });
+    //
+    // R6: it goes through the SAME bounded ordered lane as the task
+    // commands, because a correction typed after `/task B` is meaningful
+    // only if it reaches the runtime after `/task B` does. A detached
+    // spawn here could overtake the queue while the worker waited on a
+    // slow checkpoint, delivering the correction to the *previous* task.
+    submit_command(
+        commands,
+        app,
+        SessionCommand::Input {
+            text: trimmed.to_string(),
+        },
+    );
     Ok(true)
 }
 
@@ -2103,11 +2175,23 @@ mod command_queue_tests {
         AppState::new(agent_contracts::RunId::new())
     }
 
+    /// A lane plus the receiving end a test drives directly.
+    fn test_lane(cap: usize) -> (CommandLane, tokio::sync::mpsc::Receiver<SessionCommand>) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<SessionCommand>(cap);
+        (
+            CommandLane {
+                tx,
+                pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            rx,
+        )
+    }
+
     /// The whole point of the lane: one consumer sees the commands in the
     /// order the operator typed them.
     #[tokio::test]
     async fn queued_commands_are_delivered_in_submission_order() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_QUEUE_CAP);
+        let (tx, mut rx) = test_lane(COMMAND_QUEUE_CAP);
         let mut app = app();
         let first = TaskId::new();
         let second = TaskId::new();
@@ -2137,7 +2221,7 @@ mod command_queue_tests {
     /// is exactly the failure this lane exists to prevent.
     #[tokio::test]
     async fn a_full_queue_reports_the_drop_instead_of_losing_the_command() {
-        let (tx, _held_so_the_channel_stays_full) = tokio::sync::mpsc::channel::<SessionCommand>(1);
+        let (tx, _held_so_the_channel_stays_full) = test_lane(1);
         let mut app = app();
         assert!(submit_command(&tx, &mut app, SessionCommand::Checkpoint));
         assert!(
@@ -2160,7 +2244,7 @@ mod command_queue_tests {
     /// A closed worker is also reported, never assumed to have run.
     #[tokio::test]
     async fn a_closed_worker_is_reported() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<SessionCommand>(1);
+        let (tx, rx) = test_lane(1);
         drop(rx);
         let mut app = app();
         assert!(!submit_command(&tx, &mut app, SessionCommand::Checkpoint));
@@ -2170,6 +2254,55 @@ mod command_queue_tests {
             "{}",
             last.content
         );
+    }
+
+    /// R6: with the worker parked (a slow command in flight), the task
+    /// command and the ordinary text typed after it are still delivered in
+    /// typed order. Before this change the text never entered the lane at all,
+    /// so it could reach the previous task while `/task B` sat queued.
+    #[tokio::test]
+    async fn ordinary_text_cannot_overtake_a_pending_task_command() {
+        let (tx, mut rx) = test_lane(COMMAND_QUEUE_CAP);
+        let mut app = app();
+        let task = TaskId::new();
+        // The worker is not consuming yet: this is the paused-worker window.
+        assert!(submit_command(
+            &tx,
+            &mut app,
+            SessionCommand::Activate { task_id: task }
+        ));
+        assert!(submit_command(
+            &tx,
+            &mut app,
+            SessionCommand::Input {
+                text: "按这个要求修改".into(),
+            }
+        ));
+        assert_eq!(tx.pending(), 2, "both submissions are still queued");
+        // The consumer starts now and must see them in the typed order.
+        match rx.recv().await.expect("first") {
+            SessionCommand::Activate { task_id } => assert_eq!(task_id, task),
+            other => panic!("the correction overtook its task command: {other:?}"),
+        }
+        match rx.recv().await.expect("second") {
+            SessionCommand::Input { text } => assert_eq!(text, "按这个要求修改"),
+            other => panic!("the correction overtook its task command: {other:?}"),
+        }
+    }
+
+    /// R6: the session can name work that never started, instead of dropping
+    /// the sender and assuming the queue was cancelled.
+    #[tokio::test]
+    async fn the_lane_reports_submissions_that_have_not_started() {
+        let (tx, _held) = test_lane(4);
+        let mut app = app();
+        assert!(submit_command(&tx, &mut app, SessionCommand::Checkpoint));
+        assert!(submit_command(
+            &tx,
+            &mut app,
+            SessionCommand::Input { text: "hi".into() }
+        ));
+        assert_eq!(tx.pending(), 2);
     }
 
     /// The refusal names both sides, so the operator can see which task the

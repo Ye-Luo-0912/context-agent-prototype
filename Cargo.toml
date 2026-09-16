@@ -61,6 +61,10 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "ti
 tokio-util = { version = "0.7", features = ["io", "codec"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes Paragraph::line_count, the
+# library's own wrapped-row count. The TUI needs it so its scroll bound
+# and its rendering use ONE wrapping rule instead of a second estimate.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+unicode-width = "0.2"
 crossterm = "0.29"
 anyhow = "1"
