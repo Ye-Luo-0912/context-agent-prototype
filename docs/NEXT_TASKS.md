@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**当前开工顺序：R1 先行（P1 回归，已确认），R4／R5 与 R2／R3 可并行（不同 crate），R7 随 R1 同片，R6 接续原 U6，R8 接续原渲染验收；B1／B2 待 `context-simple` 在飞改动收口后接续。** 第五批（U 系列）实现已提交但按续审不视为关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**当前开工顺序：R1–R5 已关闭。剩余 R6（普通输入进保序通道）、R7 其余（SYSTEM 行事件身份、`shown_input_ids` 上限）、R8（折行/宽度复用库语义）可并行（`session.rs`／`state.rs`／`ui.rs` 互不重叠）；B1／B2 待 `context-simple` 在飞改动收口后接续。** 第五批（U 系列）实现已提交但按续审不视为关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -129,34 +129,39 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 
 审查基线 `3bdb269c`（报告：[REVIEW.md](reviews/2026-09-16-review-3bdb269c/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-3bdb269c/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-3bdb269c/COVERAGE.md)）。共同主线：**身份的作用域与事实的用途必须分开**——日志游标不是分片身份，已知费用不是当前操作终态，单任务修订号不是全局发布序号。R 编号仅定位本报告，沿用三线，不建新阶段。开工先声明每个切片的用户动作、最小反例与预期事件身份；**不得通过给每个事件随机新 RunId、删除反例或放宽固定时限来"修绿"**。
 
-### R1 — 实时分片不能被当成重复的持久事件（P1，agent-tui；与 R7 同片）
+### R1 — 实时分片不能被当成重复的持久事件（P1，agent-tui；与 R7 同片）——已关闭（2026-09-16，`bb761547`）
 用户动作：同一会话能看到流式回答与重试进度；日志补齐后对话不重复、不消失。
 - 生产者形状（已核实）：`sink.rs::LiveSink::new(core.event_sender(), core.event_sequence(), …)` 把 `ModelStarted` 的持久游标复用为每个 `ModelDelta`／`ModelRetrying` 的 `seq`；它们不写 WAL、不申请新序号。`q3bdb269c` 的 `claim_event(RunId, seq)` 因此在最外层把正常流式分片全部丢弃。
 - 修复方向：持久事件按 `(RunId, journal_seq)` 去重；**实时分片按 `(TurnId, OperationId, generation)` 校验归属**（既有 `current_op` 围栏），不进入持久身份集合，也**不受重放水位过滤**。不把分片写入 WAL、不伪造持久序号。
 - 停止：真实生产者形状（固定 RunId、分片复用 `ModelStarted` 的 seq）回归通过；旧 generation 分片仍被拒；重复持久 `ModelUsed`/`TurnCompleted` 仍只计一次；既有 TUI 测试通过。
+- 落地回执：[R1_R5_FIRST_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R1_R5_FIRST_BATCH_RECEIPT.md)。**关键发现：契约里早已有 `RuntimeEvent::is_live_only()`**（文档写明"分片复用持久游标、投递游标不得过滤"，`agent-host` 已在用），TUI 只是没采用。已改为 live-only 事件同时跳过持久 claim 与重放水位，归属交给 `current_op` 围栏。**根因之二：折叠 fixture 每次新建 RunId 却固定 seq=1，恰好绕过消费者实际应用的身份**——已改为稳定 RunId＋递增序号。agent-tui 91/0、clippy 0、fmt clean；变异恢复法复验去掉门控后助手正文为空。
 
-### R7 — 重放幂等与附属索引有界（P2，与 R1 同片收口）
+### R7 — 重放幂等与附属索引有界（P2）——**部分关闭**（发布副作用已随 R4 收口；SYSTEM 行身份与附属索引上限**待做**）
 - 现状：重放保留 `messages`/`shown_message_index`/`shown_input_ids`，重置运行投影后重新应用日志；User/Assistant/Tool 行有身份去重，但 **Warning/Focus/ModelUsed 等生成的 SYSTEM 行没有同等规则**，重放会再次追加并把已保留的助手行挤出 400 行窗口 → **同一日志重放两次可见序列不一致**。`shown_input_ids` 只插入不淘汰。
 - 修复方向：所有事件派生行共享事件身份；更稳妥的是**构建新的有界读模型后原子替换**事件派生部分，草稿/滚动/当前审批等本地状态单独保留；`InputId` 索引跟随可见窗口与活动排队输入。**reducer 输出与写盘副作用分开**：重放历史 `TaskCompleted` 不等价于重新发起一批快照写入。
 - 停止：同一日志连续重放两次事件派生视图一致；相同正文不同事件都保留；固定窗口下大量不同输入不使附属集合线性增长；不清空输入框或当前审批来简化恢复。
 
-### R2 — 取消后的补账覆盖全部迟到终态（P2，agent-runtime）
+### R2 — 取消后的补账覆盖全部迟到终态（P2，agent-runtime）——已关闭（2026-09-16，`8877a4da`）
+- 落地回执：[R1_R5_FIRST_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R1_R5_FIRST_BATCH_RECEIPT.md)。用法提取改为与业务结果分支无关的 `outcome_reported_usage`（覆盖 `ModelOutput`／`Failed`／`Cancelled`），并把「写了 Unknown 占位（accounted 未 settled，仍允许恰好一次补账）」与「已知值已入账（accounted＋settled，不可再加）」分开；`mark_usage_settled`／`usage_settled` 语义改名，**复用既有队列字段因此未动并行会话的 `actor/mod.rs`**。新回归挂起 provider 调用、等取消处理后再放行：两种迟到终态各断言业务保持取消、无工具执行、真实计数入账一次；既有 W4 回归未退化。
 - 现状：取消屏障先写 Unknown 用量并把 OperationId 标记 accounted；迟到结果的补充路径**只接纳 `Cancelled { known_usage: Some(...) }`**，迟到的 `ModelOutput { usage }` 与 `Failed { usage }` 走不到 → 业务结果正确作废，已知费用一起被跳过（**W4 原形状保留，补的是终态矩阵残余**）。
 - 修复方向：把用量提取从业务结果分支中收敛出来，覆盖 `ModelOutput`／`Failed`／`Cancelled`；把"已有 Unknown 占位"与"可见证据已全部结算"分开表达；沿既有 operation/accounting 状态做一次性幂等补账。
 - 验收矩阵：迟到 `ModelOutput`（含 usage/工具调用）→ 不采纳正文、不执行过期工具、已知计数结算一次；迟到 `Failed{usage}` → 不重启旧操作、计数结算一次；`Cancelled{known_usage}` → 保持取消且保留现有补账；任意类型无 usage → 业务原样、Unknown 保持 Unknown；同一 completion 重复到达 → 不再执行、不再加账。**在 `OPENAI_RETRY_METRICS_FILE` 不存在时跑。**
 - 停止：受控 provider ＋真实 Runtime/事件输出通过；真实 vendor 净成本仍留 T8。
 
-### R3 — 用量事实不得清掉当前操作状态（P2，与 R2 同片）
+### R3 — 用量事实不得清掉当前操作状态（P2，与 R2 同片）——已关闭（2026-09-16，`8877a4da`）
+- 落地回执：[R1_R5_FIRST_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R1_R5_FIRST_BATCH_RECEIPT.md)。`StatusProjection::fold(ModelUsed)` 不再清 `in_flight`；用量只推进账目，活动状态由能命名终止对象的生命周期事件推进。**取舍**：模型轮结束后到下一个生命周期事件之间 `/status` 会仍显示 `in_flight=model round`（无法证明归属就不改活动状态）。
 - 现状：`StatusProjection::fold(ModelUsed)` 无条件 `in_flight = None`；Runtime 允许旧调用迟到用量进入当前流 → A 取消、B 运行中、A 的迟到用量到达时，**投影显示"没有正在执行的操作"而 B 仍在运行**（是投影不准，不是 Runtime 停了 B）。
 - 修复方向：**用量事实只负责账目；活动状态由能绑定当前操作的生命周期事实推进**；需要从用量关联终态时携带明确 `OperationId`/角色/代际并核对；无身份的旧格式用量只计费、不清当前操作。不得用丢弃迟到 `ModelUsed` 来"修好界面"。
 - 停止：A/B 交错时 A 的补账入账一次且不改写 B 的运行显示；主调用与维护调用分开；实时消费与日志回放结果一致。
 
-### R4 — 卡片内容修订号与全局发布序号分开（P2，agent-tui）
+### R4 — 卡片内容修订号与全局发布序号分开（P2，agent-tui）——已关闭（2026-09-16，`d30f2956`）
+- 落地回执：[R1_R5_FIRST_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R1_R5_FIRST_BATCH_RECEIPT.md)。新增会话单调 `card_publish_seq`（切任务/投影重建不重置）作为写入器排序依据，artifact 增 `publish_seq`；卡片自身 `revision` 语义不变。顺带收口 R7 的发布副作用：重放期间 `replaying` 使历史 `TaskCompleted` 不再逐个发布快照。
 - 现状：`begin_card_for_task` 切任务时新卡 `revision` 从 0 起，而 `card_snapshot_gate.last_written_revision` 是跨任务共用的全局水位 → **A 完成后 B 的快照因 `1 <= 1` 被拒**，重启后 latest 仍是 A（Runtime 的 `TaskCompleted`／任务记录不受影响）。
 - 修复方向：发布序号在 AppState/发布器层**单调推进**，不随切换任务或投影重建归零；卡片自身版本与全局发布顺序分开；保留单写者与原子提交；**重放不逐个发布历史卡片**。
 - 停止：同一 AppState、真实临时目录连续完成 A/B/C，真实读回 latest 为 C；人为反转异步写入完成顺序，旧快照不覆盖新快照；重复重放不发布旧任务。
 
-### R5 — 遗漏检查的结果必须进入失败统计（P2，与 R4 同片）
+### R5 — 遗漏检查的结果必须进入失败统计（P2，与 R4 同片）——已关闭（2026-09-16，`d30f2956`）
+- 落地回执：[R1_R5_FIRST_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R1_R5_FIRST_BATCH_RECEIPT.md)。失败在事件处、容量裁剪前计数（`failed_checks_total`）；显示行把账目与窗口分开（「N recorded, M FAILED (of which K in the 32-row window), J not shown」）；原访问器更名 `failed_checks_in_window`。
 - 现状：`failed_checks()` 只统计仍在 `checks` 数组中的失败，`format_result_lines` 却把它与 `total_checks()` 并列显示 → 32 成功 + 第 33 个失败显示为 `33 recorded, 0 FAILED, 1 not shown`，遗漏可见但失败口径错误。
 - 修复方向：总成功/失败数在**显示裁剪之前**按事件身份结算；显示列表只是摘要窗口；或明确写成"已展示的 N 项中失败 M，另 K 项未显示"。失败信息可优先保留，但不得修改真实执行结果，也不改 Core 验收规则。
 - 停止：第 33 项失败计数正确；连续多项遗漏失败正确；重复事件与任务切换不重复计数。
