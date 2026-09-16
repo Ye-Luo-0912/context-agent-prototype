@@ -51,16 +51,23 @@ struct ArtifactReadArgs {
     reference: String,
     #[serde(default = "default_start_line")]
     start_line: usize,
-    #[serde(default = "default_end_line")]
-    end_line: usize,
+    /// Absent means "one bounded page starting at `start_line`" — the same
+    /// typed derivation on both sides (F1): the coverage footer only ever
+    /// suggests `start_line`, so a suggested continuation must stay
+    /// executable under the parser's own defaults. An explicit `end_line`
+    /// keeps its exact old semantics.
+    #[serde(default)]
+    end_line: Option<usize>,
 }
 
 fn default_start_line() -> usize {
     1
 }
-fn default_end_line() -> usize {
-    200
-}
+
+/// Lines per derived (end_line-less) page. The old independent default was
+/// `end_line = 200`; the derived window keeps that size, anchored at
+/// `start_line` instead of at line 1.
+const DEFAULT_PAGE_LINES: usize = 200;
 
 #[async_trait]
 impl Tool for ArtifactReadTool {
@@ -74,7 +81,7 @@ impl Tool for ArtifactReadTool {
                 "properties": {
                     "reference": {"type": "string", "description": "artifact:// reference from a previous tool result"},
                     "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1}
+                    "end_line": {"type": "integer", "minimum": 1, "description": "defaults to a bounded page starting at start_line"}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -93,10 +100,26 @@ impl Tool for ArtifactReadTool {
     ) -> AgentResult<ToolOutcome> {
         let args: ArtifactReadArgs = serde_json::from_value(arguments)
             .map_err(|e| AgentError::InvalidRequest(format!("artifact.read args: {e}")))?;
-        if args.start_line == 0 || args.end_line < args.start_line {
+        // F1: the parser and the continuation-footer generator share one
+        // typed semantics — an absent end_line is a page anchored at
+        // start_line (checked arithmetic: an unrepresentable window is
+        // refused, never wrapped).
+        let end_line = match args.end_line {
+            Some(end_line) => end_line,
+            None => args
+                .start_line
+                .checked_add(DEFAULT_PAGE_LINES - 1)
+                .ok_or_else(|| {
+                    AgentError::InvalidRequest(
+                        "invalid line range: start_line leaves no room for a page".into(),
+                    )
+                })?,
+        };
+        let start_line = args.start_line;
+        if start_line == 0 || end_line < start_line {
             return Err(AgentError::InvalidRequest("invalid line range".into()));
         }
-        if args.end_line - args.start_line + 1 > MAX_READ_LINES {
+        if end_line - start_line + 1 > MAX_READ_LINES {
             return Err(AgentError::InvalidRequest(format!(
                 "artifact.read is limited to {MAX_READ_LINES} lines per call"
             )));
@@ -141,7 +164,7 @@ impl Tool for ArtifactReadTool {
             }
             scanned_bytes += read as u64;
             counted_lines += 1;
-            if counted_lines >= args.start_line && counted_lines <= args.end_line {
+            if counted_lines >= start_line && counted_lines <= end_line {
                 // The capture budget applies to the RENDERED text: raw
                 // bytes can expand under lossy UTF-8 rendering (one
                 // invalid byte becomes a three-byte replacement char), so
@@ -182,22 +205,22 @@ impl Tool for ArtifactReadTool {
         let selected = lines
             .iter()
             .enumerate()
-            .map(|(offset, line)| format!("{:>6} | {}", args.start_line + offset, line))
+            .map(|(offset, line)| format!("{:>6} | {}", start_line + offset, line))
             .collect::<Vec<_>>()
             .join("\n");
         // The cursor must not hide unshown data: lines captured-then-
         // dropped from the window (capture cap) and lines beyond the scan
         // budget both leave pages unreadable only if `has_more` lied.
-        let first_unshown_in_window = (last_captured_line + 1).max(args.start_line);
-        let in_window_unshown = first_unshown_in_window <= args.end_line.min(counted_lines);
-        let beyond_window = scan_complete && args.end_line < counted_lines;
+        let first_unshown_in_window = (last_captured_line + 1).max(start_line);
+        let in_window_unshown = first_unshown_in_window <= end_line.min(counted_lines);
+        let beyond_window = scan_complete && end_line < counted_lines;
         let has_more = !scan_complete || in_window_unshown || beyond_window;
         let next_start_line = if in_window_unshown {
             first_unshown_in_window
         } else if has_more {
-            args.end_line + 1
+            end_line + 1
         } else {
-            args.end_line
+            end_line
         };
 
         // The body-level coverage statement (F04/CORE-3): the model sees
@@ -205,7 +228,7 @@ impl Tool for ArtifactReadTool {
         // must name its range, the total, and the continuation or end
         // marker there. A complete single-page read stays plain.
         let whole_artifact_in_one_page =
-            args.start_line == 1 && args.end_line >= counted_lines && !captured_truncated;
+            start_line == 1 && end_line >= counted_lines && !captured_truncated;
         let mut clauses: Vec<String> = Vec::new();
         if has_more || !scan_complete || !whole_artifact_in_one_page {
             if lines.is_empty() {
@@ -221,15 +244,15 @@ impl Tool for ArtifactReadTool {
             } else if scan_complete {
                 clauses.push(format!(
                     "showing lines {}-{} of {} total",
-                    args.start_line,
-                    args.start_line + lines.len().saturating_sub(1),
+                    start_line,
+                    start_line + lines.len().saturating_sub(1),
                     counted_lines
                 ));
             } else {
                 clauses.push(format!(
                     "showing lines {}-{} of at least {} total (scan budget reached; totals are incomplete)",
-                    args.start_line,
-                    args.start_line + lines.len().saturating_sub(1),
+                    start_line,
+                    start_line + lines.len().saturating_sub(1),
                     counted_lines
                 ));
             }
@@ -251,8 +274,8 @@ impl Tool for ArtifactReadTool {
                 ok: true,
                 summary: format!(
                     "read lines {}-{} of {} ({} lines total{}{})",
-                    args.start_line,
-                    args.start_line + lines.len().saturating_sub(1),
+                    start_line,
+                    start_line + lines.len().saturating_sub(1),
                     display_relative(&self.workspace, &display_path),
                     counted_lines,
                     if scan_complete {
@@ -733,6 +756,212 @@ mod tests {
             "the last page must carry the end marker: {}",
             tail.model_content
         );
+    }
+
+    // -- F1 regression harness ------------------------------------------------
+
+    /// Run one artifact.read call through the REAL trusted output broker,
+    /// exactly as the kernel does before a ToolOutcome reaches the actor.
+    /// Continuations are extracted from the brokered body: a pointer that
+    /// dies at the broker layer is dead for the model too.
+    async fn read_through_broker(
+        tool: &ArtifactReadTool,
+        broker: &agent_workspace::WorkspaceOutputBroker,
+        run_id: RunId,
+        args: Value,
+    ) -> ToolOutput {
+        let output = value(
+            tool.execute(run_id, "c", args, None, CancellationToken::new())
+                .await
+                .expect("artifact.read must execute"),
+        );
+        use agent_contracts::OutputBroker as _;
+        broker.bound(run_id, None, output).await
+    }
+
+    /// Extract the continuation arguments EXACTLY as the model-visible body
+    /// states them. The test must never add a parameter the tool did not
+    /// return: the red case for F1 is a suggested `start_line` that the
+    /// tool's own default `end_line` rejects.
+    fn continuation_args(content: &str) -> Value {
+        let marker = "continue with artifact.read ";
+        let at = content
+            .find(marker)
+            .unwrap_or_else(|| panic!("the page must offer a continuation in its body: {content}"));
+        let clause = content[at + marker.len()..]
+            .split(['\n', ';'])
+            .next()
+            .unwrap_or_default();
+        let mut reference = None;
+        let mut start_line = None;
+        let mut line_byte_offset = None;
+        for token in clause.split_whitespace() {
+            if let Some(value) = token.strip_prefix("reference=") {
+                reference = Some(value.to_string());
+            } else if let Some(value) = token.strip_prefix("start_line=") {
+                start_line = value.parse::<usize>().ok();
+            } else if let Some(value) = token.strip_prefix("line_byte_offset=") {
+                line_byte_offset = value.parse::<usize>().ok();
+            }
+        }
+        let mut args = serde_json::json!({
+            "reference": reference.expect("the continuation must name the reference"),
+            "start_line": start_line.expect("the continuation must name start_line"),
+        });
+        if let Some(offset) = line_byte_offset {
+            args["line_byte_offset"] = serde_json::json!(offset);
+        }
+        args
+    }
+
+    /// F1: a 450+ line artifact is ordinary legal content with default
+    /// arguments. Following the tool's own continuation verbatim — page by
+    /// page through the real broker — must reach the sentinel lines at the
+    /// end without ever inventing a parameter the tool did not return.
+    #[tokio::test]
+    async fn the_returned_continuation_is_executable_verbatim_until_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let total = 520usize;
+        let mut body = String::new();
+        for line in 1..=total {
+            if line == 500 {
+                body.push_str("sentinel-line-500\n");
+            } else if line == total {
+                body.push_str("final-line-520\n");
+            } else {
+                body.push_str(&format!("filler-line-{line}\n"));
+            }
+        }
+        let reference = workspace
+            .write_artifact(run_id, "grep", "txt", body.as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let mut args = serde_json::json!({ "reference": reference });
+        let mut seen_sentinel = false;
+        let mut seen_final = false;
+        let mut previous = (0usize, 0usize);
+        let mut pages = 0usize;
+        loop {
+            let output = read_through_broker(&tool, &broker, run_id, args.clone()).await;
+            assert!(
+                output.ok,
+                "every returned continuation must execute: {:?}",
+                output.summary
+            );
+            pages += 1;
+            assert!(pages < 8, "520 lines at 200 per page must end within a few pages");
+            if output.model_content.contains("sentinel-line-500") {
+                seen_sentinel = true;
+            }
+            if output.model_content.contains("final-line-520") {
+                seen_final = true;
+            }
+            if output.model_content.contains("end of artifact") {
+                break;
+            }
+            args = continuation_args(&output.model_content);
+            let start = args["start_line"].as_u64().unwrap() as usize;
+            let offset = args
+                .get("line_byte_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            assert!(
+                (start, offset) > previous,
+                "the continuation cursor must advance monotonically"
+            );
+            previous = (start, offset);
+        }
+        assert!(
+            seen_sentinel && seen_final,
+            "following the returned continuations verbatim must reach the tail sentinel lines"
+        );
+        assert!(pages >= 3, "520 lines cannot fit the first 200-line page");
+    }
+
+    /// F1 boundaries: the derived default stays a bounded page from
+    /// start_line, explicit end_line keeps its old semantics, a start past
+    /// the end is an honest empty page (not a range error), overflow is
+    /// checked, and repeating a read does not double-count.
+    #[tokio::test]
+    async fn defaulted_end_line_stays_bounded_and_rejects_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let body = (1..=520)
+            .map(|line| format!("filler-line-{line}\n"))
+            .collect::<String>();
+        let reference = workspace
+            .write_artifact(run_id, "grep", "txt", body.as_bytes())
+            .await
+            .unwrap();
+        let single_reference = workspace
+            .write_artifact(run_id, "grep", "txt", b"only-line\n")
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace);
+        let read = |args| {
+            let tool = &tool;
+            async move {
+                value(
+                    tool.execute(run_id, "c", args, None, CancellationToken::new())
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+
+        // A bare start_line gets a bounded page (start_line..start_line+199),
+        // not the stale global default of 200.
+        let paged = read(serde_json::json!({"reference": reference, "start_line": 2})).await;
+        assert!(paged.model_content.contains(&format!("{:>6} | filler-line-2", 2)));
+        assert!(
+            paged
+                .model_content
+                .contains(&format!("{:>6} | filler-line-201", 201))
+        );
+        assert!(!paged.model_content.contains("filler-line-202"));
+        assert_eq!(paged.metadata["next_start_line"], 202);
+
+        // start_line beyond the end is an honest empty page with a real end
+        // marker, not "invalid line range".
+        let past_end = read(serde_json::json!({"reference": reference, "start_line": 1000})).await;
+        assert!(past_end.ok);
+        assert!(past_end.model_content.contains("no lines in range"));
+        assert!(past_end.model_content.contains("end of artifact (520 lines)"));
+        assert_eq!(past_end.metadata["has_more"], false);
+
+        // An extreme start_line is checked arithmetic: rejected cleanly, no
+        // overflow, no panic.
+        let overflow = tool
+            .execute(
+                run_id,
+                "c",
+                serde_json::json!({"reference": reference, "start_line": usize::MAX}),
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(overflow.is_err(), "an unrepresentable window must be refused");
+
+        // A single-line file with pure defaults stays a plain complete read.
+        let single = read(serde_json::json!({"reference": single_reference})).await;
+        assert!(single.model_content.contains("only-line"));
+        assert!(
+            !single.model_content.contains("[coverage]"),
+            "a complete single-page read stays plain: {}",
+            single.model_content
+        );
+
+        // Repeating the same read does not double-count the lines.
+        let first = read(serde_json::json!({"reference": reference, "start_line": 5, "end_line": 9})).await;
+        let second = read(serde_json::json!({"reference": reference, "start_line": 5, "end_line": 9})).await;
+        assert_eq!(first.metadata["total_lines"], 520);
+        assert_eq!(second.metadata["total_lines"], 520);
     }
 
     /// 扫描预算截断的工件：正文必须声明总数不完整，不能让模型把
