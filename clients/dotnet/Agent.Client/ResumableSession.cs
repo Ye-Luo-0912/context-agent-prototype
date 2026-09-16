@@ -55,6 +55,15 @@ public sealed class AgentUnknownOutcomeException : Exception
 /// N4: the session is an <see cref="IAgentConnection"/>, so a UI shell can
 /// hold one connection abstraction whether it talks through this resumable
 /// session or a single-shot connection.
+///
+/// Q4/Q5: the event stream's health is part of session availability and its
+/// (re)publication is one generation boundary. A session-level queue
+/// overflow never leaves a "snapshot works, events never arrive" state: the
+/// next public operation rebuilds snapshot + subscription + pump through the
+/// normal reconnect path. Connection identity, the event queue and the
+/// generation install atomically; the pump delivers nothing before the
+/// handshake snapshot has been applied, and a superseded pump's check and
+/// enqueue are one atomic step that cannot cross an install boundary.
 /// </summary>
 public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
 {
@@ -69,8 +78,11 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
 
     /// <summary>R13: set once the session queue refused a durable
     /// notification (terminal overflow). The current event stream is a closed,
-    /// monotonically-done generation; the next successful reconnect rebuilds
-    /// it so new events become reachable again.</summary>
+    /// monotonically-done generation. Q4: while this flag stands, the session
+    /// does not treat its (possibly still healthy) connection as live — the
+    /// next public operation takes the reconnect path, and a successful
+    /// handshake rebuilds the stream so new events become reachable
+    /// again.</summary>
     private bool _eventsOverflowed;
 
     // F09: at most one connect attempt in flight per session (single-flight);
@@ -80,6 +92,14 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     private Task<AgentConnection>? _connecting;
     private long _generation;
     private bool _disposed;
+
+    /// <summary>
+    /// Q5 drill seam (test-only; always null in production): awaited by a
+    /// pump after it has taken a notification from its connection and before
+    /// the atomic staleness-gated enqueue, so a test can hold the pump at
+    /// "read, not yet delivered" across an install boundary.
+    /// </summary>
+    internal Func<WorkEventNotification, Task>? PumpDrillGate;
 
     public ResumableSession(Func<Task<Stream>> connect, AgentConnectionOptions? options = null)
     {
@@ -127,7 +147,15 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
             {
                 throw new ObjectDisposedException(nameof(ResumableSession));
             }
-            if (_connection?.IsConnected == true)
+            // Q4: session-stream health is part of availability. After a
+            // session-level queue overflow the current event stream is a
+            // closed, monotonically-done generation, so the connection behind
+            // it does not qualify as live even while its socket is healthy —
+            // the next operation takes the reconnect path below, which
+            // rebuilds snapshot + subscription + pump (and the stream)
+            // instead of answering from a session whose events can never
+            // arrive again.
+            if (!_eventsOverflowed && _connection?.IsConnected == true)
             {
                 return _connection;
             }
@@ -198,13 +226,55 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
             throw;
         }
 
+        // Q5: connection identity, event queue and generation are ONE
+        // publication unit — installed atomically under the gate, together
+        // with the pump that serves them, so no pump can straddle this
+        // boundary (its per-notification staleness check and enqueue are
+        // atomic against the same lock, see PumpEventsAsync).
         bool install;
+        TaskCompletionSource snapshotApplied;
         lock (_gate)
         {
             install = !_disposed && generation == _generation;
             if (install)
             {
                 _connection = fresh;
+                BoundedEventQueue events;
+                if (_eventsOverflowed)
+                {
+                    // R13: ordered rebuild boundary. After a session-level
+                    // overflow the current stream is a monotonically-closed
+                    // generation, so this reconnect REBUILDS a fresh live
+                    // queue instead of clearing it — new events become
+                    // reachable again for a consumer that re-reads
+                    // <see cref="Events"/>, while the faulted stream stays
+                    // closed for anyone still holding it. Recovery is
+                    // explicit: the lost backlog is never replayed, only
+                    // re-snapshotted.
+                    events = new BoundedEventQueue(_options.NotificationCapacity);
+                    _events = events;
+                    _eventsOverflowed = false;
+                }
+                else
+                {
+                    // B1 reset boundary: a NORMAL reconnect clears the unread
+                    // backlog on the SAME session stream (the ONE stable
+                    // reader across reconnects — the fresh snapshot rebuilds
+                    // all durable state, so a replaced connection's unread
+                    // facts never resurface after <see cref="Resynced"/>).
+                    events = _events;
+                    events.Clear();
+                }
+                // Q5 window 1: the pump starts with the install but holds
+                // every delivery until the handshake snapshot below has been
+                // applied (Resynced has run) — a post-watermark update must
+                // never be consumed before the snapshot that subsumes it.
+                snapshotApplied = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _ = PumpEventsAsync(fresh, events, snapshot.Watermark, snapshotApplied.Task);
+            }
+            else
+            {
+                snapshotApplied = null!;
             }
         }
         if (!install)
@@ -216,48 +286,42 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
             await fresh.DisposeAsync().ConfigureAwait(false);
             throw new ObjectDisposedException(nameof(ResumableSession));
         }
-        // R13: ordered reset/rebuild boundary. A NORMAL reconnect clears the
-        // unread backlog on the SAME session stream (the ONE stable reader
-        // across reconnects — the fresh snapshot rebuilds all durable state,
-        // so a replaced connection's unread facts never resurface after
-        // <see cref="Resynced"/>). After a session-level overflow the current
-        // stream is a monotonically-closed generation, so this reconnect
-        // REBUILDS a fresh live queue instead — new events become reachable
-        // again for a consumer that re-reads <see cref="Events"/>, while the
-        // faulted stream stays closed for anyone still holding it. Recovery is
-        // explicit: the lost backlog is never replayed, only re-snapshotted.
-        if (_eventsOverflowed)
+        // N3: the snapshot's watermark is the dedup cursor for the pump
+        // started above: durable events at or below it are already reflected
+        // in the snapshot raised here, so the pump relays them no more than
+        // once.
+        try
         {
-            lock (_gate)
-            {
-                _events = new BoundedEventQueue(_options.NotificationCapacity);
-                _eventsOverflowed = false;
-            }
+            Resynced?.Invoke(snapshot);
         }
-        else
+        finally
         {
-            _events.Clear();
+            // Q5: the delivery barrier opens once the snapshot has been
+            // published — also when a handler throws — so the pump is never
+            // stuck waiting behind a failing consumer. The handler runs
+            // outside every internal lock.
+            snapshotApplied.TrySetResult();
         }
-        // N3: one pump per installed connection relays its typed events into
-        // the session-level stream; the pump ends when the connection stops
-        // being the live one. The snapshot's watermark is the dedup cursor:
-        // durable events at or below it are already reflected in the
-        // snapshot raised below (and in this reconnect's reset), so the pump
-        // relays them no more than once.
-        _ = PumpEventsAsync(fresh, snapshot.Watermark);
-        Resynced?.Invoke(snapshot);
         return fresh;
     }
 
     /// <summary>
     /// Relays one connection's typed notifications into the session-level
-    /// event stream while that connection is the installed one. The
-    /// staleness gate is checked per notification: once a reconnect installs
-    /// a different connection (or the session is disposed), this pump stops
-    /// mid-queue — an old connection's buffered notifications never leak
-    /// into the new stream. Completion of the connection's queue (fault or
-    /// dispose) simply ends the pump; the session-level stream stays open
-    /// for the next connection.
+    /// event stream (<paramref name="events"/>, the queue captured at this
+    /// generation's install) while that connection is the installed one.
+    ///
+    /// Q5 window 1: <paramref name="snapshotApplied"/> is the delivery
+    /// barrier — no notification is relayed before the handshake snapshot
+    /// has been applied (Resynced has run), so a post-watermark update can
+    /// never be consumed before the snapshot that subsumes it.
+    ///
+    /// Q5 window 2: the staleness re-check AND the enqueue are ONE atomic
+    /// step under the session gate. Installation swaps connection and queue
+    /// together under that same lock, so a superseded pump can neither
+    /// deliver its taken notification into the current stream (its
+    /// generation is over — the fresh snapshot rebuilt all durable state)
+    /// nor mark an overflow on a stream it no longer belongs to. Completion
+    /// of the connection's queue (fault or dispose) simply ends the pump.
     ///
     /// B1: <paramref name="durableCursor"/> is the handshake snapshot's
     /// watermark. Durable notifications at or below it are already reflected
@@ -267,7 +331,11 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     /// relays — its supersession fence is turn/operation identity, the
     /// consumer's concern.
     /// </summary>
-    private async Task PumpEventsAsync(AgentConnection connection, ulong durableCursor)
+    private async Task PumpEventsAsync(
+        AgentConnection connection,
+        BoundedEventQueue events,
+        ulong durableCursor,
+        Task snapshotApplied)
     {
         try
         {
@@ -276,35 +344,40 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
             {
                 while (source.TryRead(out var notification))
                 {
-                    bool current;
+                    // Q5 drill seam (tests only; null in production): holds
+                    // the taken notification before its atomic
+                    // staleness-gated enqueue.
+                    var drill = PumpDrillGate;
+                    if (drill is not null)
+                    {
+                        await drill(notification).ConfigureAwait(false);
+                    }
+                    if (!snapshotApplied.IsCompleted)
+                    {
+                        await snapshotApplied.ConfigureAwait(false);
+                    }
                     lock (_gate)
                     {
-                        current = !_disposed && _connection == connection;
-                    }
-                    if (!current)
-                    {
-                        return;
-                    }
-                    if (!notification.IsLiveOnlyProgress
-                        && notification.Envelope.Seq <= durableCursor)
-                    {
-                        continue; // already reflected in the handshake snapshot
-                    }
-                    if (!_events.TryEnqueue(notification))
-                    {
-                        lock (_gate)
+                        if (_disposed
+                            || !ReferenceEquals(_connection, connection)
+                            || !ReferenceEquals(_events, events))
                         {
-                            if (_disposed)
-                            {
-                                return;
-                            }
+                            return;
+                        }
+                        if (!notification.IsLiveOnlyProgress
+                            && notification.Envelope.Seq <= durableCursor)
+                        {
+                            continue; // already reflected in this generation's snapshot
+                        }
+                        if (!events.TryEnqueue(notification))
+                        {
                             // Terminal overflow at session level (the same
                             // class-aware policy as the connection queue):
                             // the current event stream ends with the honest
                             // reason. R13: the session itself is NOT terminal —
                             // the overflow is recorded so the next successful
                             // reconnect rebuilds a fresh stream.
-                            _events.TryComplete(new AgentContractViolationException(
+                            events.TryComplete(new AgentContractViolationException(
                                 "work.event.queue",
                                 "overflowed with undroppable approval/terminal notifications; rebuild from a snapshot"));
                             _eventsOverflowed = true;
@@ -526,12 +599,30 @@ public sealed class ResumableSession : IAgentConnection, IAsyncDisposable
     /// deduping durable replays, and — on a normal reconnect — this reader
     /// never changes. The stream ends (with the reason) only if the queue
     /// must refuse an approval/terminal notification, or when the session is
-    /// disposed. R13: after such an overflow the stream is a closed
-    /// generation; a subsequent successful reconnect REBUILDS a fresh live
-    /// stream, so a consumer re-reading <see cref="Events"/> after the
-    /// resync receives new events again (the lost backlog is never replayed,
-    /// only re-snapshot).
-    public ChannelReader<WorkEventNotification> Events => _events.Reader;
+    /// disposed. R13/Q4: after such an overflow the stream is a closed
+    /// generation; the session's very next operation rebuilds snapshot +
+    /// subscription + pump along the normal reconnect path — no server-side
+    /// disconnect is required — and a consumer re-reading
+    /// <see cref="Events"/> after the resync receives the NEW generation's
+    /// reader (the lost backlog is never replayed, only re-snapshotted).
+    /// </summary>
+    public ChannelReader<WorkEventNotification> Events
+    {
+        get { lock (_gate) { return _events.Reader; } }
+    }
+
+    /// <summary>Q4: true while the session-level event stream is a closed,
+    /// overflowed generation awaiting its rebuild. The recovery itself runs
+    /// through every public entry: the next query or mutation treats the
+    /// stream health as part of availability, reconnects, re-subscribes,
+    /// re-snapshots (raising <see cref="Resynced"/>) and swaps in a fresh
+    /// live stream; <see cref="Events"/> then returns the new generation's
+    /// reader. The lost backlog is never replayed — re-snapshot and decide
+    /// from it.</summary>
+    public bool EventsOverflowed
+    {
+        get { lock (_gate) { return _eventsOverflowed; } }
+    }
 
     /// <summary>True once the session-level queue had to shed live-only
     /// progress notifications under pressure; re-snapshot rather than trust

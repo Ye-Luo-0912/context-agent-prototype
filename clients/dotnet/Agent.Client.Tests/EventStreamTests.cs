@@ -656,6 +656,255 @@ public class EventStreamTests
         }
     }
 
+    /// <summary>Q4: the session's OWN queue overflow is recoverable through
+    /// the public entry alone. The socket is never dropped by the server —
+    /// every query keeps being answered — yet the session must rebuild
+    /// snapshot + subscription + pump and make the next event reachable on a
+    /// fresh stream generation. "Snapshot succeeds but events never arrive
+    /// again" is not a recoverable outcome.</summary>
+    [Fact]
+    public async Task Overflowed_session_recovers_its_event_stream_through_the_public_entry_without_a_server_disconnect()
+    {
+        await using var host = new ScriptedEventHost();
+        host.Script = async (ordinal, stream, cancellationToken) =>
+        {
+            await AnswerHandshakeAsync(stream, cancellationToken);
+            if (ordinal == 0)
+            {
+                // Overflow connection: three DURABLE notifications, each with a
+                // gap so the connection's own (source) queue drains between
+                // sends — ONLY the session-level queue (capacity 2) overflows.
+                for (ulong i = 0; i < 3; i++)
+                {
+                    await WriteFrameAsync(
+                        stream, NotificationFrame(100 + i, "{\"type\":\"task_completed\"}"), cancellationToken);
+                    await Task.Delay(50, cancellationToken);
+                }
+                await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                // The socket stays healthy and every query keeps being
+                // answered — the drill must recover WITHOUT a server-side
+                // disconnect.
+                var answeredQueries = 0;
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                    if (++answeredQueries == 1)
+                    {
+                        // A NEW durable event arrives on the still-healthy
+                        // connection after the recovery query was answered.
+                        await WriteFrameAsync(
+                            stream, NotificationFrame(200, "{\"type\":\"run_started\"}"), cancellationToken);
+                    }
+                }
+            }
+            else
+            {
+                // The rebuilt connection announces the same next durable
+                // event, then keeps serving queries.
+                await WriteFrameAsync(stream, NotificationFrame(200, "{\"type\":\"run_started\"}"), cancellationToken);
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                }
+            }
+        };
+
+        var session = new ResumableSession(
+            () => ConnectAsync(host.Port),
+            new AgentConnectionOptions { NotificationCapacity = 2 });
+        try
+        {
+            var initial = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, initial.Watermark);
+
+            var reader0 = session.Events;
+            Assert.Equal(100ul, (await ReadEventAsync(reader0, TimeSpan.FromSeconds(10))).Envelope.Seq);
+            Assert.Equal(101ul, (await ReadEventAsync(reader0, TimeSpan.FromSeconds(10))).Envelope.Seq);
+            var overflow = await Assert.ThrowsAsync<AgentContractViolationException>(async () =>
+            {
+                var wait = reader0.WaitToReadAsync(CancellationToken.None).AsTask();
+                await wait.WaitAsync(TimeSpan.FromSeconds(10));
+            });
+            Assert.StartsWith("invalid work.event.queue", overflow.Message);
+            // The half-recovered state this drill starts from: queries work,
+            // the connection is healthy, the event stream is a closed
+            // generation.
+            Assert.True(session.IsConnected);
+
+            // Q4: the public entry alone — one plain query, no server-side
+            // disconnect — must rebuild snapshot + subscription + pump so the
+            // next durable event becomes reachable again.
+            var recovered = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, recovered.Watermark);
+
+            var reader1 = session.Events;
+            var fresh = await ReadEventAsync(reader1, TimeSpan.FromSeconds(10));
+            Assert.Equal("run_started", fresh.EventType);
+            Assert.Equal(200ul, fresh.Envelope.Seq);
+            Assert.NotSame(reader0, reader1);       // a NEW stream generation
+            Assert.False(reader0.TryRead(out _));   // the old generation stays closed
+            Assert.Equal(2, host.ConnectionsAccepted);
+            Assert.True(session.IsConnected);
+        }
+        finally
+        {
+            await session.DisposeAsync();
+        }
+    }
+
+    /// <summary>Q5 window 1: a notification the handshake snapshot's
+    /// watermark does not cover must not be consumable before the snapshot
+    /// has been applied. The Resynced handler is paused mid-invocation —
+    /// snapshot taken, not yet published — and the pump's already-taken
+    /// above-watermark event must wait behind that barrier, never reach the
+    /// consumer first and then be overwritten by the older snapshot.</summary>
+    [Fact]
+    public async Task Pump_delivers_no_event_before_the_resync_snapshot_takes_effect()
+    {
+        await using var host = new ScriptedEventHost();
+        var resyncEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseResync = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Script = async (_, stream, cancellationToken) =>
+        {
+            // Subscribe answered at watermark 41, then a DURABLE event ABOVE
+            // the watermark, then the snapshot answer: the event already sits
+            // in the connection's queue when the pump starts.
+            await AnswerOneRequestAsync(
+                stream, new { watermark = 41ul, resync_required = false }, cancellationToken);
+            await WriteFrameAsync(stream, NotificationFrame(42, "{\"type\":\"run_started\"}"), cancellationToken);
+            await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+            // The query that installed this connection re-issues its own
+            // snapshot on it — answer exactly that one, then park.
+            await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+            await Task.Delay(Timeout.Infinite, cancellationToken);
+        };
+
+        var session = new ResumableSession(() => ConnectAsync(host.Port));
+        session.Resynced += _ =>
+        {
+            resyncEntered.TrySetResult();
+            releaseResync.Task.Wait();
+        };
+        try
+        {
+            var drill = session.SnapshotAsync();
+            await resyncEntered.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // The controlled pause point "new pump ready, snapshot not yet
+            // applied": delivery must wait for the snapshot barrier.
+            var reader = session.Events;
+            Assert.False(
+                reader.TryRead(out _),
+                "an event above the snapshot watermark was delivered before Resynced applied the snapshot");
+
+            releaseResync.TrySetResult();
+            var snapshot = await drill.WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, snapshot.Watermark);
+
+            // After the barrier opens, the held event flows in host order.
+            var delivered = await ReadEventAsync(reader, TimeSpan.FromSeconds(10));
+            Assert.Equal("run_started", delivered.EventType);
+            Assert.Equal(42ul, delivered.Envelope.Seq);
+        }
+        finally
+        {
+            releaseResync.TrySetResult(); // unblock the handler if an assert threw
+            await session.DisposeAsync();
+        }
+    }
+
+    /// <summary>Q5 window 2: an old pump holding an already-taken
+    /// notification across an install boundary ("checked/read, not yet
+    /// delivered") must never deliver it into the new generation. The drill
+    /// seam parks the old pump on notification 101; the reconnect that
+    /// installs connection 1 releases it exactly at the install boundary
+    /// (inside the new snapshot's Resynced invocation); the new view must
+    /// contain only connection 1's event — no stale-queue pollution, no
+    /// state regression.</summary>
+    [Fact]
+    public async Task Superseded_pump_holding_a_notification_cannot_pollute_the_new_generation()
+    {
+        await using var host = new ScriptedEventHost();
+        var dropFirst = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        host.Script = async (ordinal, stream, cancellationToken) =>
+        {
+            await AnswerHandshakeAsync(stream, cancellationToken);
+            if (ordinal == 0)
+            {
+                // Two durable events: 100 relays normally, 101 is taken by
+                // the pump and held at the drill seam across the reconnect.
+                await WriteFrameAsync(stream, NotificationFrame(100, "{\"type\":\"turn_completed\"}"), cancellationToken);
+                await WriteFrameAsync(stream, NotificationFrame(101, "{\"type\":\"turn_completed\"}"), cancellationToken);
+                await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                await dropFirst.Task.WaitAsync(cancellationToken);
+            }
+            else
+            {
+                await WriteFrameAsync(stream, NotificationFrame(200, "{\"type\":\"run_started\"}"), cancellationToken);
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    await AnswerOneRequestAsync(stream, SnapshotPayload, cancellationToken);
+                }
+            }
+        };
+
+        var heldAtSeam = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseSeam = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var resyncs = 0;
+        var session = new ResumableSession(() => ConnectAsync(host.Port));
+        session.PumpDrillGate = notification =>
+        {
+            if (notification.Envelope.Seq == 101ul)
+            {
+                heldAtSeam.TrySetResult();
+                return releaseSeam.Task;
+            }
+            return Task.CompletedTask;
+        };
+        session.Resynced += _ =>
+        {
+            if (++resyncs == 2)
+            {
+                // The new generation is installed while the old pump is still
+                // parked at the seam: release it exactly across the boundary.
+                releaseSeam.TrySetResult();
+            }
+        };
+        try
+        {
+            await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            await heldAtSeam.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // Deterministic mid-stream loss, then the reconnect installs the
+            // new generation while the old pump still holds notification 101.
+            dropFirst.TrySetResult();
+            var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(10);
+            while (session.IsConnected)
+            {
+                Assert.True(DateTimeOffset.UtcNow < deadline, "the dropped connection never faulted");
+                await Task.Delay(20);
+            }
+            var reconnected = await session.SnapshotAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            Assert.Equal(41ul, reconnected.Watermark);
+            Assert.Equal(2, host.ConnectionsAccepted);
+
+            var reader = session.Events;
+            var next = await ReadEventAsync(reader, TimeSpan.FromSeconds(10));
+            Assert.Equal("run_started", next.EventType);
+            Assert.Equal(200ul, next.Envelope.Seq);
+            // The held 101 belongs to the superseded generation: it never
+            // reaches the new view (the fresh snapshot rebuilt all durable
+            // state), and the new view never regresses to it.
+            Assert.False(reader.TryRead(out _), "the superseded pump's notification polluted the new view");
+            Assert.Equal(2, resyncs);
+        }
+        finally
+        {
+            releaseSeam.TrySetResult();
+            await session.DisposeAsync();
+        }
+    }
+
     /// <summary>R13: a session-level queue overflow completes the current event
     /// stream (a monotonic terminal generation), but the session itself is NOT
     /// dead. A successful reconnect REBUILDS a fresh live stream, so a consumer
