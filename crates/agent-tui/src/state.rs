@@ -822,6 +822,10 @@ impl AppState {
     /// was already folded, either because the journal replay covered it (at
     /// or below the verified contiguous watermark) or because it is a
     /// redelivery of an event this view already applied.
+    ///
+    /// Only DURABLE events may be claimed. See
+    /// [`agent_contracts::RuntimeEvent::is_live_only`] for why the live
+    /// fragments must not be.
     fn claim_event(&mut self, run_id: RunId, seq: u64) -> bool {
         if run_id == self.run_id
             && let Some(watermark) = self.resynced_through_seq
@@ -933,11 +937,22 @@ impl AppState {
     }
 
     pub fn apply_runtime_event(&mut self, envelope: RuntimeEventEnvelope) {
-        // One shared rule for live consumption and replay: an event is
-        // applied at most once, in full. Skipping the WHOLE fold (not just
-        // the projection) is what stops a redelivered terminal event from
-        // re-activating a superseded operation or re-counting its tokens.
-        if !self.claim_event(envelope.run_id, envelope.seq) {
+        // R1: a journal cursor is NOT a stream-fragment identity. The contract
+        // already says so — `RuntimeEvent::is_live_only()` documents that
+        // `ModelDelta`/`ModelRetrying` repeat the preceding durable cursor and
+        // must not be filtered by a delivery cursor (agent-host already
+        // honours it). This consumer did not, so the first event claimed
+        // `(RunId, seq)` and every live fragment afterwards was dropped as a
+        // redelivery — no streamed text, no retry progress, and the operation
+        // fence never even ran.
+        //
+        // Their belonging is therefore decided by the identity they DO carry:
+        // `(TurnId, OperationId, generation)` via the `current_op` fence in
+        // `apply_event`.
+        if !envelope.event.is_live_only() && !self.claim_event(envelope.run_id, envelope.seq) {
+            // Durable event already folded, in full: skipping it entirely is
+            // what stops a redelivered terminal event from re-activating a
+            // superseded operation or re-counting its tokens.
             return;
         }
         self.apply_event(envelope);
@@ -1815,6 +1830,23 @@ pub fn format_result_lines(card: &ResultCard) -> Vec<String> {
     lines
 }
 
+/// R1 fixtures: a stable run identity plus increasing journal sequences, so a
+/// fold test models a REAL single-run stream. The previous shape minted a fresh
+/// `RunId` per event while pinning `seq = 1`, which silently bypassed the
+/// `(RunId, seq)` identity the consumer applies — that is why the live-stream
+/// regression had no failing test.
+#[cfg(test)]
+fn fixture_run() -> RunId {
+    static RUN: std::sync::OnceLock<RunId> = std::sync::OnceLock::new();
+    *RUN.get_or_init(RunId::new)
+}
+
+#[cfg(test)]
+fn fixture_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1839,8 +1871,8 @@ mod tests {
 
     fn envelope(event: RuntimeEvent) -> RuntimeEventEnvelope {
         RuntimeEventEnvelope {
-            run_id: RunId::new(),
-            seq: 1,
+            run_id: fixture_run(),
+            seq: fixture_seq(),
             timestamp_ms: 0,
             event,
         }
@@ -1853,6 +1885,114 @@ mod tests {
             generation,
             delta: text.into(),
         }
+    }
+
+    /// R1: `LiveSink` publishes every fragment with the SAME journal cursor as
+    /// the durable `ModelStarted` that opened the stream. A durable-sequence
+    /// identity must therefore not swallow them, or normal streamed output and
+    /// retry progress vanish — the regression this review found. The fragments
+    /// are validated by the identity they DO carry
+    /// (`TurnId`/`OperationId`/`generation`), not by a journal cursor.
+    #[test]
+    fn live_fragments_reusing_the_start_cursor_still_render() {
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        let turn = TurnId::new();
+        let op = OperationId::new();
+        // The durable start event occupies a real journal sequence...
+        let cursor = 100u64;
+        let live = |event: RuntimeEvent| RuntimeEventEnvelope {
+            run_id,
+            seq: cursor,
+            timestamp_ms: 0,
+            event,
+        };
+        app.apply_runtime_event(live(RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: op,
+            generation: 1,
+            surface_revision: 0,
+            model_round: 1,
+            prompt_layers: Default::default(),
+            turn_checkpoint: Default::default(),
+        }));
+
+        // ...and every live fragment repeats that same cursor.
+        app.apply_runtime_event(live(delta(turn, op, 1, "第一段")));
+        let transcript = |app: &AppState| -> String {
+            app.messages
+                .iter()
+                .filter(|message| message.role == UiRole::Assistant)
+                .map(|message| message.content.clone())
+                .collect()
+        };
+        assert!(
+            transcript(&app).contains("第一段"),
+            "a live fragment sharing the start cursor must still render: {:?}",
+            transcript(&app)
+        );
+
+        app.apply_runtime_event(live(RuntimeEvent::ModelRetrying {
+            turn_id: turn,
+            operation_id: op,
+            generation: 1,
+            attempt: 2,
+            delay_ms: 50,
+        }));
+        assert!(
+            app.status.contains("retrying"),
+            "the retry progress signal must reach the view: {}",
+            app.status
+        );
+
+        app.apply_runtime_event(live(delta(turn, op, 1, "第二段")));
+        let text = transcript(&app);
+        assert!(
+            text.contains("第一段") && text.contains("第二段"),
+            "both fragments must be visible in order: {text:?}"
+        );
+    }
+
+    /// The counterpart of R1: exempting live fragments from the durable
+    /// identity must NOT weaken the operation fence — a fragment from a
+    /// superseded generation is still dropped.
+    #[test]
+    fn a_live_fragment_from_a_superseded_generation_is_still_dropped() {
+        let run_id = RunId::new();
+        let mut app = AppState::new(run_id);
+        let turn = TurnId::new();
+        let current = OperationId::new();
+        let superseded = OperationId::new();
+        let cursor = 200u64;
+        let live = |event: RuntimeEvent| RuntimeEventEnvelope {
+            run_id,
+            seq: cursor,
+            timestamp_ms: 0,
+            event,
+        };
+        app.apply_runtime_event(live(RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: current,
+            generation: 7,
+            surface_revision: 0,
+            model_round: 1,
+            prompt_layers: Default::default(),
+            turn_checkpoint: Default::default(),
+        }));
+        app.apply_runtime_event(live(delta(turn, current, 7, "current")));
+        // Same cursor, older generation: the fence still rejects it.
+        app.apply_runtime_event(live(delta(turn, superseded, 2, "SUPERSEDED")));
+        let text: String = app
+            .messages
+            .iter()
+            .filter(|message| message.role == UiRole::Assistant)
+            .map(|message| message.content.clone())
+            .collect();
+        assert!(text.contains("current"), "{text:?}");
+        assert!(
+            !text.contains("SUPERSEDED"),
+            "the operation fence must still drop a superseded fragment: {text:?}"
+        );
     }
 
     #[test]
@@ -2604,7 +2744,7 @@ mod status_projection_tests {
         assert_eq!(app.current_task, Some((focused, 3)));
 
         app.apply_runtime_event(envelope(
-            2,
+            4,
             RuntimeEvent::EffectAckDebt {
                 debt: serde_json::from_value(serde_json::json!({
                     "operation_id": agent_contracts::OperationId::new(),
@@ -2619,7 +2759,7 @@ mod status_projection_tests {
         assert_eq!(app.unresolved_ack_debts, 1);
 
         app.apply_runtime_event(envelope(
-            3,
+            5,
             RuntimeEvent::EffectAckDebtResolved {
                 debt: serde_json::from_value(serde_json::json!({
                     "operation_id": agent_contracts::OperationId::new(),
@@ -2753,7 +2893,7 @@ mod status_projection_tests {
 
     fn envelope(seq: u64, event: RuntimeEvent) -> RuntimeEventEnvelope {
         RuntimeEventEnvelope {
-            run_id: RunId::new(),
+            run_id: fixture_run(),
             seq,
             timestamp_ms: seq,
             event,
