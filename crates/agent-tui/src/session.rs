@@ -7,7 +7,7 @@
 
 use std::{io, path::PathBuf, sync::Arc, time::Duration};
 
-use agent_contracts::{ApprovalDecision, RuntimeEventEnvelope};
+use agent_contracts::{ApprovalDecision, RuntimeEventEnvelope, TaskId};
 use agent_core::{ApprovalBroker, InteractiveApprovalGate, TaskApprovalGate};
 use agent_runtime::{CheckpointStore, RuntimeHandle, RuntimeInstance, decode_checkpoint_bytes};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -101,6 +101,264 @@ impl UiSink for TerminalSink<'_> {
     }
 }
 
+/// Bounded queue for commands that act on the runtime's task identity or
+/// touch the disk. ONE worker drains it in submission order, so the order
+/// the operator typed the commands is the order the runtime receives them.
+/// The previous code spawned a detached task per command, which only ever
+/// guaranteed arrival order — `/task B` followed by `/continue` could reach
+/// the actor in the opposite order and continue the task that happened to
+/// be active.
+const COMMAND_QUEUE_CAP: usize = 32;
+
+/// How many runtime events one frame may fold before yielding to the
+/// keyboard. A flood of events must not starve input.
+const DRAIN_BUDGET_PER_FRAME: usize = 2048;
+
+/// A command whose effect depends on the runtime's task identity, or that
+/// does slow storage I/O. Submitted in typing order and executed off the
+/// draw loop, so a slow disk never freezes the operator's input.
+#[derive(Debug)]
+enum SessionCommand {
+    Work {
+        goal: String,
+    },
+    Focus {
+        goal: String,
+    },
+    Activate {
+        task_id: TaskId,
+    },
+    Suspend {
+        observed: Option<TaskId>,
+    },
+    /// Continue exactly the task the operator observed. A mismatch starts
+    /// no turn and is reported naming the live task.
+    Continue {
+        observed: Option<TaskId>,
+    },
+    /// Close the observed task. `CompleteTask` has no identity-expecting
+    /// variant yet, so this is a checked refusal, not an atomic guarantee:
+    /// the worker compares a fresh status snapshot and refuses on mismatch.
+    Done {
+        summary: String,
+        observed: Option<TaskId>,
+    },
+    Checkpoint,
+    Restore {
+        target: String,
+    },
+}
+
+/// A view fact a command resolved off the draw loop. The loop applies it, so
+/// the panel still shows e.g. the checkpoint that was just saved even though
+/// the slow work did not happen on the draw thread.
+#[derive(Debug)]
+enum ViewFact {
+    CheckpointSaved { artifact: String },
+}
+
+/// Execute queued commands in submission order. Runs for the life of the
+/// session; the sender being dropped ends it.
+async fn run_command_worker(
+    mut commands: tokio::sync::mpsc::Receiver<SessionCommand>,
+    handle: RuntimeHandle,
+    plane: std::sync::Arc<agent_runtime::RuntimeCheckpointPlane>,
+    notice_tx: tokio::sync::mpsc::Sender<String>,
+    view_tx: tokio::sync::mpsc::Sender<ViewFact>,
+    checkpoint_dir: PathBuf,
+) {
+    use agent_runtime::{ContinueOutcome, SuspendOutcome};
+
+    while let Some(command) = commands.recv().await {
+        match command {
+            SessionCommand::Work { goal } => {
+                match crate::work::start_long_task(&handle, goal).await {
+                    Ok(submission) => {
+                        if let Some(warning) = submission.task_manage_notice {
+                            let _ = notice_tx.try_send(warning);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = notice_tx.try_send(format!("work failed: {error}"));
+                    }
+                }
+            }
+            SessionCommand::Focus { goal } => {
+                if let Err(error) = handle.set_focus(goal).await {
+                    let _ = notice_tx.try_send(format!("focus failed: {error}"));
+                }
+            }
+            SessionCommand::Activate { task_id } => {
+                if let Err(error) = handle.activate_task(task_id).await {
+                    let _ = notice_tx.try_send(format!("task failed: {error}"));
+                }
+            }
+            SessionCommand::Suspend { observed } => {
+                match handle.suspend_task_expecting(observed).await {
+                    Ok(SuspendOutcome::Suspended { .. }) => {}
+                    Ok(other) => {
+                        let _ = notice_tx.try_send(format!(
+                            "suspend refused: the runtime is not on the task you observed ({other:?})"
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = notice_tx.try_send(format!("suspend failed: {error}"));
+                    }
+                }
+            }
+            SessionCommand::Continue { observed } => {
+                match handle.continue_active_task_expecting(observed).await {
+                    Ok(ContinueOutcome::Continued { task_id }) => {
+                        let _ = notice_tx.try_send(format!("continuing task {task_id}"));
+                    }
+                    Ok(ContinueOutcome::ExpectedTaskMismatch { active_task_id }) => {
+                        // No turn was started. Name what is actually live so
+                        // the operator can re-target instead of silently
+                        // continuing someone else's work.
+                        let _ = notice_tx.try_send(identity_mismatch_notice(
+                            "continue",
+                            observed,
+                            active_task_id,
+                            "no turn started",
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = notice_tx.try_send(format!("continue failed: {error}"));
+                    }
+                }
+            }
+            SessionCommand::Done { summary, observed } => {
+                // `CompleteTask` carries no expected identity in the shared
+                // contract, so this is a fresh-snapshot check immediately
+                // before the call — it narrows the window, it does not close
+                // it. Refusing is the safe direction: never close a task the
+                // operator was not looking at.
+                match handle.status_snapshot().await {
+                    Ok(snapshot) if observed.is_some() && snapshot.focus_task_id != observed => {
+                        let _ = notice_tx.try_send(identity_mismatch_notice(
+                            "done",
+                            observed,
+                            snapshot.focus_task_id,
+                            "nothing was closed",
+                        ));
+                    }
+                    Ok(_) => {
+                        if let Err(error) = handle.complete_current_task(summary).await {
+                            let _ = notice_tx.try_send(format!("done failed: {error}"));
+                        }
+                    }
+                    Err(error) => {
+                        let _ = notice_tx.try_send(format!("done failed: {error}"));
+                    }
+                }
+            }
+            SessionCommand::Checkpoint => {
+                // The runtime snapshot and the atomic store write are both
+                // off the draw loop: the operator's keyboard stays live while
+                // a large checkpoint is written.
+                let store = CheckpointStore::new(checkpoint_dir.clone());
+                match plane.capture().await {
+                    Ok(checkpoint) => {
+                        let tasks = checkpoint.tasks.tasks.len();
+                        match serde_json::to_vec(&checkpoint) {
+                            Ok(bytes) => match store.write_atomic(&bytes).await {
+                                Ok(stored) => {
+                                    let line = format!(
+                                        "checkpoint saved ({tasks} tasks): {}",
+                                        stored.artifact
+                                    );
+                                    let _ = view_tx
+                                        .try_send(ViewFact::CheckpointSaved {
+                                            artifact: stored.artifact.clone(),
+                                        })
+                                        .map_err(|_| ());
+                                    let _ = notice_tx.try_send(line);
+                                }
+                                Err(error) => {
+                                    let _ = notice_tx
+                                        .try_send(format!("checkpoint write failed: {error}"));
+                                }
+                            },
+                            Err(error) => {
+                                let _ = notice_tx
+                                    .try_send(format!("checkpoint serialize failed: {error}"));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let _ = notice_tx.try_send(format!("checkpoint failed: {error}"));
+                    }
+                }
+            }
+            SessionCommand::Restore { target } => {
+                let path = resolve_restore_target(&checkpoint_dir, target.trim());
+                let result = async {
+                    let bytes = read_checkpoint_bounded(&path).await?;
+                    let checkpoint = decode_checkpoint_bytes(&bytes)
+                        .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+                    plane.restore(checkpoint).await.map_err(anyhow::Error::from)
+                }
+                .await;
+                match result {
+                    Ok(()) => {
+                        // Keep the operator-visible wording the product
+                        // already documents.
+                        let _ = notice_tx.try_send(
+                            "runtime restored; /continue resumes the active task".to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = notice_tx.try_send(format!("restore failed: {error}"));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The refusal notice for an identity-checked command that named a task the
+/// runtime is not on. Names both sides so the operator can re-target instead
+/// of assuming the command took effect. Pure so the wording is testable
+/// without a live runtime.
+fn identity_mismatch_notice(
+    command: &str,
+    observed: Option<TaskId>,
+    live: Option<TaskId>,
+    effect: &str,
+) -> String {
+    fn name(task_id: Option<TaskId>) -> String {
+        task_id.map_or_else(|| "no task".to_string(), |task_id| task_id.to_string())
+    }
+    format!(
+        "{command} refused: you observed {}, the live task is {} — {effect}",
+        name(observed),
+        name(live)
+    )
+}
+
+/// Submit one command, in order, or say why it was not accepted. A full
+/// queue is reported rather than silently dropped: the operator must know
+/// that a typed action did not reach the runtime.
+fn submit_command(
+    commands: &tokio::sync::mpsc::Sender<SessionCommand>,
+    app: &mut AppState,
+    command: SessionCommand,
+) -> bool {
+    match commands.try_send(command) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
+            app.push_system(format!(
+                "command queue is full ({COMMAND_QUEUE_CAP}); {command:?} was NOT submitted — wait for the pending commands to finish"
+            ));
+            false
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            app.push_system("command worker is gone; the command was not submitted".into());
+            false
+        }
+    }
+}
+
 /// Drive one interactive session to completion. Returns when the operator
 /// quits (Ctrl-C or `/quit`); the caller owns runtime shutdown.
 #[allow(clippy::too_many_arguments)]
@@ -145,24 +403,55 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
     // comes back through this channel: printing to stdout directly would
     // corrupt the alternate-screen frame.
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::channel::<String>(NOTICE_CHANNEL_CAP);
+    // U6: one bounded, ordered lane for commands that act on the runtime's
+    // task identity or touch the disk. A single worker drains it in
+    // submission order, so the operator's typing order is the order the
+    // runtime receives.
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_QUEUE_CAP);
+    let (view_tx, mut view_rx) = tokio::sync::mpsc::channel::<ViewFact>(8);
+    tokio::spawn(run_command_worker(
+        command_rx,
+        handle.clone(),
+        runtime.checkpoint_plane(),
+        notice_tx.clone(),
+        view_tx,
+        checkpoint_dir.clone(),
+    ));
 
     loop {
         let traces_dir = checkpoint_dir
             .parent()
             .map(|state_dir| state_dir.join("traces"))
             .unwrap_or_else(|| checkpoint_dir.clone());
-        loop {
+        // Bounded per-frame drain: a flood of events must not starve input.
+        let mut drained = 0usize;
+        while drained < DRAIN_BUDGET_PER_FRAME {
             match runtime_events.try_recv() {
-                Ok(event) => app.apply_runtime_event(event),
+                Ok(event) => {
+                    app.apply_runtime_event(event);
+                    drained += 1;
+                }
                 Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
                     // A Lagged receiver dropped events it never saw. Hide
-                    // nothing: name the loss, rebuild the projection from
-                    // the durable journal (current run only), and continue.
+                    // nothing: name the loss, rebuild the view from the
+                    // durable journal (current run only), and continue. The
+                    // rebuild marks itself PARTIAL when it cannot verify a
+                    // contiguous prefix, and /status says so too.
                     let (folded, partial) = app.resync_projection(&traces_dir).await;
                     app.push_system(format!(
-                        "warning: the UI fell behind and dropped {skipped} runtime events; the status projection was resynced from the journal ({folded} events folded){}",
-                        if partial { " — PARTIAL: a journal file was unreadable or truncated" } else { "" }
+                        "warning: the UI fell behind and dropped {skipped} runtime events; the view was resynced from the journal ({folded} events folded){}",
+                        if partial {
+                            format!(
+                                " — PARTIAL: {}",
+                                app.view_partial_reason
+                                    .as_deref()
+                                    .unwrap_or("the replay could not be verified")
+                            )
+                        } else {
+                            String::new()
+                        }
                     ));
+                    drained += 1;
                 }
                 Err(_) => break,
             }
@@ -174,6 +463,13 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
         }
         while let Ok(line) = notice_rx.try_recv() {
             app.push_system(line);
+        }
+        while let Ok(fact) = view_rx.try_recv() {
+            // View facts resolved by an off-loop command task, applied here
+            // so the panel still reflects them.
+            match fact {
+                ViewFact::CheckpointSaved { artifact } => app.last_checkpoint = Some(artifact),
+            }
         }
 
         sink.draw(&app)?;
@@ -254,9 +550,9 @@ pub(crate) async fn run_session<S: UiSource, O: UiSink>(
                     &mut app,
                     trimmed,
                     &handle,
-                    runtime,
                     interactive.as_ref(),
                     &notice_tx,
+                    &command_tx,
                     &checkpoint_dir,
                 )
                 .await?;
@@ -287,23 +583,25 @@ async fn dispatch_command(
     app: &mut AppState,
     trimmed: &str,
     handle: &RuntimeHandle,
-    runtime: &RuntimeInstance,
     interactive: Option<&InteractiveHandle>,
     notice_tx: &tokio::sync::mpsc::Sender<String>,
+    commands: &tokio::sync::mpsc::Sender<SessionCommand>,
     checkpoint_dir: &std::path::Path,
 ) -> anyhow::Result<bool> {
     if trimmed == "/quit" {
         return Ok(false);
     }
+    // U6: the task an identity-checked command should act on, as the
+    // operator last observed it.
+    let observed = app.observed_task;
     if let Some(goal) = trimmed.strip_prefix("/focus ") {
-        let handle = handle.clone();
-        let notice_tx = notice_tx.clone();
-        let goal = goal.trim().to_string();
-        tokio::spawn(async move {
-            if let Err(error) = handle.set_focus(goal).await {
-                let _ = notice_tx.try_send(format!("focus failed: {error}"));
-            }
-        });
+        submit_command(
+            commands,
+            app,
+            SessionCommand::Focus {
+                goal: goal.trim().to_string(),
+            },
+        );
         return Ok(true);
     }
     if let Some(id_text) = trimmed.strip_prefix("/task ") {
@@ -312,13 +610,7 @@ async fn dispatch_command(
         // `/continue` does.
         match id_text.trim().parse::<agent_contracts::TaskId>() {
             Ok(task_id) => {
-                let handle = handle.clone();
-                let notice_tx = notice_tx.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = handle.activate_task(task_id).await {
-                        let _ = notice_tx.try_send(format!("task failed: {error}"));
-                    }
-                });
+                submit_command(commands, app, SessionCommand::Activate { task_id });
             }
             Err(error) => {
                 app.push_system(format!("invalid task id: {error}"));
@@ -361,21 +653,9 @@ async fn dispatch_command(
         // attaches the PreferSurface demand for task.manage onto an empty
         // requirement set, and delivers the goal once through the normal
         // user-message path inside one serialized command. No second
-        // orchestrator.
-        let handle = handle.clone();
-        let notice_tx = notice_tx.clone();
-        tokio::spawn(async move {
-            match crate::work::start_long_task(&handle, goal).await {
-                Ok(submission) => {
-                    if let Some(warning) = submission.task_manage_notice {
-                        let _ = notice_tx.try_send(warning);
-                    }
-                }
-                Err(error) => {
-                    let _ = notice_tx.try_send(format!("work failed: {error}"));
-                }
-            }
-        });
+        // orchestrator. Queued so it cannot overtake a task command the
+        // operator typed first.
+        submit_command(commands, app, SessionCommand::Work { goal });
         return Ok(true);
     }
     if trimmed == "/plan" {
@@ -490,13 +770,7 @@ async fn dispatch_command(
         return Ok(true);
     }
     if trimmed == "/suspend" {
-        let handle = handle.clone();
-        let notice_tx = notice_tx.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle.suspend_task().await {
-                let _ = notice_tx.try_send(format!("suspend failed: {error}"));
-            }
-        });
+        submit_command(commands, app, SessionCommand::Suspend { observed });
         return Ok(true);
     }
     if let Some(content) = trimmed.strip_prefix("/pin ") {
@@ -511,14 +785,16 @@ async fn dispatch_command(
         return Ok(true);
     }
     if let Some(summary) = trimmed.strip_prefix("/done ") {
-        let handle = handle.clone();
-        let notice_tx = notice_tx.clone();
-        let summary = summary.trim().to_string();
-        tokio::spawn(async move {
-            if let Err(error) = handle.complete_current_task(summary).await {
-                let _ = notice_tx.try_send(format!("done failed: {error}"));
-            }
-        });
+        // Queued for ordering and checked against the observed task in the
+        // worker (CompleteTask has no identity-expecting variant yet).
+        submit_command(
+            commands,
+            app,
+            SessionCommand::Done {
+                summary: summary.trim().to_string(),
+                observed,
+            },
+        );
         return Ok(true);
     }
     if trimmed == "/context" {
@@ -583,53 +859,21 @@ async fn dispatch_command(
         return Ok(true);
     }
     if trimmed == "/checkpoint" {
-        // The manual save rides the same atomic envelope store as the
-        // automatic safe points: one format, one retention domain,
-        // checksum verified on load.
-        let store = CheckpointStore::new(checkpoint_dir.to_path_buf());
-        match runtime.checkpoint().await {
-            Ok(checkpoint) => {
-                let tasks = checkpoint.tasks.tasks.len();
-                let bytes = match serde_json::to_vec(&checkpoint) {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        app.push_system(format!("checkpoint serialize failed: {error}"));
-                        return Ok(true);
-                    }
-                };
-                match store.write_atomic(&bytes).await {
-                    Ok(stored) => {
-                        app.last_checkpoint = Some(stored.artifact.clone());
-                        app.push_system(format!(
-                            "checkpoint saved ({tasks} tasks): {}",
-                            stored.artifact
-                        ));
-                    }
-                    Err(error) => app.push_system(format!("checkpoint write failed: {error}")),
-                }
-            }
-            Err(error) => app.push_system(format!("checkpoint failed: {error}")),
-        }
+        // Queued in typing order and executed off the draw loop: the manual
+        // save rides the same atomic envelope store as the automatic safe
+        // points (one format, one retention domain, checksum verified on
+        // load), and a slow disk no longer freezes the operator's keyboard.
+        submit_command(commands, app, SessionCommand::Checkpoint);
         return Ok(true);
     }
     if let Some(restore_target) = trimmed.strip_prefix("/restore ") {
-        let result = async {
-            let path = resolve_restore_target(checkpoint_dir, restore_target.trim());
-            let bytes = read_checkpoint_bounded(&path).await?;
-            let checkpoint = decode_checkpoint_bytes(&bytes)
-                .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
-            runtime
-                .restore(checkpoint)
-                .await
-                .map_err(anyhow::Error::from)
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                app.push_system("runtime restored; /continue resumes the active task".to_string())
-            }
-            Err(error) => app.push_system(format!("restore failed: {error}")),
-        }
+        submit_command(
+            commands,
+            app,
+            SessionCommand::Restore {
+                target: restore_target.trim().to_string(),
+            },
+        );
         return Ok(true);
     }
     if trimmed == "/cancel" {
@@ -644,13 +888,11 @@ async fn dispatch_command(
         // not re-ingested. Refusals (no active task, busy runtime,
         // recovery required) surface here; the started turn itself is
         // event-driven (`TaskContinuationStarted`).
-        let handle = handle.clone();
-        let notice_tx = notice_tx.clone();
-        tokio::spawn(async move {
-            if let Err(error) = handle.continue_active_task().await {
-                let _ = notice_tx.try_send(format!("continue failed: {error}"));
-            }
-        });
+        //
+        // U6: submitted in typing order and identity-checked against the
+        // task the operator observed, so `/task B` immediately followed by
+        // `/continue` cannot continue whatever happened to be active.
+        submit_command(commands, app, SessionCommand::Continue { observed });
         return Ok(true);
     }
 
@@ -1850,6 +2092,101 @@ mod exec4_restore_read_tests {
                 .contains("exceeds the checkpoint artifact bound"),
             "the refusal names the bound: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod command_queue_tests {
+    use super::*;
+
+    fn app() -> AppState {
+        AppState::new(agent_contracts::RunId::new())
+    }
+
+    /// The whole point of the lane: one consumer sees the commands in the
+    /// order the operator typed them.
+    #[tokio::test]
+    async fn queued_commands_are_delivered_in_submission_order() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionCommand>(COMMAND_QUEUE_CAP);
+        let mut app = app();
+        let first = TaskId::new();
+        let second = TaskId::new();
+        assert!(submit_command(
+            &tx,
+            &mut app,
+            SessionCommand::Activate { task_id: first }
+        ));
+        assert!(submit_command(
+            &tx,
+            &mut app,
+            SessionCommand::Continue {
+                observed: Some(second)
+            }
+        ));
+        match rx.recv().await.expect("first command") {
+            SessionCommand::Activate { task_id } => assert_eq!(task_id, first),
+            other => panic!("commands arrived out of order: {other:?}"),
+        }
+        match rx.recv().await.expect("second command") {
+            SessionCommand::Continue { observed } => assert_eq!(observed, Some(second)),
+            other => panic!("commands arrived out of order: {other:?}"),
+        }
+    }
+
+    /// A full lane must report the drop. Silently discarding a typed action
+    /// is exactly the failure this lane exists to prevent.
+    #[tokio::test]
+    async fn a_full_queue_reports_the_drop_instead_of_losing_the_command() {
+        let (tx, _held_so_the_channel_stays_full) = tokio::sync::mpsc::channel::<SessionCommand>(1);
+        let mut app = app();
+        assert!(submit_command(&tx, &mut app, SessionCommand::Checkpoint));
+        assert!(
+            !submit_command(&tx, &mut app, SessionCommand::Checkpoint),
+            "the second submission cannot be delivered"
+        );
+        let last = app.messages.last().expect("a reported drop");
+        assert!(
+            last.content.contains("command queue is full"),
+            "the drop must be named: {}",
+            last.content
+        );
+        assert!(
+            last.content.contains("NOT submitted"),
+            "the drop must say the command did not reach the runtime: {}",
+            last.content
+        );
+    }
+
+    /// A closed worker is also reported, never assumed to have run.
+    #[tokio::test]
+    async fn a_closed_worker_is_reported() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<SessionCommand>(1);
+        drop(rx);
+        let mut app = app();
+        assert!(!submit_command(&tx, &mut app, SessionCommand::Checkpoint));
+        let last = app.messages.last().expect("a reported drop");
+        assert!(
+            last.content.contains("command worker is gone"),
+            "{}",
+            last.content
+        );
+    }
+
+    /// The refusal names both sides, so the operator can see which task the
+    /// runtime is actually on.
+    #[test]
+    fn an_identity_mismatch_names_both_tasks() {
+        let observed = TaskId::new();
+        let live = TaskId::new();
+        let notice =
+            identity_mismatch_notice("continue", Some(observed), Some(live), "no turn started");
+        assert!(notice.contains(&observed.to_string()), "{notice}");
+        assert!(notice.contains(&live.to_string()), "{notice}");
+        assert!(notice.contains("no turn started"), "{notice}");
+
+        let none = identity_mismatch_notice("done", None, Some(live), "nothing was closed");
+        assert!(none.contains("no task"), "{none}");
+        assert!(none.contains(&live.to_string()), "{none}");
     }
 }
 

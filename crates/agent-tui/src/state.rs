@@ -374,6 +374,12 @@ pub struct AppState {
     /// currently anchors, and how many effect-ack debts remain unresolved.
     /// `/status` renders these; nothing here drives effects.
     pub current_task: Option<(TaskId, u64)>,
+    /// The task the operator most recently saw this session. Used as the
+    /// `expected_task_id` for identity-checked commands, so a command typed
+    /// against task A cannot silently act on whatever became active later.
+    /// Not cleared by `FocusCleared`: the operator's last observation is
+    /// still task A even while it is suspended.
+    pub observed_task: Option<TaskId>,
     pub unresolved_ack_debts: usize,
     pub last_checkpoint: Option<String>,
     /// The explicit per-turn model-round budget (`--max-rounds`). `None`
@@ -444,6 +450,7 @@ impl AppState {
             streaming_row_open: false,
             queued_input_id: None,
             current_task: None,
+            observed_task: None,
             unresolved_ack_debts: 0,
             last_checkpoint: None,
             execution_budget: None,
@@ -877,6 +884,7 @@ impl AppState {
         self.input_tokens = 0;
         self.output_tokens = 0;
         self.current_task = None;
+        self.observed_task = None;
         self.unresolved_ack_debts = 0;
         self.last_checkpoint = None;
         self.result_card = ResultCard::default();
@@ -1003,6 +1011,7 @@ impl AppState {
                 // card across a task switch is what let task B's changes
                 // render under task A's durable completion header.
                 self.begin_card_for_task(Some(task_id));
+                self.observed_task = Some(task_id);
                 self.push_system(format!("focus -> task {task_id}: {goal}"));
             }
             RuntimeEvent::FocusCleared => {
@@ -1444,6 +1453,7 @@ impl AppState {
                 // card is bound to that task: material recorded for a
                 // different task must never render under this header.
                 self.result_card.task_id = Some(task_id);
+                self.observed_task = Some(task_id);
                 self.result_card.completion = Some(CardCompletion {
                     task_id,
                     anchor_revision,
