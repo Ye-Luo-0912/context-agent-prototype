@@ -22,6 +22,122 @@ fn fs_read(call_id: &str, path: &str) -> ToolOutput {
     }
 }
 
+fn visible_whole_file(path: &str, revision: &str) -> agent_contracts::FileBodyWindow {
+    agent_contracts::FileBodyWindow {
+        path: path.into(),
+        revision: Some(revision.into()),
+        start_line: None,
+        end_line: None,
+        covers_file: true,
+        complete: true,
+    }
+}
+
+#[tokio::test]
+async fn already_visible_foreground_body_is_not_reported_missing() {
+    // The Runtime keeps the just-completed fs.read in the TurnFrame while
+    // this engine preview still has no corresponding ToolObservation. The
+    // final request nevertheless carries the complete body window, so a
+    // second foreground lookup would be both redundant and a false miss.
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "inspect src/task.rs".into(),
+            budget_tokens: 10_000,
+            hints: ContextHints {
+                foreground_resources: vec![ResourceKey {
+                    path: "src/task.rs".into(),
+                    revision: Some("rev-1".into()),
+                }],
+                visible_body_windows: vec![visible_whole_file("src/task.rs", "rev-1")],
+                ..ContextHints::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    assert!(materialized.foreground.is_empty());
+    assert!(
+        materialized.optional_misses.is_empty(),
+        "an exact complete body already in this request is not a miss: {:?}",
+        materialized.optional_misses
+    );
+}
+
+#[tokio::test]
+async fn partial_or_stale_visible_body_does_not_hide_foreground_miss() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    for window in [
+        agent_contracts::FileBodyWindow {
+            path: "src/task.rs".into(),
+            revision: Some("rev-1".into()),
+            start_line: Some(1),
+            end_line: Some(10),
+            covers_file: false,
+            complete: true,
+        },
+        visible_whole_file("src/task.rs", "rev-2"),
+    ] {
+        let materialized = engine
+            .materialize(ContextQuery {
+                current_input: "inspect src/task.rs".into(),
+                budget_tokens: 10_000,
+                hints: ContextHints {
+                    foreground_resources: vec![ResourceKey {
+                        path: "src/task.rs".into(),
+                        revision: Some("rev-1".into()),
+                    }],
+                    visible_body_windows: vec![window],
+                    ..ContextHints::default()
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(materialized.foreground.len(), 0);
+        assert_eq!(materialized.optional_misses.total(), 1);
+        assert_eq!(
+            materialized.optional_misses.as_slice()[0].reason,
+            agent_contracts::ContextMaterializationMissReason::Missing
+        );
+    }
+}
+
+#[tokio::test]
+async fn visible_foreground_body_is_skipped_before_the_foreground_cap() {
+    let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "inspect a.rs b.rs c.rs".into(),
+            budget_tokens: 10_000,
+            hints: ContextHints {
+                foreground_resources: ["a.rs", "b.rs", "c.rs"]
+                    .into_iter()
+                    .map(|path| ResourceKey {
+                        path: path.into(),
+                        revision: Some("rev-1".into()),
+                    })
+                    .collect(),
+                visible_body_windows: vec![visible_whole_file("c.rs", "rev-1")],
+                ..ContextHints::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(materialized.optional_misses.total(), 2);
+    assert!(
+        materialized
+            .optional_misses
+            .iter()
+            .all(|miss| miss.identity.item_ref != "c.rs@rev-1")
+    );
+    assert!(
+        materialized.optional_misses.iter().all(|miss| {
+            miss.reason == agent_contracts::ContextMaterializationMissReason::Missing
+        })
+    );
+}
+
 #[tokio::test]
 async fn warm_body_is_projected_without_residency_change() {
     let engine = SimpleContextEngine::new(SimpleContextConfig::default());

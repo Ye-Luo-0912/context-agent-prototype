@@ -2234,8 +2234,16 @@ impl SimpleContextEngine {
             .hints
             .foreground_resources
             .iter()
-            .map(|key| normalize_resource_path(&key.path))
-            .filter(|path| !path.is_empty())
+            .filter_map(|key| {
+                let path = normalize_resource_path(&key.path);
+                if path.is_empty()
+                    || crate::materializer::foreground_body_already_visible(query, key, &path)
+                {
+                    None
+                } else {
+                    Some(path)
+                }
+            })
             .collect();
         if claims.is_empty() && foreground_paths.is_empty() {
             return resolution;
@@ -3242,7 +3250,7 @@ impl ContextEngine for SimpleContextEngine {
                     AgentError::Internal("context materialization id is exhausted".into())
                 })?;
         let materialization_id = state.materialization_revision;
-        let foreground_plan = materializer::plan_foreground(&state, &query, &[]);
+        let foreground_plan = materializer::plan_foreground(&state, &query, &[], &resolution);
         let required_plan =
             materializer::plan_required_with_resolution(&state, &query, &resolution);
         drop(state);

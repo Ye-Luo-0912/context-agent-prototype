@@ -17,7 +17,7 @@
 use agent_contracts::{
     AnchorRootClaim, AnchorRootStrength, ContextEngine, ContextItemId, ContextKind,
     ContextMaterializationMissReason, ContextQuery, ContextResidency, ContextRetention,
-    ContextScope, RootReason, ScopeId, ScopeKind,
+    ContextScope, ResourceKey, RootReason, ScopeId, ScopeKind,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -337,6 +337,78 @@ async fn a_prompt_required_ref_to_a_pending_card_is_resolved_and_served() {
         materialized.items.iter().any(|item| item.item_id == target),
         "the resolved pending body must reach the frame: {:?}",
         materialized.items
+    );
+}
+
+#[tokio::test]
+async fn foreground_miss_over_unread_cold_pages_is_not_claimed_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = w1_config(&dir, 2, 0);
+    let source = SimpleContextEngine::new(config.clone());
+    open_focus(&source, "foreground cold page reason").await;
+    externalize_in_scope(&source, None, "cold-one").await;
+    externalize_in_scope(&source, None, "cold-two").await;
+    externalize_in_scope(&source, None, "cold-three").await;
+    let checkpoint = source.checkpoint().await.unwrap();
+
+    let engine = SimpleContextEngine::new(config);
+    engine.restore(checkpoint).await.unwrap();
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            !state.pending_external_cards.is_empty(),
+            "the fixture must leave unread cold cards"
+        );
+    }
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "inspect cold-target.rs".into(),
+            budget_tokens: 100_000,
+            hints: agent_contracts::ContextHints {
+                foreground_resources: vec![ResourceKey {
+                    path: "cold-target.rs".into(),
+                    revision: Some("rev-missing".into()),
+                }],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(materialized.foreground.len(), 0);
+    assert_eq!(materialized.optional_misses.total(), 1);
+    assert_eq!(
+        materialized.optional_misses.as_slice()[0].reason,
+        ContextMaterializationMissReason::UnreadColdPage,
+        "unread pending cards make foreground absence unproven: {:?}",
+        materialized.optional_misses
+    );
+
+    let complete_scan = SimpleContextEngine::new(w1_config(&dir, 2, 64));
+    complete_scan
+        .restore(source.checkpoint().await.unwrap())
+        .await
+        .unwrap();
+    let materialized = complete_scan
+        .materialize(ContextQuery {
+            current_input: "inspect cold-target.rs".into(),
+            budget_tokens: 100_000,
+            hints: agent_contracts::ContextHints {
+                foreground_resources: vec![ResourceKey {
+                    path: "cold-target.rs".into(),
+                    revision: Some("rev-missing".into()),
+                }],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        materialized.optional_misses.as_slice()[0].reason,
+        ContextMaterializationMissReason::Missing,
+        "after the complete cold scan, the proven absence is Missing: {:?}",
+        materialized.optional_misses
     );
 }
 

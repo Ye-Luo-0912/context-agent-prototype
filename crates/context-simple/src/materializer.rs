@@ -909,20 +909,34 @@ pub(crate) fn plan_foreground(
     state: &State,
     query: &ContextQuery,
     selected: &[MaterializedItem],
+    // The bounded pending-card resolution supplies the honest reason for a
+    // path miss: an unexamined cold remainder is `UnreadColdPage`, while a
+    // fully examined directory permits `Missing`.
+    resolution: &RequiredColdResolution,
 ) -> ForegroundPlan {
     let mut plan = Vec::new();
     let mut misses = ContextMaterializationMisses::default();
     for key in &query.hints.foreground_resources {
+        let path = normalize_resource_path(&key.path);
+        if path.is_empty() {
+            continue;
+        }
+        // The runtime may already carry a complete body for this exact
+        // path@revision in the same model request (for example, the
+        // fs.read result that has not yet been ingested into the engine at
+        // the end of the current turn). That body is already visible to the
+        // model, so it must not be planned a second time or reported as a
+        // Missing foreground body. A bounded/partial or mismatched window
+        // deliberately does not satisfy this check.
+        if foreground_body_already_visible(query, key, &path) {
+            continue;
+        }
         if plan.len() >= MAX_FOREGROUND_RESOURCES {
             misses.push(context_miss(
                 resource_identity(key),
                 ContextMaterializationMissReason::BudgetExcluded,
             ));
             break;
-        }
-        let path = normalize_resource_path(&key.path);
-        if path.is_empty() {
-            continue;
         }
         if selected_includes_file_body(selected, &path) {
             continue;
@@ -966,7 +980,14 @@ pub(crate) fn plan_foreground(
         } else {
             misses.push(context_miss(
                 identity,
-                ContextMaterializationMissReason::Missing,
+                if resolution.pending_unread > 0 {
+                    // A bounded foreground scan that left cold cards unread
+                    // cannot prove this path absent. Keep the miss resumable
+                    // instead of claiming a permanent Missing result.
+                    ContextMaterializationMissReason::UnreadColdPage
+                } else {
+                    ContextMaterializationMissReason::Missing
+                },
             ));
         }
     }
@@ -1107,6 +1128,34 @@ fn selected_includes_file_body(selected: &[MaterializedItem], path: &str) -> boo
         };
         item.content != descriptor
     })
+}
+
+pub(crate) fn foreground_body_already_visible(
+    query: &ContextQuery,
+    key: &agent_contracts::ResourceKey,
+    normalized_path: &str,
+) -> bool {
+    let Some(revision) = key
+        .revision
+        .as_deref()
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+    else {
+        // A path without a stamped revision cannot be matched to a specific
+        // body version safely.
+        return false;
+    };
+    query
+        .hints
+        .visible_body_windows
+        .iter()
+        .take(agent_contracts::MAX_VISIBLE_BODY_WINDOWS)
+        .any(|window| {
+            window.complete
+                && window.covers_file
+                && normalize_resource_path(&window.path) == normalized_path
+                && window.revision.as_deref().map(str::trim) == Some(revision)
+        })
 }
 
 fn revision_ok(item_revision: Option<&str>, wanted: Option<&str>) -> bool {
