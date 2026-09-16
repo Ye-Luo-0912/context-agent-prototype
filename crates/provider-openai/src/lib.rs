@@ -1275,6 +1275,10 @@ impl ModelEventSink for NoopSink {
 }
 
 #[cfg(test)]
+#[path = "task_sequence_tests.rs"]
+mod task_sequence_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use agent_contracts::{
