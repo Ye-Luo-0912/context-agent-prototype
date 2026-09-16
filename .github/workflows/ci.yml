@@ -57,6 +57,15 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo check -p agent-host --all-targets
 
+      # E3 guard: the Linux test shards select crates with explicit -p lists,
+      # so a newly added workspace member could silently miss its Linux
+      # cargo test run. Compare cargo metadata's workspace members against
+      # the shard union parsed from this workflow's test matrix; anything
+      # not in a shard must be listed in the script with name and reason.
+      - name: Linux test shards cover the workspace
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/ci_shard_consistency.py
+
       # The context-service package owns its process-boundary integration
       # target and Cargo supplies the exact freshly-built binary through
       # CARGO_BIN_EXE; the workspace build also covers the shipped service.
@@ -88,7 +97,7 @@ jobs:
         include:
           - os: ubuntu-latest
             part: 1
-            cargo_pkgs: "-p context-simple -p agent-tui -p agent-workspace -p tool-runtime -p agent-process -p agent-conformance -p agent-replay"
+            cargo_pkgs: "-p context-simple -p agent-tui -p agent-workspace -p tool-runtime -p agent-process -p agent-conformance -p agent-replay -p agent-host"
           - os: ubuntu-latest
             part: 2
             cargo_pkgs: "-p agent-runtime -p agent-eval -p agent-contracts -p agent-platform-protocol -p context-baselines -p context-contextcore -p agent-capability-process -p agent-context-service -p agent-storage -p agent-core -p provider-openai -p agent-compose"
@@ -140,7 +149,9 @@ jobs:
       # contract suite is owned by the agent-context-service package and uses
       # Cargo's CARGO_BIN_EXE path, so Cargo itself rebuilds the exact binary;
       # no timestamp-based freshness workaround is needed. Part 1 (Ubuntu)
-      # contains none of these crates.
+      # contains none of these crates; agent-host is also self-sufficient
+      # there — its tests spawn only its own binary through
+      # CARGO_BIN_EXE_agent-host, which cargo test builds automatically.
       - name: Build cross-crate test fixtures
         if: matrix.part != 1
         shell: pwsh

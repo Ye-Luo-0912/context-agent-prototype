@@ -265,13 +265,31 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn project_markers_do_not_block_on_a_writerless_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
         use libc;
         let dir = tempfile::tempdir().unwrap();
         // Plant the FIFO under a real marker name so the scan must probe it.
         let fifo = dir.path().join("Cargo.toml");
-        let path = fifo.as_os_str().as_encoded_bytes().to_vec();
-        let rc = unsafe { libc::mkfifo(path.as_ptr() as *const libc::c_char, 0o600) };
+        // mkfifo needs a NUL-terminated C string; keep the CString allocation
+        // alive across the call so its pointer stays valid.
+        let path = CString::new(fifo.as_os_str().as_bytes()).expect("fixture path contains NUL");
+        let rc = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
         assert_eq!(rc, 0, "mkfifo fixture");
+        // The fixture really is a FIFO at the expected path: file type via
+        // metadata and raw S_IFIFO mode bits both agree.
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let meta = std::fs::metadata(&fifo).expect("fifo fixture must exist");
+        assert!(
+            meta.file_type().is_fifo(),
+            "fixture must be a FIFO: {fifo:?}"
+        );
+        assert_eq!(
+            meta.mode() & libc::S_IFMT,
+            libc::S_IFIFO,
+            "raw mode must report S_IFIFO"
+        );
         // Positive control: a real marker directory from PROJECT_MARKERS.
         std::fs::create_dir(dir.path().join("src")).unwrap();
         let workspace = Workspace::open(dir.path()).await.unwrap();
