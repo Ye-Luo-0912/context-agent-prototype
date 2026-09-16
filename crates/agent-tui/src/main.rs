@@ -6,7 +6,10 @@ mod state;
 mod ui;
 mod work;
 
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{Arc, Mutex},
+};
 
 use agent_compose::{
     ComposeConfig, ContextPolicy, HostToolPolicyRegistry, build_context_engine, compose,
@@ -17,8 +20,9 @@ use agent_storage::FileEventJournal;
 use agent_workspace::{Workspace, WorkspaceOutputBroker};
 use anyhow::Context;
 use crossterm::{
+    cursor::Show,
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use session::{
@@ -26,6 +30,238 @@ use session::{
     resolve_latest_checkpoint, run_session,
 };
 use tool_runtime::{BuiltinToolDispatcher, VerificationRecipes};
+
+// ===== U5: terminal session guard =====
+//
+// The interactive terminal is engaged in three independent steps: raw mode,
+// the alternate screen, and clearing it. The old code enabled raw mode with
+// `?` early returns between the steps, so any `?` after `enable_raw_mode()`
+// bypassed the tail restore and left the terminal wedged (raw/alternate,
+// cursor hidden). The guard tracks exactly which states *this process*
+// turned on and restores them on early return, on `Drop`, and in a panic
+// hook. It does NOT claim to recover a terminal killed by SIGKILL — only the
+// states this process itself engaged.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TermStep {
+    EnableRaw,
+    EnterAlt,
+    Clear,
+    ShowCursor,
+    LeaveAlt,
+    DisableRaw,
+}
+
+/// The terminal operations the guard drives. Abstracted so the guard's
+/// state machine is unit-testable without a PTY (see `RecordingTermBackend`
+/// in the `guard_tests` module).
+trait TermBackend: Send {
+    fn enable_raw_mode(&mut self) -> io::Result<()>;
+    fn enter_alternate_screen(&mut self) -> io::Result<()>;
+    fn clear(&mut self) -> io::Result<()>;
+    fn show_cursor(&mut self) -> io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> io::Result<()>;
+    fn disable_raw_mode(&mut self) -> io::Result<()>;
+    /// Real backends own the live `Terminal`; fakes return `None` so the
+    /// session can still draw through it while keeping the guard generic.
+    fn terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<io::Stdout>>>;
+}
+
+struct RealTermBackend {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl RealTermBackend {
+    fn new() -> io::Result<Self> {
+        let backend = CrosstermBackend::new(io::stdout());
+        let terminal = Terminal::new(backend)?;
+        Ok(Self { terminal })
+    }
+}
+
+impl TermBackend for RealTermBackend {
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        terminal::enable_raw_mode()
+    }
+    fn enter_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnterAlternateScreen)
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        self.terminal.clear()
+    }
+    fn show_cursor(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), Show)
+    }
+    fn leave_alternate_screen(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), LeaveAlternateScreen)
+    }
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        terminal::disable_raw_mode()
+    }
+    fn terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<io::Stdout>>> {
+        Some(&mut self.terminal)
+    }
+}
+
+/// Tracks which interactive-terminal states this process engaged. Restores
+/// them (in reverse order) on `restore`, `Drop`, and via the panic hook.
+#[derive(Debug)]
+struct TerminalGuard<B: TermBackend> {
+    backend: B,
+    raw_mode: bool,
+    alternate_screen: bool,
+    /// Observed enable/restore sequence. Ignored in production; unit tests
+    /// read it to prove the state machine engages and restores in order,
+    /// and restores partial state after an early failure.
+    steps: Vec<TermStep>,
+}
+
+impl<B: TermBackend> TerminalGuard<B> {
+    /// Engage the interactive terminal step by step. If any step fails after
+    /// a prior state was already turned on, the partially-engaged states are
+    /// restored *before* the error is returned — so an early `?` can never
+    /// leave the terminal wedged.
+    fn open(mut backend: B) -> anyhow::Result<Self> {
+        install_terminal_panic_hook();
+        let mut steps = Vec::new();
+
+        backend
+            .enable_raw_mode()
+            .map_err(|e| anyhow::anyhow!("enable raw mode: {e}"))?;
+        steps.push(TermStep::EnableRaw);
+        set_active_terminal_raw(true);
+
+        if let Err(error) = backend.enter_alternate_screen() {
+            let _ = Self {
+                backend,
+                raw_mode: true,
+                alternate_screen: false,
+                steps,
+            }
+            .restore();
+            return Err(anyhow::anyhow!("enter alternate screen: {error}"));
+        }
+        steps.push(TermStep::EnterAlt);
+        set_active_terminal_alt(true);
+
+        if let Err(error) = backend.clear() {
+            let _ = Self {
+                backend,
+                raw_mode: true,
+                alternate_screen: true,
+                steps,
+            }
+            .restore();
+            return Err(anyhow::anyhow!("clear terminal: {error}"));
+        }
+        steps.push(TermStep::Clear);
+
+        Ok(Self {
+            backend,
+            raw_mode: true,
+            alternate_screen: true,
+            steps,
+        })
+    }
+
+    /// Restore every state this process engaged, in reverse order, and report
+    /// each failure instead of swallowing it.
+    fn restore(&mut self) -> Vec<anyhow::Error> {
+        let mut errors = Vec::new();
+        if self.raw_mode || self.alternate_screen {
+            if let Err(e) = self.backend.show_cursor() {
+                errors.push(anyhow::anyhow!("show cursor: {e}"));
+            }
+            self.steps.push(TermStep::ShowCursor);
+        }
+        if self.alternate_screen {
+            if let Err(e) = self.backend.leave_alternate_screen() {
+                errors.push(anyhow::anyhow!("leave alternate screen: {e}"));
+            }
+            self.steps.push(TermStep::LeaveAlt);
+            self.alternate_screen = false;
+        }
+        if self.raw_mode {
+            if let Err(e) = self.backend.disable_raw_mode() {
+                errors.push(anyhow::anyhow!("disable raw mode: {e}"));
+            }
+            self.steps.push(TermStep::DisableRaw);
+            self.raw_mode = false;
+        }
+        set_active_terminal_raw(false);
+        set_active_terminal_alt(false);
+        errors
+    }
+
+    fn terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<io::Stdout>>> {
+        self.backend.terminal_mut()
+    }
+
+    #[cfg(test)]
+    fn steps(&self) -> &[TermStep] {
+        &self.steps
+    }
+}
+
+impl<B: TermBackend> Drop for TerminalGuard<B> {
+    fn drop(&mut self) {
+        // On drop we still restore, but errors cannot escape a destructor;
+        // `restore` already drives the real backend and records into `steps`.
+        let _ = self.restore();
+    }
+}
+
+/// The terminal state this process currently holds, shared with the panic
+/// hook so a panic can restore the terminal even though the guard value is
+/// not reachable from the hook.
+struct ActiveTerminalState {
+    raw: bool,
+    alt: bool,
+}
+
+static ACTIVE_TERMINAL: Mutex<ActiveTerminalState> = Mutex::new(ActiveTerminalState {
+    raw: false,
+    alt: false,
+});
+
+fn set_active_terminal_raw(on: bool) {
+    if let Ok(mut state) = ACTIVE_TERMINAL.lock() {
+        state.raw = on;
+    }
+}
+
+fn set_active_terminal_alt(on: bool) {
+    if let Ok(mut state) = ACTIVE_TERMINAL.lock() {
+        state.alt = on;
+    }
+}
+
+/// Install a panic hook (once) that restores the terminal before chaining the
+/// previous hook, so a panic never leaves the operator's prompt wedged in
+/// raw/alternate state with a hidden cursor.
+fn install_terminal_panic_hook() {
+    use std::sync::Once;
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Ok(mut state) = ACTIVE_TERMINAL.lock()
+                && (state.raw || state.alt)
+            {
+                let _ = execute!(io::stdout(), Show);
+                if state.alt {
+                    let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                }
+                if state.raw {
+                    let _ = terminal::disable_raw_mode();
+                }
+                state.raw = false;
+                state.alt = false;
+            }
+            previous(info);
+        }));
+    });
+}
 
 fn main() -> anyhow::Result<()> {
     // The re-entered host-death watchdog (PROCESS-01) must not run normal
@@ -305,16 +541,18 @@ async fn real_main() -> anyhow::Result<()> {
     }
     debug_assert!(jsonl_sink.is_none());
 
-    enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create terminal")?;
-    terminal.clear().context("clear terminal")?;
-
+    // U5: engage the interactive terminal behind a guard. Any `?` or early
+    // return past this point restores raw/alternate/cursor — the guard owns
+    // the terminal and restores on `Drop`; a panic restores via the hook.
+    let mut term = TerminalGuard::open(
+        RealTermBackend::new().map_err(|e| anyhow::anyhow!("create terminal: {e}"))?,
+    )?;
     let result = run_session(
         &mut TerminalSource,
-        &mut TerminalSink::new(&mut terminal),
+        &mut TerminalSink::new(
+            term.terminal_mut()
+                .expect("the real backend always owns a terminal"),
+        ),
         composed.handle().clone(),
         &composed.instance,
         &mut runtime_events,
@@ -327,18 +565,152 @@ async fn real_main() -> anyhow::Result<()> {
     )
     .await;
 
-    // cancel -> stop actor (flush journal, RunCompleted) -> stop modules ->
-    // join the actor; any failure is aggregated into one error.
+    // U5: two independent responsibilities, settled separately:
+    //   1. release the interactive terminal state FIRST, so an operator
+    //      regains a usable prompt even if runtime cleanup later stalls;
+    //   2. then run the bounded, reportable Runtime shutdown and aggregate
+    //      its error on its own.
+    let term_errors = term.restore();
     let shutdown_result = composed.shutdown().await;
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-    terminal.show_cursor().ok();
 
-    match (result, shutdown_result) {
-        (Err(ui_error), _) => Err(ui_error),
-        (Ok(()), Err(shutdown_error)) => {
+    match (result, shutdown_result, term_errors) {
+        (Err(ui_error), _, _) => Err(ui_error),
+        (_, Err(shutdown_error), _) => {
             Err(anyhow::Error::new(shutdown_error).context("runtime shutdown failed"))
         }
-        (Ok(()), Ok(())) => Ok(()),
+        (_, _, errors) if !errors.is_empty() => {
+            for error in &errors {
+                eprintln!("terminal restore: {error}");
+            }
+            Err(anyhow::anyhow!(
+                "terminal restore failed after the session ended"
+            ))
+        }
+        (Ok(()), Ok(()), _) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::*;
+
+    /// Test-only backend: records every operation it is asked to perform and
+    /// never touches a real terminal, so the guard's state machine is
+    /// observable without a PTY. `fail_at` makes one step return an error to
+    /// prove the guard restores partial state after an early failure.
+    #[derive(Debug, Clone)]
+    struct RecordingTermBackend {
+        steps: std::sync::Arc<std::sync::Mutex<Vec<TermStep>>>,
+        fail_at: Option<TermStep>,
+    }
+
+    impl RecordingTermBackend {
+        fn new() -> Self {
+            Self {
+                steps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: None,
+            }
+        }
+        fn with_failure(fail_at: TermStep) -> Self {
+            Self {
+                steps: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                fail_at: Some(fail_at),
+            }
+        }
+    }
+
+    impl TermBackend for RecordingTermBackend {
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.steps.lock().unwrap().push(TermStep::EnableRaw);
+            if self.fail_at == Some(TermStep::EnableRaw) {
+                Err(io::Error::other("injected failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn enter_alternate_screen(&mut self) -> io::Result<()> {
+            self.steps.lock().unwrap().push(TermStep::EnterAlt);
+            if self.fail_at == Some(TermStep::EnterAlt) {
+                Err(io::Error::other("injected failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn clear(&mut self) -> io::Result<()> {
+            self.steps.lock().unwrap().push(TermStep::Clear);
+            if self.fail_at == Some(TermStep::Clear) {
+                Err(io::Error::other("injected failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn show_cursor(&mut self) -> io::Result<()> {
+            self.steps.lock().unwrap().push(TermStep::ShowCursor);
+            Ok(())
+        }
+        fn leave_alternate_screen(&mut self) -> io::Result<()> {
+            self.steps.lock().unwrap().push(TermStep::LeaveAlt);
+            Ok(())
+        }
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.steps.lock().unwrap().push(TermStep::DisableRaw);
+            Ok(())
+        }
+        fn terminal_mut(&mut self) -> Option<&mut Terminal<CrosstermBackend<io::Stdout>>> {
+            None
+        }
+    }
+
+    /// The guard must engage (EnableRaw, EnterAlt, Clear) and, on drop,
+    /// restore in reverse order (ShowCursor, LeaveAlt, DisableRaw) — proving
+    /// the state machine is correct and observable without a PTY.
+    #[test]
+    fn guard_engages_then_restores_in_reverse_order() {
+        let backend = RecordingTermBackend::new();
+        let guard = TerminalGuard::open(backend.clone()).unwrap();
+        assert_eq!(
+            guard.steps(),
+            &[TermStep::EnableRaw, TermStep::EnterAlt, TermStep::Clear]
+        );
+        // Restoring happens on `Drop`.
+        drop(guard);
+        assert_eq!(
+            backend.steps.lock().unwrap().as_slice(),
+            &[
+                TermStep::EnableRaw,
+                TermStep::EnterAlt,
+                TermStep::Clear,
+                TermStep::ShowCursor,
+                TermStep::LeaveAlt,
+                TermStep::DisableRaw,
+            ]
+        );
+    }
+
+    /// The core U5 regression: a `?` early return after `enable_raw_mode`
+    /// used to bypass the tail restore and leave the terminal wedged. The
+    /// guard must restore the states it had already engaged (here: raw mode)
+    /// when a later step fails.
+    #[test]
+    fn guard_restores_partial_state_after_early_failure() {
+        let backend = RecordingTermBackend::with_failure(TermStep::EnterAlt);
+        let error = TerminalGuard::open(backend.clone()).unwrap_err();
+        let recorded = backend.steps.lock().unwrap();
+        assert!(
+            recorded.contains(&TermStep::EnableRaw),
+            "raw mode was engaged before the failure"
+        );
+        assert!(
+            recorded.contains(&TermStep::DisableRaw),
+            "raw mode must be restored after the early failure: {recorded:?}"
+        );
+        assert!(
+            !recorded.contains(&TermStep::LeaveAlt),
+            "alternate screen was never engaged, so it must not be left: {recorded:?}"
+        );
+        assert!(
+            error.to_string().contains("alternate screen"),
+            "the error must name the failing step: {error}"
+        );
     }
 }

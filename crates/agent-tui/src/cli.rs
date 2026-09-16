@@ -22,6 +22,12 @@ pub const EXIT_OK: i32 = 0;
 pub const EXIT_ERROR: i32 = 1;
 pub const EXIT_ROUND_BUDGET: i32 = 2;
 pub const EXIT_APPROVAL_DENIED: i32 = 3;
+/// U7: the run ended without a positive terminal event we can trust. The
+/// drain observed a gap (lagged/dropped events) or the event stream closed
+/// with no completion proof, so "no failure seen" is NOT reported as
+/// success. Exit 4 keeps the existing meanings of 0..3; this is a new,
+/// explicitly versioned outcome distinct from both success and denial.
+pub const EXIT_INCOMPLETE: i32 = 4;
 
 #[derive(Debug, Clone)]
 pub enum HeadlessAction {
@@ -363,6 +369,13 @@ pub async fn run_headless<W: Write + Send + 'static>(
         approval_denied: false,
         other_failure: None,
         timed_out: false,
+        // U7: the run must not claim success when it cannot prove a
+        // positive terminal event. A lagged receiver dropped events we
+        // never observed; a closed stream ended without any completion
+        // proof. Both are gaps, not evidence of success.
+        events_dropped: false,
+        dropped_count: 0,
+        closed_without_completion: false,
     };
     let mut sink = BoundedJsonlSink::spawn(jsonl);
     let mut sink_failure: Option<String> = None;
@@ -383,9 +396,24 @@ pub async fn run_headless<W: Write + Send + 'static>(
                     eprintln!(
                         "warning: headless consumer lagged and dropped {skipped} runtime events"
                     );
+                    // U7: record the gap. The dropped span may have carried a
+                    // denial, failure or settlement the tail `TurnCompleted`
+                    // would otherwise mask. We never invent what we missed:
+                    // this forces an explicit `incomplete` outcome below.
+                    outcome.events_dropped = true;
+                    outcome.dropped_count += skipped;
                     continue;
                 }
-                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Closed) => {
+                    // U7: in production the live `RuntimeHandle` owns the
+                    // broadcast Sender, so a normal run ends on a terminal
+                    // event or timeout — never via `Closed`. A `Closed` with
+                    // no completion proof means a defensive interface caller
+                    // (e.g. an already-closed receiver) and must not be read
+                    // as success.
+                    outcome.closed_without_completion = true;
+                    break;
+                }
             },
             _ = tokio::time::sleep(remaining) => {
                 outcome.timed_out = true;
@@ -394,8 +422,10 @@ pub async fn run_headless<W: Write + Send + 'static>(
         };
         outcome.observe(&envelope.event);
         if emit_jsonl_event(&envelope) {
-            let mut line = serde_json::to_vec(&envelope)?;
-            line.push(b'\n');
+            let line = serde_json::to_vec(&envelope)?;
+            // U7: `BoundedJsonlSink::write_line` already appends a single
+            // newline. Pushing one here produced a duplicate blank line per
+            // event; the sink owns the line boundary.
             if let Err(error) = sink.write_line(&line) {
                 // Slow consumer or disconnect: stop the drain with an
                 // explicit typed failure. The failure surfaces through the
@@ -408,6 +438,10 @@ pub async fn run_headless<W: Write + Send + 'static>(
     }
 
     let task_was_active = outcome.task_active;
+    // Capture the clean-completion signal before `finish()` consumes the
+    // drain: we use it to decide whether to prompt the Core to cancel the
+    // in-flight turn (U7 stop/output overlap).
+    let turn_completed = outcome.turn_completed;
     let mut result = outcome.finish();
     // Closure semantics for scripts: `operator_accepted` = durable
     // TaskCompleted; `awaiting_operator_review` = work produced but the
@@ -431,13 +465,22 @@ pub async fn run_headless<W: Write + Send + 'static>(
             "round_budget": result.round_budget,
             "approval_denied": result.approval_denied,
         });
-        let mut line = serde_json::to_vec(&session)?;
-        line.push(b'\n');
+        let line = serde_json::to_vec(&session)?;
+        // U7: `write_line` appends the terminating newline (see event path).
         if let Err(error) = sink.write_line(&line) {
             sink_failure = Some(error.to_string());
         }
     }
-    let (mut jsonl, flush_result) = sink.finish()?;
+    // U7: stop work and output drain settle separately. When the run did
+    // not reach a clean `turn_completed`, prompt the Core to cancel the
+    // in-flight turn *before* we wait on the output sink, so the runtime
+    // cleanup overlaps the (possibly slow) output drain instead of being
+    // deferred until after it. Skipped on a clean completion where there is
+    // nothing to cancel.
+    if !turn_completed {
+        let _ = handle.cancel_turn().await;
+    }
+    let (jsonl, flush_result) = sink.finish()?;
     if let Err(error) = flush_result {
         // The writer's own IO error is usually the disconnect cause the
         // sink already reported; surface it without discarding the typed
@@ -462,7 +505,11 @@ pub async fn run_headless<W: Write + Send + 'static>(
             };
         }
     }
-    jsonl.flush()?;
+    // U7: do NOT re-flush the returned writer here. `sink.finish()` above
+    // already flushed the writer inside the bounded writer thread; a second
+    // synchronous flush would escape that bound and could block on a wedged
+    // consumer the drain already gave up on. The caller (main.rs) discards
+    // the writer after `std::process::exit`, so no further flush is needed.
     Ok((result, jsonl))
 }
 
@@ -493,6 +540,19 @@ struct Drain {
     approval_denied: bool,
     other_failure: Option<String>,
     timed_out: bool,
+    /// U7: a broadcast `Lagged` dropped events we never observed. The
+    /// dropped span may have carried a denial, failure or settlement the
+    /// tail `TurnCompleted` would otherwise mask. We never invent what we
+    /// missed: this forces an explicit `incomplete` outcome.
+    events_dropped: bool,
+    dropped_count: u64,
+    /// U7: the receiver closed with no terminal event observed. In normal
+    /// production the `RuntimeHandle` owns the broadcast Sender, so a live
+    /// run ends via a terminal event or timeout — never via `Closed`. A
+    /// `Closed` with no completion proof is therefore a defensive interface
+    /// boundary case (e.g. a caller handed in an already-closed receiver),
+    /// and must not be read as success.
+    closed_without_completion: bool,
 }
 
 impl Drain {
@@ -592,6 +652,27 @@ impl Drain {
                 stop: "failure".into(),
                 task_completed: self.task_completed,
                 round_budget: false,
+                approval_denied: false,
+            };
+        }
+        // U7: an observed event gap (Lagged) or a receiver that closed before
+        // any terminal event proves we cannot vouch for the run. We never
+        // synthesize a clean completion from a tail `TurnCompleted` that may
+        // sit on top of a dropped denial/failure, and we never reinterpret the
+        // gap as an approval denial. Surface it as an explicit, non-success
+        // exit so callers stop equating "no failure seen" with "succeeded".
+        if self.events_dropped || self.closed_without_completion {
+            return HeadlessOutcome {
+                exit: EXIT_INCOMPLETE,
+                status: "incomplete",
+                stop: if self.events_dropped {
+                    "events_dropped"
+                } else {
+                    "stream_closed"
+                }
+                .into(),
+                task_completed: self.task_completed,
+                round_budget: self.round_budget,
                 approval_denied: false,
             };
         }
@@ -1536,6 +1617,187 @@ mod tests {
         assert_eq!(
             end["task_state"], "awaiting_operator_review",
             "the restored active task must not be under-reported as none: {end}"
+        );
+    }
+
+    // ===== U7: completeness, not "no failure seen" =====
+
+    /// Build a synthetic `RuntimeEventEnvelope` for a test stream.
+    fn envelope(
+        run_id: agent_contracts::RunId,
+        seq: u64,
+        event: RuntimeEvent,
+    ) -> RuntimeEventEnvelope {
+        RuntimeEventEnvelope {
+            run_id,
+            seq,
+            timestamp_ms: 0,
+            event,
+        }
+    }
+
+    /// The consumer lagged and dropped a span that contains an approval
+    /// denial, but the received tail is only `TurnCompleted`. Without gap
+    /// detection the old drain would report this as a clean success; it must
+    /// instead report an explicit `incomplete` outcome (never success, and
+    /// never silently reinterpreted as the denial it could not observe).
+    #[tokio::test]
+    async fn headless_dropped_denial_followed_by_turn_completed_is_not_complete_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let composed = product_compose(root, &[], Arc::new(MockModelTransport), Some(4))
+            .await
+            .unwrap();
+        composed.instance.start().await.unwrap();
+        let run_id = composed.handle().run_id();
+
+        // A synthetic stream the drain actually reads: capacity 1 so the
+        // first send (the denial) is evicted before the receiver ever reads
+        // it, producing a `Lagged` on the first recv.
+        let (tx, mut rx) = broadcast::channel::<RuntimeEventEnvelope>(1);
+        let dropped_denial = envelope(
+            run_id,
+            1,
+            RuntimeEvent::ToolFinished {
+                output: ToolOutput {
+                    call_id: "x".into(),
+                    tool_name: "fs.write".into(),
+                    ok: false,
+                    summary: "denied by approval policy".into(),
+                    model_content: "denied by approval policy".into(),
+                    artifact_ref: None,
+                    metadata: json!({ "failure_class": "approval_denied" }),
+                },
+                facts: None,
+            },
+        );
+        let turn_completed = envelope(run_id, 2, RuntimeEvent::TurnCompleted);
+        let _ = tx.send(dropped_denial);
+        let _ = tx.send(turn_completed);
+        drop(tx);
+
+        let (outcome, _jsonl) = run_headless(
+            composed.handle().clone(),
+            &mut rx,
+            HeadlessAction::Prompt {
+                text: "demo".into(),
+                work: false,
+            },
+            Duration::from_secs(30),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+
+        assert_eq!(outcome.exit, EXIT_INCOMPLETE, "{outcome:?}");
+        assert_eq!(outcome.status, "incomplete", "{outcome:?}");
+        assert_eq!(outcome.stop, "events_dropped", "{outcome:?}");
+        // The gap is not silently reinterpreted as the denial it dropped.
+        assert!(
+            !outcome.approval_denied,
+            "a dropped denial is not proof of denial: {outcome:?}"
+        );
+    }
+
+    /// Defensive interface boundary: a receiver that is already closed, with
+    /// no terminal event ever observed. In normal production the
+    /// `RuntimeHandle` owns the broadcast Sender, so a live run ends via a
+    /// terminal event or timeout — never via `Closed`. A `Closed` with no
+    /// completion proof must therefore NOT be read as success.
+    #[tokio::test]
+    async fn headless_closed_receiver_without_terminal_event_is_not_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let composed = product_compose(root, &[], Arc::new(MockModelTransport), Some(4))
+            .await
+            .unwrap();
+        composed.instance.start().await.unwrap();
+
+        // Hand in an already-closed receiver (defensive boundary case).
+        let (tx, mut rx) = broadcast::channel::<RuntimeEventEnvelope>(8);
+        drop(tx);
+
+        let (outcome, _jsonl) = run_headless(
+            composed.handle().clone(),
+            &mut rx,
+            HeadlessAction::Prompt {
+                text: "demo".into(),
+                work: false,
+            },
+            Duration::from_secs(30),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+
+        assert_eq!(outcome.exit, EXIT_INCOMPLETE, "{outcome:?}");
+        assert_eq!(outcome.status, "incomplete", "{outcome:?}");
+        assert_eq!(outcome.stop, "stream_closed", "{outcome:?}");
+    }
+
+    /// U7: every JSONL event carries exactly one line terminator. The old
+    /// code appended a newline at the call site AND `write_line` appended
+    /// another, so each record was `...}\n\n` (a blank line between rows).
+    #[tokio::test]
+    async fn headless_jsonl_emits_each_event_with_a_single_newline() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let composed = product_compose(
+            root,
+            &[hello_grant()],
+            Arc::new(MockModelTransport),
+            Some(4),
+        )
+        .await
+        .unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        let jsonl = Vec::new();
+        let (outcome, jsonl) = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "demo: write hello".into(),
+                work: false,
+            },
+            Duration::from_secs(30),
+            jsonl,
+        )
+        .await
+        .unwrap();
+        composed.shutdown().await.unwrap();
+        assert_eq!(outcome.exit, EXIT_OK, "{outcome:?}");
+
+        let text = String::from_utf8(jsonl).unwrap();
+        assert!(
+            !text.contains("\n\n"),
+            "JSONL must not contain a doubled newline between records: {text}"
+        );
+        assert!(
+            text.ends_with('\n'),
+            "JSONL must end with exactly one terminator: {text:?}"
+        );
+        for line in text.lines() {
+            assert!(!line.is_empty(), "blank line in JSONL output: {text}");
+            serde_json::from_str::<serde_json::Value>(line).expect("each JSONL line must parse");
+        }
+    }
+
+    /// `BoundedJsonlSink::write_line` is the single owner of the terminator:
+    /// it appends exactly one `\n`. The callers must never append another.
+    #[test]
+    fn bounded_jsonl_sink_appends_exactly_one_newline() {
+        let mut sink = BoundedJsonlSink::spawn(std::io::Cursor::new(Vec::new()));
+        sink.write_line(b"{\"a\":1}").unwrap();
+        sink.write_line(b"{\"b\":2}").unwrap();
+        let (writer, result) = sink.finish().unwrap();
+        assert!(result.is_ok());
+        let bytes = writer.into_inner();
+        assert_eq!(
+            bytes, b"{\"a\":1}\n{\"b\":2}\n",
+            "each record gets exactly one terminator"
         );
     }
 }
