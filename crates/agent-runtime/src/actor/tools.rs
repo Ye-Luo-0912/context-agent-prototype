@@ -2,6 +2,24 @@ use super::*;
 
 const MAX_SETTLEMENT_DETAIL_CHARS: usize = 1_200;
 
+/// R2: the usage a completion's outcome can honestly report, whatever its
+/// business classification was. The business result and the money are
+/// orthogonal — a superseded operation's content is dropped, but the counters
+/// the provider already reported still belong in the account. Keeping this
+/// extraction separate from the business-result arms is what lets the stale
+/// path settle `ModelOutput`, `Failed { usage }` and
+/// `Cancelled { known_usage }` through ONE rule instead of only the last one,
+/// which is how a cancellation's unknown placeholder came to swallow the late
+/// evidence of a successful or failed round.
+fn outcome_reported_usage(outcome: &OperationOutcome) -> Option<&agent_contracts::ModelUsage> {
+    match outcome {
+        OperationOutcome::ModelOutput { usage, .. } => Some(usage),
+        OperationOutcome::Failed { usage, .. } => usage.as_ref(),
+        OperationOutcome::Cancelled { known_usage } => known_usage.as_ref(),
+        OperationOutcome::ToolOutput(_) | OperationOutcome::Completed => None,
+    }
+}
+
 /// A prepared output describes proposed bytes, not observed world state.
 /// Unless commit settles as fully durable, strip every proposed revision and
 /// retain only a bounded set of attempted paths. Partial/unknown receipts do
@@ -868,27 +886,25 @@ impl RuntimeActor {
             return;
         }
         if self.is_stale(&completion) {
-            // COST-7 (R2-11): the business result dies here, but the cost
-            // does not. A stale MODEL round whose provider report arrived
-            // keeps its real usage under its honest identity; a stale
-            // MAINTENANCE completion keeps its engine report's compaction
-            // rows. The dedupe fence (cancel-vs-late-completion, duplicate
-            // arrivals) makes sure one cost enters the account once.
-            if self.usage_already_accounted(completion.operation.operation_id) {
-                // W4 (V7): the fence stands — but a stale CANCELLED model
-                // completion whose transport already settled counters
-                // SUPPLEMENTS the cancellation's unknown row exactly once:
-                // the unknown row was the honest settlement available at
-                // the barrier; the late evidence improves it without
-                // replacing the classification and without double counting
-                // (the unknown row carries zeros by construction).
-                if completion.kind == OpKind::Model
-                    && !self.usage_supplemented(completion.operation.operation_id)
-                    && let OperationOutcome::Cancelled {
-                        known_usage: Some(usage),
-                    } = &completion.operation.outcome
-                    && usage.has_any_reported()
-                {
+            // COST-7 (R2-11) + R2: the business result dies here, but the
+            // cost does not — and NOT only for one outcome shape. Usage
+            // extraction is deliberately independent of the business-result
+            // arms: a stale `ModelOutput { usage }`, a stale
+            // `Failed { usage }` and a stale `Cancelled { known_usage }` all
+            // settle their reported counters exactly once.
+            //
+            // "A placeholder was written" and "no further evidence may be
+            // added" are DIFFERENT facts. The cancellation barrier writes an
+            // unknown row and marks the operation accounted but NOT settled,
+            // so exactly one late result can still supply the real counters;
+            // any booking marks settled too, so a duplicate arrival cannot
+            // add a second row.
+            if completion.kind == OpKind::Model
+                && let Some(usage) = outcome_reported_usage(&completion.operation.outcome)
+                    .filter(|usage| usage.has_any_reported())
+            {
+                let operation_id = completion.operation.operation_id;
+                if !self.usage_settled(operation_id) {
                     let _ = self
                         .core
                         .emit_event(RuntimeEvent::ModelUsed {
@@ -902,28 +918,15 @@ impl RuntimeActor {
                             usage: Some(usage.clone()),
                         })
                         .await;
-                    self.mark_usage_supplemented(completion.operation.operation_id);
+                    // Booked AND settled: the account now holds a real value
+                    // for this operation and no further evidence may be
+                    // layered on top of it.
+                    self.mark_usage_accounted(operation_id);
+                    self.mark_usage_settled(operation_id);
                 }
-                // Already in the account (e.g. the cancellation's unknown
-                // row): only the business drop below still applies.
-            } else if let OperationOutcome::ModelOutput { usage, .. } =
-                &completion.operation.outcome
-            {
-                let _ = self
-                    .core
-                    .emit_event(RuntimeEvent::ModelUsed {
-                        input_tokens: usage.input_tokens.unwrap_or(0),
-                        output_tokens: usage.output_tokens.unwrap_or(0),
-                        cached_input_tokens: usage.cached_input_tokens.unwrap_or(0),
-                        attempts: usage.attempts.max(1),
-                        retries: usage.retries,
-                        usage_identity: usage.usage_identity(),
-                        role: agent_contracts::ModelCallRole::Main,
-                        usage: Some(usage.clone()),
-                    })
-                    .await;
-                self.mark_usage_accounted(completion.operation.operation_id);
-            } else if completion.kind == OpKind::Maintenance
+            }
+            if completion.kind == OpKind::Maintenance
+                && !self.usage_already_accounted(completion.operation.operation_id)
                 && let Some(Ok(report)) = completion.maintenance.as_ref()
             {
                 for compaction in &report.compactions {
@@ -944,6 +947,9 @@ impl RuntimeActor {
                         .await;
                 }
                 self.mark_usage_accounted(completion.operation.operation_id);
+                // A maintenance completion reports its compaction rows in
+                // one report; nothing can be added later.
+                self.mark_usage_settled(completion.operation.operation_id);
             }
             // A stale materialization's parked round plan goes with it: the
             // preview is non-consuming, so dropping it is the whole rollback.
@@ -1656,6 +1662,9 @@ impl RuntimeActor {
                                 })
                                 .await;
                             self.mark_usage_accounted(completion.operation.operation_id);
+                            // Real counters are booked: nothing more may be
+                            // added for this operation.
+                            self.mark_usage_settled(completion.operation.operation_id);
                         }
                         _ => {
                             RuntimeActor::emit_unknown_model_usage_row(
@@ -1663,6 +1672,8 @@ impl RuntimeActor {
                                 agent_contracts::ModelCallRole::Main,
                             )
                             .await;
+                            // Unknown placeholder only: it stays improvable by
+                            // exactly one late result carrying real counters.
                             self.mark_usage_accounted(completion.operation.operation_id);
                         }
                     }
@@ -1696,6 +1707,9 @@ impl RuntimeActor {
                         })
                         .await;
                     self.mark_usage_accounted(completion.operation.operation_id);
+                    // The cancellation's known counters are in the account:
+                    // no late duplicate may add them again.
+                    self.mark_usage_settled(completion.operation.operation_id);
                 }
                 if let Err(error) = self
                     .cancel_turn(

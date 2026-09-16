@@ -3532,10 +3532,14 @@ impl RuntimeActor {
         self.state.usage_accounted_ops.contains(&operation_id)
     }
 
-    /// W4 (V7): remember that the late known usage of an already-accounted
-    /// cancelled operation was supplemented exactly once, so duplicate stale
-    /// arrivals cannot repeat the supplement.
-    pub(super) fn mark_usage_supplemented(&mut self, operation_id: OperationId) {
+    /// COST-7 (R2-11) + R2: remember that NO further usage evidence may be
+    /// added for this operation — either a real value is already booked, or
+    /// the cancellation's unknown placeholder has already been improved once.
+    /// A placeholder written by `emit_cancelled_usage_row` deliberately does
+    /// NOT mark this, so exactly one late result can still supply the real
+    /// counters; every booking path does, so a duplicate arrival cannot add a
+    /// second row.
+    pub(super) fn mark_usage_settled(&mut self, operation_id: OperationId) {
         let queue = &mut self.state.usage_supplemented_ops;
         if queue.contains(&operation_id) {
             return;
@@ -3546,9 +3550,10 @@ impl RuntimeActor {
         }
     }
 
-    /// W4 (V7): true when this operation's late known usage already
-    /// supplemented the cancellation's unknown row.
-    pub(super) fn usage_supplemented(&self, operation_id: OperationId) -> bool {
+    /// R2: true when no further usage evidence may be added for this
+    /// operation. Distinct from `usage_already_accounted`, which is also true
+    /// for a cancel-time unknown placeholder that is still improvable.
+    pub(super) fn usage_settled(&self, operation_id: OperationId) -> bool {
         self.state.usage_supplemented_ops.contains(&operation_id)
     }
 

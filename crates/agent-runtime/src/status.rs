@@ -92,7 +92,15 @@ impl StatusProjection {
                 cached_input_tokens,
                 ..
             } => {
-                self.in_flight = None;
+                // R3: a usage fact moves the ACCOUNT, never the activity
+                // state. `ModelUsed` carries no operation identity, and the
+                // runtime legitimately emits a SUPERSEDED operation's late
+                // counters into the current stream — clearing `in_flight`
+                // here would report "nothing is running" while a newer
+                // operation is still live. In-flight is advanced only by
+                // lifecycle events that can name what they end
+                // (`ModelStarted`/`ToolStarted`/`ToolFinished`/
+                // `TurnCompleted`/`TurnCancelled`/`RuntimeRestored`).
                 self.input_tokens = self.input_tokens.saturating_add(*input_tokens);
                 self.output_tokens = self.output_tokens.saturating_add(*output_tokens);
                 self.cached_input_tokens = self
@@ -363,6 +371,56 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("cancelled turns: 1")),
             "the snapshot must name the cancellation: {lines:?}"
+        );
+    }
+
+    /// R3: a usage row moves the ACCOUNT, never the activity state. The
+    /// runtime legitimately emits a superseded operation's late counters into
+    /// the current stream; clearing `in_flight` on them would report "nothing
+    /// is running" while the newer operation is still live.
+    #[test]
+    fn a_late_usage_row_does_not_clear_the_current_operation() {
+        let started = |turn: agent_contracts::TurnId, generation: u64| RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: agent_contracts::OperationId::new(),
+            generation,
+            surface_revision: 0,
+            model_round: 1,
+            prompt_layers: Default::default(),
+            turn_checkpoint: Default::default(),
+        };
+        let projection = fold_all(&[
+            // Operation A ran and its turn ended.
+            started(agent_contracts::TurnId::new(), 1),
+            RuntimeEvent::TurnCompleted,
+            // Operation B is live now.
+            started(agent_contracts::TurnId::new(), 2),
+            // A's counters arrive after B started.
+            RuntimeEvent::ModelUsed {
+                input_tokens: 90,
+                output_tokens: 30,
+                attempts: 1,
+                retries: 0,
+                cached_input_tokens: 7,
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                role: agent_contracts::ModelCallRole::Main,
+                usage: None,
+            },
+        ]);
+        let lines = projection.lines();
+        let status_line = lines
+            .iter()
+            .find(|line| line.starts_with("status:"))
+            .expect("status line");
+        assert!(
+            status_line.contains("in_flight=model round"),
+            "a late usage row must not report the live operation as finished: {status_line}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("tokens: in=90 out=30")),
+            "the late counters must still be booked: {lines:?}"
         );
     }
 
