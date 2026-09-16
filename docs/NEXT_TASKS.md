@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**当前开工顺序：A2（U3＋U4，读模型与按任务 review）与 U6（保序命令提交，`session.rs`）为主线——两者都触及 `state.rs`/`session.rs`，同一 crate 内按文件所有权串行；B1/B2 待 `context-simple` 的在飞改动收口后接续（该文件当前有他人在未提交改动）。** A1（U1＋U2）与 A4（U7）已于 2026-09-16 关闭，A3 只剩 U6。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**当前开工顺序：U6（保序命令提交与慢 I/O 离开绘制循环，`session.rs`）为 A 线最后一片；B1/B2 待 `context-simple` 的在飞改动收口后接续（该文件当前有他人在未提交改动）。** A1（U1＋U2）、A2（U3＋U4）、A4（U7）已于 2026-09-16 关闭，A3 只剩 U6。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -80,13 +80,14 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 停止：实际渲染/输入用例通过且批准/拒绝仍走同一 Core gate；不靠 CaptureSink 或对内部字符串取子集证明屏幕可见。
 - 落地回执：[A1_U1_U2_APPROVAL_AND_RENDERING_RECEIPT](reviews/2026-09-16-review-d92564bc/A1_U1_U2_APPROVAL_AND_RENDERING_RECEIPT.md)。`PendingApproval` 改 `detail: Vec<String>`＋`truncated`（完整请求，无 220 字符上限）；`approval_scroll`＋`PgUp/PgDn`（`classify_approval_key` 纯函数分离回答键与导航键）；确认绑定屏上 `request_id`（过期确认不批准新请求）；对话摘要截断标 `…` 并指向面板。`conversation_lines` 按 `'\n'` 拆真 `Line`；折行/滚动/光标共用 `display_width` 显示列宽＋横向视窗。8 条新测试经真实 `ui::render`＋`TestBackend` buffer 断言，变异恢复法复验两条关键用例转红后 sha256 还原。agent-tui 75/0、clippy 0、fmt clean。限制：无真实 PTY 端到端；`display_width` 为内联宽字符表，未覆盖全部 Unicode 组合字符；未复核 Core 侧请求上限。
 
-### A2 — 一份事件读模型与按任务 review（U3＋U4，agent-tui＋agent-runtime）
+### A2 — 一份事件读模型与按任务 review（U3＋U4，agent-tui＋agent-runtime）——已关闭（2026-09-16，`baa2ca70`＋`7224ec6d`）
 用户动作：`/status`、`/review` 与现场画面一致；重放/重复投递不改变结论；任务 B 的修改与失败不挂在任务 A 的完成头下。
 - U3：`AppState` 同时维护公共 `StatusProjection` 与本地 `status/busy/current_model_operation/current_task`/局部 Token/对话/`result_card`；`resync_projection` 只重建公共投影；重放水位只跳过 `projection.fold`，同一已覆盖事件仍继续改后面本地字段；对话与部分 live 消息按**正文内容**去重；`StatusProjection` 自身未折叠 `TurnCancelled` 等终态；坏行被跳过、目录被截断仍报完整且把最大 seq 当连续水位。
 - U4：`ResultCard` 的 changes/checks 无各自 TaskId，A 完成后开始 B 不会切换卡片；容量上限满后直接不追加且无独立遗漏计数，`format_result_lines` 用 `len-cap` 算溢出恒不可见；`result-card-latest.json` 由独立 task 写同一路径，无单写者/版本化原子快照。
 - 修复方向：一套共享事件折叠规则，按事件与操作身份（RunId/seq、TurnId/OperationId/generation）去重，实时消费与重放同一规则；输入草稿/滚动位置等纯界面状态另留 ViewState；按任务归属或查询复核材料，显示窗口/总数/遗漏数分离，晚到失败不被容量限制静默掩盖；快照写入单写者或版本化原子提交。不新建任务真相、不从 prose 推断完成。
 - 红例：实时逐条消费得状态 A，另一实例先遗漏一段再重放＋重复投递已覆盖的 **ModelUsed/TurnCompleted/操作切换**事件（不是 `RunStarted`——它只置 bool，去重失效也可能通过）后必须等价；取消无 usage 清理 in-flight；相同文字不同 turn 保留；A 完成 → B 修改并校验失败 → `/review B` 不得出现 A 的完成头；第 33 个 check 的失败不得静默消失；坏 JSON 中间行/日志覆盖不全保持 Partial。
 - 停止：现场画面、`/status`、`/review` 与相同已验证事件视图一致；旧事件不能反向激活操作。
+- 落地回执：[A2_U3_U4_EVENT_MODEL_AND_REVIEW_RECEIPT](reviews/2026-09-16-review-d92564bc/A2_U3_U4_EVENT_MODEL_AND_REVIEW_RECEIPT.md)。U3：`apply_runtime_event` 先 claim `(RunId, seq)`，claim 被拒即**整体返回**（不再只跳投影折叠）；折叠体抽到 `apply_event` 且**重放调用同一函数**；`resync_projection` 先归零事件派生字段（`reset_event_derived_view`，纯界面状态与追加型转录不动）再重建；转录行按事件身份去重（`claim_message_row`）＋用户气泡按 `input_id`，5 处正文比对删除；`AssistantMessage` 只终结本轮自己流式打开的行（`streaming_row_open`）；`StatusProjection` 补折叠 `TurnCancelled`；坏行/短读/序列缺口 → `view_partial`＋原因，只在可验证连续前缀设水位。U4：`ResultCard` 增 `task_id`＋单调 `revision`＋`omitted_*` 计数，切换任务**归档**旧卡（有界 8 张），`/review` 走 `review_card()`（当前任务卡，否则最近归档卡，永不混合）；容量拒绝即计数并在 review 明示；快照单写者 gate＋写临时文件 rename 提交。8 条新测试，6 处变异恢复法复验转红后 sha256 还原。agent-tui 83/0、real_binary_startup 2/0、agent-runtime `status::` 5/5、clippy 0、fmt clean。**限制**：未跑 agent-runtime 全量（他人在 `execution/`、`actor/` 有未提交改动）与 workspace 全量 CI；归档上限 8 张、不能按 TaskId 查任意历史；`view_partial` 未覆盖 live `Lagged` 缺口；快照写入失败不重试。
 
 ### A3 — 保序控制与可退出的终端（U5＋U6，agent-tui）——**部分关闭**：U5 已关闭（2026-09-16，`296ec005`）；**U6 待做**
 用户动作：终端在任何早退/异常/退出路径后都恢复；用户键入顺序就是命令提交顺序；慢磁盘操作期间仍能取消/退出。
