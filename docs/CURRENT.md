@@ -4,7 +4,7 @@
 
 ## 已核对基线
 
-- **U 批次基线 `3d0b114f`（2026-09-16，A 线收口）**：CI run `35103897272` 最终 **success，attempt 2**。attempt 1 唯一失败是 `agent-host` 的 `host_t7_journey::named_pipe_t7_same_task_full_backend_journey`（`part_a.md` 工件未在 30s 墙钟截止前落地），**与本次改动无依赖关系**（`agent-host` 不依赖 `agent-tui`，也不使用 `StatusProjection`），本机同平台复现 9.54s 通过；重跑即绿。已推送 `origin/main`（`d92564bc..3d0b114f`）。
+- **续审基线 `3bdb269c`（2026-09-16，U 批次之后）**：CI run `35107501790`，**attempt 1 success**（勿与父提交 `3d0b114f` 的 attempt-2 回执混淆）。该次续审发现 **U3 引入的回归**：`claim_event(RunId, seq)` 把 `LiveSink` 复用 `ModelStarted` 游标的实时分片（`ModelDelta`／`ModelRetrying`）当成重复持久事件丢弃 → 正常流式显示与重试进度被破坏（**R1，最高优先**）。另开 R2–R8（费用补账终态矩阵、用量误清 in-flight、卡片修订号与全局发布序号混用、遗漏检查的失败计数、普通输入未进有序通道、重放非幂等与附属索引无界、审批滚动仍用宽度除法＋自制 Unicode 表）。报告与范围见 [docs/reviews/2026-09-16-review-3bdb269c/](reviews/2026-09-16-review-3bdb269c/REVIEW.md)；行动见同目录 [NEXT_ACTIONS.md](reviews/2026-09-16-review-3bdb269c/NEXT_ACTIONS.md)。**A 线不能视为全部关闭。**
 - 阶段审查基线：`4aaa8bea89336e2ec0fd21c76d04967814b24020`（2026-09-14）。该 SHA 的 CI run `34788369834` 最终 success，**第 2 次尝试**（满载抖动重跑），非首次全绿。审查报告：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)。
 - main 之上另有并行分支在飞（如 `codex/headless-output-budget`：真实 DeepSeek 任务记录 headless 输出缺口、失败轮结算与输出预算修复）。采用任何结论前核对实际分支与 HEAD。
 
@@ -18,7 +18,7 @@
 
 **2026-09-16 新审查（基线 `d92564bc`，CI run `35036238204` 首次成功）**：开 U1–U7 与 B1–B3 十项发现。主线是"TUI 已经不是显示壳——它的审批、命令顺序、事件恢复和任务复核直接影响长流程可控性，应作为后端主体的一部分收口"。首次全文读取 `agent-tui/src` 八个源文件（含内联测试）、`tests/real_binary_startup.rs` 与该 crate 配置。报告与覆盖表见 [docs/reviews/2026-09-16-review-d92564bc/](reviews/2026-09-16-review-d92564bc/REVIEW.md)；派工与停止条件见同目录 [NEXT_ACTIONS.md](reviews/2026-09-16-review-d92564bc/NEXT_ACTIONS.md)。架构不重做，三线不变，GUI 继续后置。
 
-**2026-09-16 U 批次收口（A 线）**：A1／A2／A3／A4 全部关闭，**U1–U7 已全部处理**。A3 的 U6（`96c0e5c3`）：任务动作与 `/checkpoint`、`/restore` 改走单一有界有序队列（32）＋唯一 worker（键入顺序即送达顺序，满队/worker 消失显式报告）；`/continue`、`/suspend` 用共享 `*_expecting` 接口绑定操作员观察到的任务（不匹配不启动回合并点名两侧）；`/done` 前置快照比对后拒绝；worker 持 `RuntimeInstance::checkpoint_plane()` 使运行时捕获与原子存储写离开绘制线程；每帧 drain 有界；`/quit`、`/cancel` 不排队。回执：[A3/U6](reviews/2026-09-16-review-d92564bc/A3_U6_ORDERED_COMMANDS_RECEIPT.md)。**A 线残余限制如实记录**：`/done` 非原子（`RuntimeCommand::CompleteTask` 无 expecting 变体，属共享契约后续项）；身份不匹配仅有文案级单测；只读命令之间不保证顺序；真实 PTY 端到端与键盘响应计时未做。**B1/B2 仍待 `context-simple` 他人在飞改动收口**；C 线可在不触碰该文件前提下并行。
+**2026-09-16 U 批次收口（A 线）→ 已被续审部分推翻**：A1／A2／A3／A4 的**实现与提交**均已完成（`22ab97a6`／`baa2ca70`＋`7224ec6d`／`296ec005`＋`96c0e5c3`／`296ec005`），但 `3bdb269c` 续审确认 **U3 的精确一次身份去重引入回归（R1）**：`claim_event(RunId, seq)` 会把 `LiveSink` 复用 `ModelStarted` 游标的 `ModelDelta`／`ModelRetrying` 判为重复并整体丢弃。**因此 A 线不能视为全部关闭**，R1–R8 见第六批。已完成的改进（完整审批详情、多行拆分、终端 guard、有序命令 worker、任务卡隔离、headless 事件缺口）保留，不按旧问题重做。
 
 **2026-09-16 U 批次进展（第二批）**：A2（U3＋U4）关闭，A 线只剩 U6。U3（`baa2ca70`）：`apply_runtime_event` 先 claim `(RunId, seq)`，被拒即整体返回（修复前只跳过投影折叠、本地字段仍被改），折叠体抽到 `apply_event` 供**实时与重放共用**，`resync_projection` 先归零事件派生字段再重建，转录行改按**事件身份**去重（5 处正文比对删除，相同文字不同 turn 都保留），`AssistantMessage` 只终结本轮流式打开的行，`StatusProjection` 补折叠 `TurnCancelled`，坏行/短读/序列缺口 → `view_partial` 且不设连续水位。U4（`7224ec6d`）：`ResultCard` 按 `task_id` 归属、切换任务归档旧卡，容量拒绝改为**计数**并在 review 明示遗漏，快照单写者＋版本化＋rename 原子提交。回执：[A2](reviews/2026-09-16-review-d92564bc/A2_U3_U4_EVENT_MODEL_AND_REVIEW_RECEIPT.md)。**仍未做**：U6（`session.rs` 20 处 detached spawn 不保序、慢 I/O 占住绘制循环）、B1/B2（`context-simple` 当前有他人在未提交改动）。新增回归以变异恢复法复验 6 处转红；agent-tui 83/0、real_binary_startup 2/0、agent-runtime `status::` 5/5、clippy 0、fmt clean；未跑 agent-runtime 全量与 workspace 全量 CI。
 
@@ -47,10 +47,9 @@
 - 跨进程连续任务轨迹已由 `host_process_variant` 证明（真实两 OS 进程、同 TaskId/lineage 恢复、指令传递证据）；仍未覆盖 watchdog/监督重初始化的全部路径。
 - 本地 HTTP 捕获只证明客户端发出了字段；端点 schema 接受、实际命中、任务净成本下降均未验证（T6/T8；V6 工具结果块类型是 W3 待修项）。
 - 冷目录分页与旧路径的跨层缺口未收口：scope 退休可漏未加载冷页引用（V1）、必需正文可被误报 Missing（V2）、service 边界丢 coverage/续查（V3）、续查状态可膨胀与 ABA（V4/V5）、取消丢已知用量（V7）——W1–W4 队列见 [NEXT_TASKS.md](NEXT_TASKS.md)。
-- **TUI 作为操作入口的完整性（`d92564bc` 审查）**：U1–U7 已全部关闭（A1/A2/A3/A4）。**仍未收口**——后端侧 B1（批量 required 冷解析互相驱逐）与 B2（existing card 仅凭 `exists` 认领），待 `context-simple` 在飞改动收口后接续；A 线自身残余限制见下条。U 系列队列见 [NEXT_TASKS.md](NEXT_TASKS.md) 第五批。
+- **TUI 作为操作入口的完整性（`d92564bc` 审查）**：U1–U7 均已实现并提交，但 `3bdb269c` 续审确认 **U3 引入 R1 回归**（实时分片被当作重复持久事件丢弃）——见上「续审基线」。**仍未收口**：R1–R8（第六批）、后端侧 B1（批量 required 冷解析互相驱逐）与 B2（existing card 仅凭 `exists` 认领）、B3（ledger 导出取消安全，可后置）。队列见 [NEXT_TASKS.md](NEXT_TASKS.md) 第五、六批。
 - **A 线残余（`d92564bc` 审查，已记录不回退）**：`/done` 的身份校验是前置快照比对而非原子保证（需给共享 `RuntimeCommand::CompleteTask` 加 expecting 变体）；`display_width` 为内联宽字符表；结果卡归档上限 8 张、不能按 TaskId 查任意历史；`view_partial` 未覆盖 live `Lagged` 之外的缺口；真实 PTY 端到端未执行。
-- **已知抖动（不新增门禁）**：`host_t7_journey::named_pipe_t7_same_task_full_backend_journey` 的 `wait_file_content` 用 30s 墙钟截止，满载 Windows runner 上曾超时（run `35103897272` attempt 1；attempt 2 绿，本机 9.54s）。若再次出现，先看该截止而非假定功能回归。
-- 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
+- **已知抖动（不新增门禁）**：`host_t7_journey::named_pipe_t7_same_task_full_backend_journey` 的 `wait_file_content` 用 30s 墙钟截止，满载 Windows runner 上曾超时（run `35103897272` attempt 1；attempt 2 绿，本机 9.54s）。若再次出现，先看该截止而非假定功能回归。- 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
 - 尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
 
 ## 按需阅读

@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**当前开工顺序：A 线 U 系列已全部关闭。下一步是 B1/B2（`context-simple`）——但该文件当前有他人在未提交改动，须等其收口后再接续；C 线（实际请求序列的 KV 与成本）可在不触碰 `context-simple` 的前提下并行推进。** A1（U1＋U2）、A2（U3＋U4）、A3（U5＋U6）、A4（U7）已于 2026-09-16 关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**当前开工顺序：R1 先行（P1 回归，已确认），R4／R5 与 R2／R3 可并行（不同 crate），R7 随 R1 同片，R6 接续原 U6，R8 接续原渲染验收；B1／B2 待 `context-simple` 在飞改动收口后接续。** 第五批（U 系列）实现已提交但按续审不视为关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -67,9 +67,9 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 回归：Compose→Retry→backoff cancel 全链、metrics 环境变量不存在：已知用量保留、取消分类不变、未执行重试不多计、未知字段不补零、同次 SSE 累计快照不重复相加。
 落地回执：[W4_CANCEL_SETTLES_KNOWN_USAGE_RECEIPT](reviews/2026-09-16-review-4f6eb7ff/W4_CANCEL_SETTLES_KNOWN_USAGE_RECEIPT.md)。`FailedWithUsage{source:Cancelled}` 携带（裸 Cancelled 不变）、`OperationOutcome::Cancelled{known_usage}` 守卫臂结算、屏障前按真实计数记账＋fence、迟到 stale completion 经有界 FIFO 一次性补记；observer 降级为诊断副本。全链回归在 env 不存在下断言正式账目。限制：maintenance lane 取消仍 unknown（token 永不取消）；迟到成功不补记（既有设计）。
 
-## 第五批（U 系列；U1 先行，A 线内部按文件所有权串行）——**A 线已全部关闭**（`3d0b114f`，CI run `35103897272` success／attempt 2）
+## 第五批（U 系列；U1 先行，A 线内部按文件所有权串行）——**实现已提交，但续审确认 U3 引入 R1 回归，A 线不算关闭**
 
-审查基线 `d92564bc`（报告：[REVIEW.md](reviews/2026-09-16-review-d92564bc/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-d92564bc/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-d92564bc/COVERAGE.md)）。A1–A4 已全部关闭并推送 `origin/main`；attempt 1 唯一失败为 T7 旅程的 30s 墙钟抖动（与本批无依赖关系，重跑即绿）。**剩余 B1/B2 见本批文末。** 共同主线：**让 TUI 成为可信的操作入口（一套读模型、一个保序提交口、一个布局/宽度模型），而不是另一份会自行漂移的运行状态；让 required 解析产生稳定的执行计划，而不是依赖最后剩下的热目录内容。** 都属于主体完善，不重做架构、不前置 GUI。行为修改与机械移动分开提交；定向测试后跑既有相关跨 crate 集成，合并沿用现有 CI。
+审查基线 `d92564bc`（报告：[REVIEW.md](reviews/2026-09-16-review-d92564bc/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-d92564bc/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-d92564bc/COVERAGE.md)）。A1–A4 的实现与提交均已完成；`3bdb269c` 续审发现其中 U3 的精确一次身份去重破坏实时分片（见第六批 R1），**保留已完成改进、不重开旧问题，但 A 线整体转入第六批收口。** 共同主线：**让 TUI 成为可信的操作入口（一套读模型、一个保序提交口、一个布局/宽度模型），而不是另一份会自行漂移的运行状态；让 required 解析产生稳定的执行计划，而不是依赖最后剩下的热目录内容。** 都属于主体完善，不重做架构、不前置 GUI。行为修改与机械移动分开提交；定向测试后跑既有相关跨 crate 集成，合并沿用现有 CI。
 
 ### A1 — 审批可核对与多行文本渲染（U1＋U2，agent-tui）——已关闭（2026-09-16，`22ab97a6`）
 用户动作：待审批的长命令/长路径/大段替换内容能在确认前翻到尾部核对；代码块、错误栈、计划按原行结构显示。
@@ -124,6 +124,58 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 
 ### C（续）— 实际请求序列的 KV 与成本比较
 不重开 W3 已修的内容块类型任务。沿实际 request 序列核对连续请求首差异、稳定证据范围与工具 schema 变化、失败/取消的已知用量只结算一次；TUI 的 Token 显示取自同一份结算事实（与 A2 的读模型一致），不因重放再算一份不同的账。质量、指令、证据新鲜度、权限撤销不得因缓存倒退。真实端点接受/命中/净成本仍是 T8 条件实验，无预算无凭据保持 NOT_RUN。
+
+## 第六批（R 系列：`3bdb269c` 续审；R1 先修，其余按文件所有权并行）
+
+审查基线 `3bdb269c`（报告：[REVIEW.md](reviews/2026-09-16-review-3bdb269c/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-3bdb269c/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-3bdb269c/COVERAGE.md)）。共同主线：**身份的作用域与事实的用途必须分开**——日志游标不是分片身份，已知费用不是当前操作终态，单任务修订号不是全局发布序号。R 编号仅定位本报告，沿用三线，不建新阶段。开工先声明每个切片的用户动作、最小反例与预期事件身份；**不得通过给每个事件随机新 RunId、删除反例或放宽固定时限来"修绿"**。
+
+### R1 — 实时分片不能被当成重复的持久事件（P1，agent-tui；与 R7 同片）
+用户动作：同一会话能看到流式回答与重试进度；日志补齐后对话不重复、不消失。
+- 生产者形状（已核实）：`sink.rs::LiveSink::new(core.event_sender(), core.event_sequence(), …)` 把 `ModelStarted` 的持久游标复用为每个 `ModelDelta`／`ModelRetrying` 的 `seq`；它们不写 WAL、不申请新序号。`q3bdb269c` 的 `claim_event(RunId, seq)` 因此在最外层把正常流式分片全部丢弃。
+- 修复方向：持久事件按 `(RunId, journal_seq)` 去重；**实时分片按 `(TurnId, OperationId, generation)` 校验归属**（既有 `current_op` 围栏），不进入持久身份集合，也**不受重放水位过滤**。不把分片写入 WAL、不伪造持久序号。
+- 停止：真实生产者形状（固定 RunId、分片复用 `ModelStarted` 的 seq）回归通过；旧 generation 分片仍被拒；重复持久 `ModelUsed`/`TurnCompleted` 仍只计一次；既有 TUI 测试通过。
+
+### R7 — 重放幂等与附属索引有界（P2，与 R1 同片收口）
+- 现状：重放保留 `messages`/`shown_message_index`/`shown_input_ids`，重置运行投影后重新应用日志；User/Assistant/Tool 行有身份去重，但 **Warning/Focus/ModelUsed 等生成的 SYSTEM 行没有同等规则**，重放会再次追加并把已保留的助手行挤出 400 行窗口 → **同一日志重放两次可见序列不一致**。`shown_input_ids` 只插入不淘汰。
+- 修复方向：所有事件派生行共享事件身份；更稳妥的是**构建新的有界读模型后原子替换**事件派生部分，草稿/滚动/当前审批等本地状态单独保留；`InputId` 索引跟随可见窗口与活动排队输入。**reducer 输出与写盘副作用分开**：重放历史 `TaskCompleted` 不等价于重新发起一批快照写入。
+- 停止：同一日志连续重放两次事件派生视图一致；相同正文不同事件都保留；固定窗口下大量不同输入不使附属集合线性增长；不清空输入框或当前审批来简化恢复。
+
+### R2 — 取消后的补账覆盖全部迟到终态（P2，agent-runtime）
+- 现状：取消屏障先写 Unknown 用量并把 OperationId 标记 accounted；迟到结果的补充路径**只接纳 `Cancelled { known_usage: Some(...) }`**，迟到的 `ModelOutput { usage }` 与 `Failed { usage }` 走不到 → 业务结果正确作废，已知费用一起被跳过（**W4 原形状保留，补的是终态矩阵残余**）。
+- 修复方向：把用量提取从业务结果分支中收敛出来，覆盖 `ModelOutput`／`Failed`／`Cancelled`；把"已有 Unknown 占位"与"可见证据已全部结算"分开表达；沿既有 operation/accounting 状态做一次性幂等补账。
+- 验收矩阵：迟到 `ModelOutput`（含 usage/工具调用）→ 不采纳正文、不执行过期工具、已知计数结算一次；迟到 `Failed{usage}` → 不重启旧操作、计数结算一次；`Cancelled{known_usage}` → 保持取消且保留现有补账；任意类型无 usage → 业务原样、Unknown 保持 Unknown；同一 completion 重复到达 → 不再执行、不再加账。**在 `OPENAI_RETRY_METRICS_FILE` 不存在时跑。**
+- 停止：受控 provider ＋真实 Runtime/事件输出通过；真实 vendor 净成本仍留 T8。
+
+### R3 — 用量事实不得清掉当前操作状态（P2，与 R2 同片）
+- 现状：`StatusProjection::fold(ModelUsed)` 无条件 `in_flight = None`；Runtime 允许旧调用迟到用量进入当前流 → A 取消、B 运行中、A 的迟到用量到达时，**投影显示"没有正在执行的操作"而 B 仍在运行**（是投影不准，不是 Runtime 停了 B）。
+- 修复方向：**用量事实只负责账目；活动状态由能绑定当前操作的生命周期事实推进**；需要从用量关联终态时携带明确 `OperationId`/角色/代际并核对；无身份的旧格式用量只计费、不清当前操作。不得用丢弃迟到 `ModelUsed` 来"修好界面"。
+- 停止：A/B 交错时 A 的补账入账一次且不改写 B 的运行显示；主调用与维护调用分开；实时消费与日志回放结果一致。
+
+### R4 — 卡片内容修订号与全局发布序号分开（P2，agent-tui）
+- 现状：`begin_card_for_task` 切任务时新卡 `revision` 从 0 起，而 `card_snapshot_gate.last_written_revision` 是跨任务共用的全局水位 → **A 完成后 B 的快照因 `1 <= 1` 被拒**，重启后 latest 仍是 A（Runtime 的 `TaskCompleted`／任务记录不受影响）。
+- 修复方向：发布序号在 AppState/发布器层**单调推进**，不随切换任务或投影重建归零；卡片自身版本与全局发布顺序分开；保留单写者与原子提交；**重放不逐个发布历史卡片**。
+- 停止：同一 AppState、真实临时目录连续完成 A/B/C，真实读回 latest 为 C；人为反转异步写入完成顺序，旧快照不覆盖新快照；重复重放不发布旧任务。
+
+### R5 — 遗漏检查的结果必须进入失败统计（P2，与 R4 同片）
+- 现状：`failed_checks()` 只统计仍在 `checks` 数组中的失败，`format_result_lines` 却把它与 `total_checks()` 并列显示 → 32 成功 + 第 33 个失败显示为 `33 recorded, 0 FAILED, 1 not shown`，遗漏可见但失败口径错误。
+- 修复方向：总成功/失败数在**显示裁剪之前**按事件身份结算；显示列表只是摘要窗口；或明确写成"已展示的 N 项中失败 M，另 K 项未显示"。失败信息可优先保留，但不得修改真实执行结果，也不改 Core 验收规则。
+- 停止：第 33 项失败计数正确；连续多项遗漏失败正确；重复事件与任务切换不重复计数。
+
+### R6 — 普通输入也要进有序提交通道（P2，接续原 U6，agent-tui）
+- 现状：`SessionCommand` 已覆盖任务切换/继续/挂起/保存/恢复，但**普通非 `/` 文本仍走独立 `tokio::spawn(handle.user_message(…))`**：worker 在等慢 checkpoint 时输入 `/task B` 再输入普通纠正文本，普通文本会绕过 worker 先到达当前任务 A。
+- 修复方向：具有用户语义顺序的普通文本与任务切换**共享同一有界通道**；依赖任务身份的纠正优先用既有 `expected_task_id`/steering 入口表达目标；紧急取消可保留独立入口，但**必须定义它如何处理尚未提交的队列**；worker 的 `JoinHandle` 由 session 持有，退出时停止接单并明确取消/结算未开始命令（不能只丢弃发送端就当已取消）。
+- 停止：真实键入顺序（`/task B`→普通文本、`/restore`→普通文本、取消与排队输入、退出时队列非空）每个输入都有明确的提交或拒绝回执；不把所有操作塞进一个会让取消排在慢 I/O 后的阻塞队列。
+
+### R8 — 审批滚动与折行口径复用库语义（P2，接续原 U1/U2 渲染验收，agent-tui）
+- 现状：`wrapped_rows` 与 conversation 行数仍用 `display_width(line).div_ceil(width)` 估算，而 Ratatui `Paragraph` 按**词边界**折行（未填满即换行）→ 滚动上限被低估，长参数尾部或 sentinel 可能到不了；同处**手写 Unicode 宽字符表**把组合附加符/ZWJ 算成 1，不等价于 `UnicodeWidthStr`。
+- 修复方向：复用项目锁定比例版本的宽度/布局语义——评估该版本受特性门控的 `Paragraph::line_count`，或**先统一折行一次、渲染不再二次 Wrap**；不要为减少修改文件数维护第二份 Unicode 与折行算法。
+- 停止：真实 `ui::render` + `TestBackend` 覆盖窄宽度、大量不能同行的单词、组合字符/ZWJ、中文、缩进与尾部 sentinel；不只比较字符串或宽度辅助函数。本轮**未执行**这些后端渲染反例，不得把静态差异当作已测得的像素结果。
+
+### B1／B2 — 沿原后端工单推进（不重新编号）
+`3bdb269c` 区间未改动 `context-simple`；原 B1（批量 required 的有界版本绑定计划）与 B2（首次认领 existing card 的校验）沿既有所有权继续，B3（ledger 导出取消安全）可后置。文档记载"他人本地在飞"不等于 main 已包含——先与实际工作树核对，不覆盖在飞改动。
+
+### T8 — 条件性供应商成本对照
+**先有 R2 的完整结算**再测真实供应商，否则只比较最终成功调用会漏掉失败/取消成本（取消频繁的长任务成本可能被低估）。场景固定同一任务/起点/验收，至少覆盖前缀稳定、动态尾部、文件版本变化、checkpoint、维护、失败重试与取消补账；报告 uncached/read/write/output、主/维护调用、尝试数、未知覆盖与任务质量。无授权/凭据/预算则 `NOT_RUN`，不借用环境密钥发起付费实验。
 
 ## T1–T7 完成记录（历史）
 

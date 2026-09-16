@@ -1,0 +1,81 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "baseline": "3bdb269cba4e1bdd0fe2e71007dfa1ad7640b28d",
+  "baseline_commit_utc": "2026-09-16T14:17:19Z",
+  "ci": {
+    "run_id": 35107501790,
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "success",
+    "origin": "queried existing remote run"
+  },
+  "review_scope": "Repository-wide continuation; full line-by-line repository coverage NOT completed",
+  "execution": {
+    "local_rust_tests": "NOT_RUN",
+    "dotnet_tests": "NOT_RUN",
+    "pty": "NOT_RUN",
+    "vendor_api": "NOT_RUN",
+    "repository_modified": false
+  },
+  "findings": [
+    {
+      "id": "R1",
+      "priority": "first",
+      "title": "Durable cursor dedup drops live deltas"
+    },
+    {
+      "id": "R2",
+      "priority": "P2",
+      "title": "Late successful/failed usage blocked after unknown cancel settlement"
+    },
+    {
+      "id": "R3",
+      "priority": "P2",
+      "title": "Old usage clears new operation view"
+    },
+    {
+      "id": "R4",
+      "priority": "P2",
+      "title": "Per-task revision compared with global snapshot watermark"
+    },
+    {
+      "id": "R5",
+      "priority": "P2",
+      "title": "Omitted failures absent from global-looking failure count"
+    },
+    {
+      "id": "R6",
+      "priority": "P2",
+      "title": "Ordinary input bypasses ordered command lane"
+    },
+    {
+      "id": "R7",
+      "priority": "P2",
+      "title": "Transcript replay not idempotent; input identity retention unbounded"
+    },
+    {
+      "id": "R8",
+      "priority": "P2",
+      "title": "Approval scroll estimate and custom Unicode width diverge from rendering"
+    }
+  ],
+  "continued_existing_items": [
+    "B1 from d92564bc review",
+    "B2 from d92564bc review",
+    "B3 from d92564bc review (later)"
+  ],
+  "files": {
+    "REVIEW.md": {
+      "bytes": 18715,
+      "sha256": "697f0eb8c4174f71fc1c02205c034290016c637391fe57ba37a3afdd14053f8e"
+    },
+    "NEXT_ACTIONS.md": {
+      "bytes": 6331,
+      "sha256": "c0d27aa53fc427078a0eecfdad8b6c06b4ec207956dfbbe01080534d3be76bf0"
+    },
+    "COVERAGE.md": {
+      "bytes": 3927,
+      "sha256": "767920d792984887865145937048e5d7f0ba8b9bb5f28c8ef09526caf3ce58f6"
+    }
+  }
+}
