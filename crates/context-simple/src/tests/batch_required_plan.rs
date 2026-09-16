@@ -14,9 +14,9 @@
 //! 结束时谁还恰好驻留；真实预算不足报 `BudgetExcluded`，不宣称 `Missing`。
 
 use agent_contracts::{
-    AnchorRootClaim, AnchorRootStrength, ContextEngine, ContextHints, ContextItemId, ContextKind,
-    ContextMaterializationMissReason, ContextQuery, ContextResidency, ContextRetention,
-    ContextScope, ResourceKey, RootReason,
+    AnchorRootClaim, AnchorRootStrength, ContextConsumptionAck, ContextEngine, ContextHints,
+    ContextItemId, ContextKind, ContextMaterializationMissReason, ContextQuery, ContextResidency,
+    ContextRetention, ContextScope, OperationId, ResourceKey, RootReason, TurnId,
 };
 
 use crate::engine::{SimpleContextConfig, SimpleContextEngine};
@@ -80,11 +80,17 @@ async fn externalize_stamped(
 /// The pending row for `id`, proving the entry is NOT resident (the id is
 /// known only as a cold locator).
 async fn pending_row_for(engine: &SimpleContextEngine, id: ContextItemId) -> bool {
+    pending_row_hash(engine, id).await.is_some()
+}
+
+/// The pending row's card hash, for version-binding assertions.
+async fn pending_row_hash(engine: &SimpleContextEngine, id: ContextItemId) -> Option<String> {
     let state = engine.state.lock().await;
     state
         .pending_external_cards
         .iter()
-        .any(|(row_id, _)| *row_id == id)
+        .find(|(row_id, _)| *row_id == id)
+        .map(|(_, hash)| hash.clone())
 }
 
 fn required_claim(item_ref: String) -> AnchorRootClaim {
@@ -363,5 +369,250 @@ async fn mixed_exact_entity_and_path_refs_survive_batch_demotion() {
             "the served body is the captured one: {}",
             served.content
         );
+    }
+}
+
+/// 切片 A（2026-09-16 review 6afa25df Q1，红先）：材料化把 A/B/C 三份正文送
+/// 进最终帧（A 随后被 C 的安装挤回 pending 冷驻留）之后，Runtime 会把最终
+/// `materialized.items` 的全部 id 放进真实 `ContextConsumptionAck`
+/// （model.rs 最终帧 ACK 直接来自 items）。旧 owner 计数只查 heap /
+/// eviction_buffer / pending_externalize_retry / 已加载 external 四处——A
+/// 四处皆空，ACK 被拒，本轮成功结果无法提交。红即 unwrap。
+#[tokio::test]
+async fn consumption_ack_accepts_the_pending_cold_body_the_preview_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, [a, b, c]) = abc_fixture(&dir).await;
+
+    let materialized = engine
+        .materialize(ContextQuery {
+            current_input: "continue".into(),
+            budget_tokens: 100_000,
+            hints: ContextHints {
+                anchor_roots: vec![
+                    required_claim(format!("context://run/{a}")),
+                    required_claim(format!("context://run/{b}")),
+                    required_claim(format!("context://run/{c}")),
+                ],
+                ..Default::default()
+            },
+        })
+        .await
+        .unwrap();
+
+    // 保留 B1 的既有断言：A 确实 pending 冷驻留——本测证明的不是热驻留。
+    {
+        let state = engine.state.lock().await;
+        assert!(
+            state.external.get(a).is_none(),
+            "setup: C's install must have demoted A back to pending"
+        );
+    }
+    assert!(pending_row_for(&engine, a).await, "A keeps its cold row");
+
+    // 真实 Runtime 形状：最终帧的全部 id 进 ACK（不只是仍驻留的子集）。
+    engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: materialized.materialization_id,
+            item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: materialized
+                .external
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect(),
+            foreground_item_ids: materialized
+                .foreground
+                .iter()
+                .map(|item| item.item_id)
+                .collect(),
+        })
+        .await
+        .unwrap();
+
+    // 消费结算的诚实形状：三个 id 各记一次聚合 ack；A（冷）的逐项事实以
+    // `(id, 卡片哈希, turn, tick)` 记录存续，B/C（驻留）直接盖戳。
+    // 卡片哈希先在锁外读：tokio Mutex 不可重入，持锁跨 .await 再锁同一把
+    // 锁会在 current_thread runtime 上永久死锁。
+    let row_hash = pending_row_hash(&engine, a)
+        .await
+        .expect("A's row survives");
+    {
+        let state = engine.state.lock().await;
+        assert_eq!(
+            state.access_consumption_acks, 3,
+            "each acked id settles exactly one consumption fact"
+        );
+        assert_eq!(
+            state.pending_cold_consumed.len(),
+            1,
+            "exactly the demoted id needs the persisted cold record: {:?}",
+            state.pending_cold_consumed
+        );
+        let record = &state.pending_cold_consumed[0];
+        assert_eq!(record.item_id, a, "the cold record is A's");
+        assert_eq!(
+            record.card_hash, row_hash,
+            "the record is bound to the exact card version the preview served"
+        );
+    }
+    // checkpoint/restore 一致：持久化记录随状态走，恢复后仍能落账。
+    let checkpoint = engine.checkpoint().await.unwrap();
+    let restored = SimpleContextEngine::new(b1_config(&dir, 2));
+    restored.restore(checkpoint).await.unwrap();
+
+    // A 的卡片按 id 水化：记录把真实的消费事实盖到新驻留条目上（延迟
+    // 记账，不是伪造强化——没有额外计数之外的强化，GC 世代锚不动）。
+    let fetched = restored
+        .fetch_external(a)
+        .await
+        .unwrap()
+        .expect("the consumed version still fetches by id");
+    assert!(
+        fetched.content.contains("payload-req-alpha"),
+        "the fetched body is the served one: {}",
+        fetched.content
+    );
+    {
+        let state = restored.state.lock().await;
+        let entry = state.external.get(a).expect("the card installed");
+        assert_eq!(
+            entry.access_count, 1,
+            "the one true consumption lands, nothing more"
+        );
+        assert_eq!(
+            entry.last_access_turn, state.turn,
+            "the landing records the turn the model actually consumed, not the hydration turn"
+        );
+        assert!(
+            state.pending_cold_consumed.is_empty(),
+            "the record left the ring once it landed: {:?}",
+            state.pending_cold_consumed
+        );
+    }
+}
+
+/// 旧拒绝语义保持：错误 materialization id 的 ACK 仍被拒绝——预览匹配
+/// 先于 owner 校验，冷修复不放宽它。
+#[tokio::test]
+async fn ack_with_a_wrong_materialization_id_is_still_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, [a, b, c]) = abc_fixture(&dir).await;
+
+    let materialized = engine
+        .materialize(required_abc_query(a, b, c))
+        .await
+        .unwrap();
+
+    let error = engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: materialized.materialization_id.wrapping_add(1),
+            item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: Vec::new(),
+            foreground_item_ids: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("is pending"),
+        "the stale-preview rejection names the id mismatch: {error}"
+    );
+}
+
+/// 旧拒绝语义保持：预览之外的外来 id 仍被拒绝。
+#[tokio::test]
+async fn ack_with_a_foreign_id_is_still_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, [a, b, c]) = abc_fixture(&dir).await;
+
+    let materialized = engine
+        .materialize(required_abc_query(a, b, c))
+        .await
+        .unwrap();
+
+    let error = engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: materialized.materialization_id,
+            item_ids: materialized
+                .items
+                .iter()
+                .map(|item| item.item_id)
+                .chain(std::iter::once(ContextItemId::new()))
+                .collect(),
+            external_item_ids: Vec::new(),
+            foreground_item_ids: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("outside the referenced preview"),
+        "a foreign id never passes the preview containment check: {error}"
+    );
+}
+
+/// 版本绑定：预览送出 A 的卡片版本后，若 pending 定位行的哈希不再是预览
+/// 时那张（元数据变更后重写卡），ACK 必须拒绝——「同 ID 出现过」不是
+/// owner，被送出的版本才算。
+#[tokio::test]
+async fn ack_over_a_resolved_cold_id_with_a_changed_card_version_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, [a, b, c]) = abc_fixture(&dir).await;
+
+    let materialized = engine
+        .materialize(required_abc_query(a, b, c))
+        .await
+        .unwrap();
+    assert!(pending_row_for(&engine, a).await, "A keeps its cold row");
+
+    // A 的卡片版本在预览之后被替换（模拟重写卡）：预览捕获的哈希失效。
+    {
+        let mut state = engine.state.lock().await;
+        for (row_id, hash) in state.pending_external_cards.iter_mut() {
+            if *row_id == a {
+                *hash = "deadbeef0000".into();
+            }
+        }
+    }
+
+    let error = engine
+        .acknowledge_consumption(ContextConsumptionAck {
+            turn_id: TurnId::new(),
+            operation_id: OperationId::new(),
+            model_round: 1,
+            materialization_id: materialized.materialization_id,
+            item_ids: materialized.items.iter().map(|item| item.item_id).collect(),
+            external_item_ids: Vec::new(),
+            foreground_item_ids: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("without exactly one residency owner"),
+        "the served card version no longer has an owner, so the ack rejects: {error}"
+    );
+}
+
+/// 共享 query：required 声明 A/B/C 三份正文（模型预算足够）。
+fn required_abc_query(a: ContextItemId, b: ContextItemId, c: ContextItemId) -> ContextQuery {
+    ContextQuery {
+        current_input: "continue".into(),
+        budget_tokens: 100_000,
+        hints: ContextHints {
+            anchor_roots: vec![
+                required_claim(format!("context://run/{a}")),
+                required_claim(format!("context://run/{b}")),
+                required_claim(format!("context://run/{c}")),
+            ],
+            ..Default::default()
+        },
     }
 }

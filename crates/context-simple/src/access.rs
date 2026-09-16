@@ -42,6 +42,100 @@ pub(crate) fn stamp_consumed(
     applied
 }
 
+/// 上限：已验证的 pending 冷消费记录环。记录在对应卡片版本水化时落账并
+/// 离环；超过上限丢最旧一行。聚合 ack 计数不受丢行影响，上限只约束
+/// checkpoint 里的逐项事实大小。
+pub(crate) const PENDING_COLD_CONSUMED_CAP: usize = 128;
+
+/// 一次已验证的 pending 冷卡片消费（Q1）：模型在 `tick`/`turn` 确实看到了
+/// `(item_id, card_hash)` 这张卡片版本的正文。持久化——checkpoint/restore
+/// 不丢；当这张卡片版本水化时，记录把真实的 tick/turn 盖到新驻留的条目上
+/// （真实事件的延迟记账，不是伪造强化）：热度、admit、热集与 Cold 老化的
+/// GC 世代锚都不因此移动。卡片版本绑定与 owner 校验同源：换版本的卡片不
+/// 落这份账。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PendingColdConsumed {
+    pub(crate) item_id: ContextItemId,
+    pub(crate) card_hash: String,
+    pub(crate) turn: u64,
+    pub(crate) tick: u64,
+}
+
+/// 已验证 pending 冷 owner 的消费结算：聚合 ack 计数前进（消费确实发生），
+/// 并写入一条有界、持久化的 `(id, card hash, turn, tick)` 记录，等该卡片
+/// 版本下次水化时落真实的访问戳。条目本身不在内存——驻留、热度、pin、
+/// 水化都不动。返回 true（事实已记录），供 debug 断言与提交语义使用。
+pub(crate) fn stamp_pending_cold_consumed(
+    state: &mut State,
+    item_id: ContextItemId,
+    card_hash: String,
+    now_tick: u64,
+    turn: u64,
+) -> bool {
+    bump_access(state, AccessSignal::ConsumptionAck);
+    crate::reactivation::mark_consumed(state, item_id);
+    prune_pending_cold_consumed(state);
+    state.pending_cold_consumed.push(PendingColdConsumed {
+        item_id,
+        card_hash,
+        turn,
+        tick: now_tick,
+    });
+    if state.pending_cold_consumed.len() > PENDING_COLD_CONSUMED_CAP {
+        state.pending_cold_consumed.remove(0);
+    }
+    true
+}
+
+/// 记录的落账出口：`installed` 是刚装进 external 表的 `(id, card hash)`。
+/// 版本一致的记录把真实 tick/turn 盖到新条目上（ConsumptionAck 是最强
+/// 信号，必落），随后离环；不落 GC 世代锚——消费发生时条目并不驻留，
+/// 不授予 Cold 老化延期。卡片已消失的版本由下一次写入时的惰性清理移除。
+pub(crate) fn land_pending_cold_consumptions(
+    state: &mut State,
+    installed: &[(ContextItemId, String)],
+) {
+    if state.pending_cold_consumed.is_empty() {
+        return;
+    }
+    let mut landed: Vec<PendingColdConsumed> = Vec::new();
+    {
+        let keys: std::collections::HashSet<(&ContextItemId, &String)> =
+            installed.iter().map(|(id, hash)| (id, hash)).collect();
+        state.pending_cold_consumed.retain(|record| {
+            if keys.contains(&(&record.item_id, &record.card_hash)) {
+                landed.push(record.clone());
+                return false;
+            }
+            true
+        });
+    }
+    for record in landed {
+        let _ = state.external.stamp_access(
+            record.item_id,
+            AccessSignal::ConsumptionAck,
+            record.tick,
+            None,
+            Some(record.turn),
+            None,
+        );
+    }
+}
+
+/// 丢弃既不对应任何 pending 定位行、也无同版本已记录卡片的记录：它们的
+/// 版本永远不可能再水化，留在环里只会挤出还可能落账的事实。
+fn prune_pending_cold_consumed(state: &mut State) {
+    let live_rows: std::collections::HashSet<(ContextItemId, String)> =
+        state.pending_external_cards.iter().cloned().collect();
+    state.pending_cold_consumed.retain(|record| {
+        live_rows.contains(&(record.item_id, record.card_hash.clone()))
+            || state
+                .external
+                .card_hash(record.item_id)
+                .is_some_and(|hash| hash == record.card_hash)
+    });
+}
+
 /// inspect / fetch 的故意读取。弱于 ack，强于 search；从不增加
 /// `access_count`（那是消费确认的特权）。
 pub(crate) fn stamp_read(state: &mut State, item_id: ContextItemId, signal: AccessSignal) -> bool {

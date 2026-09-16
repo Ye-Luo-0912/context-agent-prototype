@@ -581,6 +581,14 @@ pub(crate) struct PendingMaterialization {
     /// ack can stamp final-frame exposure for bodies the model consumed
     /// without changing their residency.
     pub(crate) foreground_paths: Vec<(ContextItemId, String)>,
+    /// Q1 (2026-09-16 review 6afa25df): pending cold locators for ids this
+    /// preview served whose only residency owner at preview end was a
+    /// spill-card row (a later install in the same resolution demoted the
+    /// captured entry back to pending). The ack validates the same
+    /// `(item id, card hash)` version it delivered — not merely "a pending
+    /// row with this id exists now", which would accept a different card
+    /// version than the body actually rendered.
+    pending_cold_items: Vec<(ContextItemId, String)>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -773,6 +781,13 @@ pub(crate) struct State {
     /// observational signal; never reinforces access or changes residency).
     #[serde(default)]
     pub(crate) foreground_consumed_acks: u64,
+    /// Q1: verified consumptions of still-pending cold cards, persisted so
+    /// the fact survives checkpoint/restore and lands its true access stamp
+    /// on the entry when the exact consumed card version hydrates. Bounded
+    /// ring (`access::PENDING_COLD_CONSUMED_CAP`); see
+    /// `access::PendingColdConsumed` for the honesty rules of the landing.
+    #[serde(default)]
+    pub(crate) pending_cold_consumed: Vec<crate::access::PendingColdConsumed>,
     /// Segment-local reactivation instrumentation. Skipped in checkpoints
     /// and zeroed on restore; run-global aggregation is event-side.
     #[serde(skip)]
@@ -1640,8 +1655,17 @@ impl SimpleContextEngine {
         state
             .external
             .merge_paged(claimed.iter().map(|(entry, _)| entry.clone()).collect());
-        for (entry, hash) in claimed {
-            state.external.record_card(entry.item_id, hash);
+        for (entry, hash) in &claimed {
+            state.external.record_card(entry.item_id, hash.clone());
+        }
+        if !claimed.is_empty() {
+            // A verified pending-cold consumption lands its true stamp the
+            // moment the exact consumed card version becomes resident.
+            let installed: Vec<(ContextItemId, String)> = claimed
+                .iter()
+                .map(|(entry, hash)| (entry.item_id, hash.clone()))
+                .collect();
+            crate::access::land_pending_cold_consumptions(&mut state, &installed);
         }
         state.external_cards_missing = state.external_cards_missing.saturating_add(missing);
         state.external_card_io_failures =
@@ -2141,7 +2165,14 @@ impl SimpleContextEngine {
                 };
                 state.pending_external_cards.remove(position);
                 state.external.merge_paged(vec![entry.clone()]);
-                state.external.record_card(item_id, hash);
+                state.external.record_card(item_id, hash.clone());
+                // Same landing as the batch path: a verified pending-cold
+                // consumption stamps the entry as this exact card version
+                // becomes resident.
+                crate::access::land_pending_cold_consumptions(
+                    &mut state,
+                    &[(item_id, hash.clone())],
+                );
                 // S3: per-id installs settle through the one residency
                 // entry (protecting the just-served id so the caller's read
                 // still finds it). With carded history this slides the hot
@@ -2497,35 +2528,71 @@ fn plan_external_spill(state: &State, config: &SimpleContextConfig) -> ExternalS
     plan
 }
 
-fn has_exactly_one_owner(state: &State, item_id: ContextItemId) -> bool {
-    // The heap and external map own unique id indexes; the reversible Warm
-    // buffer is bounded by config and the externalize-retry list holds the
-    // spilled overflow, so checking all four locations is O(1) plus small
-    // bounded scans rather than O(total history). The catalog skips a
-    // duplicate on rebuild, so it cannot be the duplicate detector.
+/// How many of the four loaded residency locations (heap, reversible Warm
+/// buffer, externalize-retry list, loaded external map) own `item_id`.
+/// The heap and external map own unique id indexes; the buffer is bounded
+/// by config and the retry list holds the spilled overflow, so checking
+/// all four locations is O(1) plus small bounded scans rather than
+/// O(total history). The catalog skips a duplicate on rebuild, so it
+/// cannot be the duplicate detector.
+fn loaded_owner_count(state: &State, item_id: ContextItemId) -> usize {
     let resident = usize::from(state.items.indexes().get(item_id).is_some());
     let warm = usize::from(state.eviction_buffer.iter().any(|item| item.id == item_id));
-    let pending = usize::from(
+    let retry = usize::from(
         state
             .pending_externalize_retry
             .iter()
             .any(|item| item.id == item_id),
     );
     let external = usize::from(state.external.get(item_id).is_some());
-    resident + warm + pending + external == 1
+    resident + warm + retry + external
 }
 
-/// Stamp one consumed identity wherever its body/descriptor currently lives.
-/// A successful acknowledgement never changes residency or semantic state;
-/// it only records that the model actually saw the final packed projection.
+/// The one logical-owner query a consumption ack validates against: the
+/// four loaded locations plus the pending cold locator bound to THIS
+/// preview's card version. At most one pending row per id exists, and the
+/// row counts only while its card hash still equals the hash the preview
+/// delivered — "a row with the same id exists now" is not ownership; the
+/// ack proves this exact card version was sent. Any second owner (or a
+/// stale/absent locator) still rejects, exactly like the old count.
+fn has_exactly_one_owner(
+    state: &State,
+    item_id: ContextItemId,
+    preview_cold: &[(ContextItemId, String)],
+) -> bool {
+    let cold = usize::from(preview_cold.iter().any(|(cold_id, cold_hash)| {
+        *cold_id == item_id
+            && state
+                .pending_external_cards
+                .iter()
+                .any(|(row_id, row_hash)| *row_id == item_id && row_hash == cold_hash)
+    }));
+    loaded_owner_count(state, item_id) + cold == 1
+}
+
+/// Stamp one consumed identity wherever its body/descriptor currently
+/// lives — the four loaded locations, or a pending cold locator this
+/// preview verified by card version. A successful acknowledgement never
+/// changes residency or semantic state; it only records that the model
+/// actually saw the final packed projection.
 fn stamp_consumed(
     state: &mut State,
     item_id: ContextItemId,
+    preview_cold: &[(ContextItemId, String)],
     now_tick: u64,
     turn: u64,
     gc_epoch: u64,
 ) -> bool {
-    crate::access::stamp_consumed(state, item_id, now_tick, turn, gc_epoch)
+    if crate::access::stamp_consumed(state, item_id, now_tick, turn, gc_epoch) {
+        return true;
+    }
+    // Not loaded: ownership above verified a pending cold row under this
+    // preview's exact card hash, so the access fact settles through the
+    // bounded persisted record — the entry itself is not in memory.
+    let Some((_, hash)) = preview_cold.iter().find(|(cold_id, _)| *cold_id == item_id) else {
+        return false;
+    };
+    crate::access::stamp_pending_cold_consumed(state, item_id, hash.clone(), now_tick, turn)
 }
 
 #[async_trait::async_trait]
@@ -3411,6 +3478,19 @@ impl ContextEngine for SimpleContextEngine {
                     (!path.is_empty()).then_some((item.item_id, path))
                 })
                 .collect(),
+            pending_cold_items: materialized
+                .items
+                .iter()
+                .map(|item| item.item_id)
+                .filter(|id| loaded_owner_count(&state, *id) == 0)
+                .filter_map(|id| {
+                    state
+                        .pending_external_cards
+                        .iter()
+                        .find(|(row_id, _)| *row_id == id)
+                        .cloned()
+                })
+                .collect(),
         });
         drop(state);
         Ok(materialized)
@@ -3460,7 +3540,7 @@ impl ContextEngine for SimpleContextEngine {
             .item_ids
             .iter()
             .chain(&ack.external_item_ids)
-            .any(|id| !has_exactly_one_owner(&state, *id))
+            .any(|id| !has_exactly_one_owner(&state, *id, &pending.pending_cold_items))
         {
             return Err(AgentError::Context(
                 "context consumption ack references an item without exactly one residency owner"
@@ -3482,16 +3562,28 @@ impl ContextEngine for SimpleContextEngine {
             .filter(|(item_id, _)| ack.foreground_item_ids.contains(item_id))
             .map(|(_, path)| path.clone())
             .collect();
+        // The preview's cold locators, cloned out so the owned copy survives
+        // the pending borrow into the stamping loop below.
+        let preview_cold = pending.pending_cold_items.clone();
         state.event_seq = now_event_seq;
         let turn = state.turn;
         let gc_epoch = state.gc_epoch;
         for item_id in ack.item_ids.iter().chain(&ack.external_item_ids) {
             // Ownership was validated above while holding the same lock, so
             // stamping is infallible and the acknowledgement commits as one
-            // mutation rather than partially reinforcing a prefix. The stamp
-            // itself must run in release builds too: consumption is the only
-            // record that the model actually saw the final packed frame.
-            let stamped = stamp_consumed(&mut state, *item_id, now_event_seq, turn, gc_epoch);
+            // mutation rather than partially reinforcing a prefix. A loaded
+            // id stamps in place; a verified pending-cold id settles through
+            // the bounded persisted record. The stamp itself must run in
+            // release builds too: consumption is the only record that the
+            // model actually saw the final packed frame.
+            let stamped = stamp_consumed(
+                &mut state,
+                *item_id,
+                &preview_cold,
+                now_event_seq,
+                turn,
+                gc_epoch,
+            );
             debug_assert!(stamped);
         }
         // Foreground bodies were seen by the model but never changed

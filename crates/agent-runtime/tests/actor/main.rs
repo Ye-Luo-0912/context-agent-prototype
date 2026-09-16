@@ -5,6 +5,7 @@
 mod barrier;
 mod budget;
 mod busy;
+mod cold_consumption_ack;
 mod context_ack_usage;
 mod context_commit;
 mod final_pack;
