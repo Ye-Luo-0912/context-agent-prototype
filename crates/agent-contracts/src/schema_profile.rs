@@ -15,6 +15,18 @@
 //! `additionalProperties` (boolean). `description` is an annotation and is
 //! ignored. Every other keyword fails compilation.
 //!
+//! ## Constraint survival
+//!
+//! A constraint that compilation accepts must keep executable semantics in
+//! the compiled node: `enum` is carried by every primitive node, including
+//! boolean and null, and an empty `enum` (which admits no value) fails
+//! compilation. A schema node without a `type` supports only `enum` plus
+//! annotations; any other constraint keyword on such a node fails
+//! compilation instead of decaying into an unconstrained node that silently
+//! drops the rule. There is no path that accepts a keyword at compile time
+//! and ignores it at validation: what the compiled profile enforces, the
+//! model-facing schema advertises, and the Core gate refuses, are one set.
+//!
 //! ## Numeric domain
 //!
 //! RFC 8785 §3.1 renders every JSON number through an IEEE 754 binary64
@@ -93,8 +105,12 @@ impl std::fmt::Display for SchemaViolation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum BoundedNode {
     Any,
-    Null,
-    Bool,
+    Null {
+        enum_options: Option<Vec<Value>>,
+    },
+    Bool {
+        enum_options: Option<Vec<Value>>,
+    },
     Integer {
         minimum: Option<i64>,
         maximum: Option<i64>,
@@ -270,6 +286,13 @@ impl BoundedNode {
                     let options = value
                         .as_array()
                         .ok_or_else(|| "schema 'enum' must be an array".to_string())?;
+                    if options.is_empty() {
+                        // The JSON Schema meta-schema requires a non-empty
+                        // array: an empty option set admits no value, which
+                        // is a producer bug surfaced at admission instead of
+                        // compiling into an always-refusing gate.
+                        return Err("schema 'enum' must not be empty".into());
+                    }
                     let mut bounded: Vec<Value> = Vec::with_capacity(options.len());
                     for option in options {
                         if !is_primitive(option) {
@@ -350,6 +373,34 @@ impl BoundedNode {
         if pattern.is_some() && !matches!(declared, None | Some(NodeType::String)) {
             return Err("schema 'pattern' applies only to strings".into());
         }
+        if declared.is_none() {
+            // A typeless node carries no shape semantics: accepting shape
+            // keywords here would compile into an unconstrained node that
+            // silently drops them. `enum` alone stays executable (the
+            // `Enum` node below); anything else fails capability admission.
+            let dropped: Option<&'static str> = if !properties.is_empty() {
+                Some("'properties'")
+            } else if !required.is_empty() {
+                Some("'required'")
+            } else if items.is_some() || min_items.is_some() || max_items.is_some() {
+                Some("'items'/'minItems'/'maxItems'")
+            } else if minimum.is_some() || maximum.is_some() {
+                Some("'minimum'/'maximum'")
+            } else if min_length.is_some() || max_length.is_some() {
+                Some("'minLength'/'maxLength'")
+            } else if pattern.is_some() {
+                Some("'pattern'")
+            } else if allow_additional.is_some() {
+                Some("'additionalProperties'")
+            } else {
+                None
+            };
+            if let Some(keyword) = dropped {
+                return Err(format!(
+                    "typeless schema node carries {keyword}: declare a JSON type so the constraint is enforced; a typeless node supports only 'enum' and annotations"
+                ));
+            }
+        }
 
         let node = match declared.unwrap_or(NodeType::Any) {
             NodeType::Array => {
@@ -396,8 +447,8 @@ impl BoundedNode {
                 enum_options,
                 pattern,
             },
-            NodeType::Null => BoundedNode::Null,
-            NodeType::Bool => BoundedNode::Bool,
+            NodeType::Null => BoundedNode::Null { enum_options },
+            NodeType::Bool => BoundedNode::Bool { enum_options },
             NodeType::Any => match enum_options {
                 Some(options) => BoundedNode::Enum { options },
                 None => BoundedNode::Any,
@@ -409,8 +460,8 @@ impl BoundedNode {
     fn node_type(&self) -> NodeType {
         match self {
             BoundedNode::Any => NodeType::Any,
-            BoundedNode::Null => NodeType::Null,
-            BoundedNode::Bool => NodeType::Bool,
+            BoundedNode::Null { .. } => NodeType::Null,
+            BoundedNode::Bool { .. } => NodeType::Bool,
             BoundedNode::Integer { .. } => NodeType::Integer,
             BoundedNode::Number { .. } => NodeType::Number,
             BoundedNode::String { .. } => NodeType::String,
@@ -431,8 +482,16 @@ impl BoundedNode {
             // An unconstrained node still bounds and domain-checks the value
             // it admits: numbers under it reach the digest like any other.
             BoundedNode::Any => budget.scan_value(value, pointer),
-            BoundedNode::Null => expect(value, pointer, NodeType::Null, budget),
-            BoundedNode::Bool => expect(value, pointer, NodeType::Bool, budget),
+            BoundedNode::Null { enum_options } => {
+                expect(value, pointer, NodeType::Null, budget)?;
+                check_enum(enum_options.as_deref(), value, pointer)?;
+                Ok(())
+            }
+            BoundedNode::Bool { enum_options } => {
+                expect(value, pointer, NodeType::Bool, budget)?;
+                check_enum(enum_options.as_deref(), value, pointer)?;
+                Ok(())
+            }
             BoundedNode::Integer {
                 minimum,
                 maximum,
@@ -1456,6 +1515,99 @@ mod tests {
             .is_err(),
             "an invalid regex must fail capability admission"
         );
+    }
+
+    #[test]
+    fn boolean_enum_survives_compile_into_validation() {
+        // SCHEMA_CASES.json `boolean_enum_is_enforced`: the compiler read and
+        // checked `enum` on `{"type":"boolean"}` but dropped the allowed set
+        // when building the node, so `true` passed an `enum:[false]` gate.
+        // The allowed set must reach validation on every primitive type.
+        let profile = compile(json!({
+            "type": "object",
+            "properties": {"flag": {"type": "boolean", "enum": [false]}},
+            "required": ["flag"]
+        }));
+        valid(&profile, json!({"flag": false}));
+        let violation = invalid(&profile, json!({"flag": true}));
+        assert_eq!(violation.pointer, "/flag");
+        assert!(
+            violation.expected.starts_with("one of ["),
+            "boolean enum mismatch must be a typed violation: {violation}"
+        );
+        let inverse = compile(json!({
+            "type": "object",
+            "properties": {"flag": {"type": "boolean", "enum": [true]}}
+        }));
+        valid(&inverse, json!({"flag": true}));
+        assert!(
+            invalid(&inverse, json!({"flag": false}))
+                .expected
+                .starts_with("one of [")
+        );
+        let null_enum = compile(json!({
+            "type": "object",
+            "properties": {"unit": {"type": "null", "enum": [null]}}
+        }));
+        valid(&null_enum, json!({"unit": null}));
+    }
+
+    #[test]
+    fn typeless_constraint_keywords_fail_compilation() {
+        // SCHEMA_CASES.json `nested_typeless_pattern` /
+        // `nested_typeless_required`: a typeless node supports only `enum`
+        // (plus annotations); any other constraint keyword must fail
+        // capability admission instead of compiling to an unconstrained Any
+        // that silently drops the rule.
+        for schema in [
+            json!({"type": "object", "properties": {"s": {"pattern": "^ok$"}}}),
+            json!({"type": "object", "properties": {"child": {"properties": {"x": {"type": "string"}}, "required": ["x"]}}}),
+            json!({"type": "object", "properties": {"s": {"minLength": 2}}}),
+            json!({"type": "object", "properties": {"n": {"minimum": 1}}}),
+            json!({"type": "object", "properties": {"a": {"items": {"type": "string"}}}}),
+            json!({"type": "object", "properties": {"a": {"minItems": 1}}}),
+            json!({"type": "object", "properties": {"o": {"additionalProperties": false}}}),
+            // `enum` alone is executable on a typeless node; combining it
+            // with a shape constraint is not.
+            json!({"type": "object", "properties": {"e": {"enum": ["a"], "pattern": "^a$"}}}),
+        ] {
+            let error = SchemaProfile::compile(&schema)
+                .err()
+                .unwrap_or_else(|| panic!("typeless constraint must fail compile: {schema}"));
+            assert!(
+                error.contains("typeless"),
+                "must name the typeless-node rule: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn typeless_enum_only_nodes_stay_executable() {
+        let profile = compile(json!({
+            "type": "object",
+            "properties": {"mode": {"enum": ["normal", "resume"]}}
+        }));
+        valid(&profile, json!({"mode": "normal"}));
+        let violation = invalid(&profile, json!({"mode": "restart"}));
+        assert!(violation.expected.starts_with("one of ["), "{violation}");
+        // A truly empty schema stays an unconstrained (but bounded) node.
+        valid(
+            &compile(json!({"type": "object", "properties": {"x": {}}})),
+            json!({"x": 1}),
+        );
+    }
+
+    #[test]
+    fn empty_enum_fails_compilation() {
+        // The JSON Schema meta-schema requires a non-empty `enum`; an empty
+        // option set admits no value and is refused at admission instead of
+        // compiling into an always-refusing gate.
+        let error = SchemaProfile::compile(&json!({
+            "type": "object",
+            "properties": {"x": {"enum": []}}
+        }))
+        .unwrap_err();
+        assert!(error.contains("empty"), "{error}");
     }
 
     #[test]
