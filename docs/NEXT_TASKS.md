@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**当前开工顺序：R1–R5 已关闭。剩余 R6（普通输入进保序通道）、R7 其余（SYSTEM 行事件身份、`shown_input_ids` 上限）、R8（折行/宽度复用库语义）可并行（`session.rs`／`state.rs`／`ui.rs` 互不重叠）；B1／B2 待 `context-simple` 在飞改动收口后接续。** 第五批（U 系列）实现已提交但按续审不视为关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**当前开工顺序：R 系列（R1–R8）与 B3 已全部关闭。剩余仅 B1（批量 required 有界解析计划）与 B2（existing card 认领校验）——两者基线已干净，可直接开工。** 第五批（U 系列）实现已提交但按续审不视为关闭。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -136,7 +136,8 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 停止：真实生产者形状（固定 RunId、分片复用 `ModelStarted` 的 seq）回归通过；旧 generation 分片仍被拒；重复持久 `ModelUsed`/`TurnCompleted` 仍只计一次；既有 TUI 测试通过。
 - 落地回执：[R1_R5_FIRST_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R1_R5_FIRST_BATCH_RECEIPT.md)。**关键发现：契约里早已有 `RuntimeEvent::is_live_only()`**（文档写明"分片复用持久游标、投递游标不得过滤"，`agent-host` 已在用），TUI 只是没采用。已改为 live-only 事件同时跳过持久 claim 与重放水位，归属交给 `current_op` 围栏。**根因之二：折叠 fixture 每次新建 RunId 却固定 seq=1，恰好绕过消费者实际应用的身份**——已改为稳定 RunId＋递增序号。agent-tui 91/0、clippy 0、fmt clean；变异恢复法复验去掉门控后助手正文为空。
 
-### R7 — 重放幂等与附属索引有界（P2）——**部分关闭**（发布副作用已随 R4 收口；SYSTEM 行身份与附属索引上限**待做**）
+### R7 — 重放幂等与附属索引有界（P2）——已关闭（2026-09-16，R4 收口发布副作用；`ef8a835c`＋`1a3ec323` 收口其余）
+- 落地回执：[R6_R7_R8_B3_SECOND_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R6_R7_R8_B3_SECOND_BATCH_RECEIPT.md)。事件派生行带事件身份，重放先丢弃再重建（会话本地行存活）；`shown_input_ids` 改为有界 FIFO＋索引。`replaying_the_same_journal_twice_yields_the_same_transcript` 钉住幂等。
 - 现状：重放保留 `messages`/`shown_message_index`/`shown_input_ids`，重置运行投影后重新应用日志；User/Assistant/Tool 行有身份去重，但 **Warning/Focus/ModelUsed 等生成的 SYSTEM 行没有同等规则**，重放会再次追加并把已保留的助手行挤出 400 行窗口 → **同一日志重放两次可见序列不一致**。`shown_input_ids` 只插入不淘汰。
 - 修复方向：所有事件派生行共享事件身份；更稳妥的是**构建新的有界读模型后原子替换**事件派生部分，草稿/滚动/当前审批等本地状态单独保留；`InputId` 索引跟随可见窗口与活动排队输入。**reducer 输出与写盘副作用分开**：重放历史 `TaskCompleted` 不等价于重新发起一批快照写入。
 - 停止：同一日志连续重放两次事件派生视图一致；相同正文不同事件都保留；固定窗口下大量不同输入不使附属集合线性增长；不清空输入框或当前审批来简化恢复。
@@ -166,18 +167,21 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 修复方向：总成功/失败数在**显示裁剪之前**按事件身份结算；显示列表只是摘要窗口；或明确写成"已展示的 N 项中失败 M，另 K 项未显示"。失败信息可优先保留，但不得修改真实执行结果，也不改 Core 验收规则。
 - 停止：第 33 项失败计数正确；连续多项遗漏失败正确；重复事件与任务切换不重复计数。
 
-### R6 — 普通输入也要进有序提交通道（P2，接续原 U6，agent-tui）
+### R6 — 普通输入也要进有序提交通道（P2，接续原 U6，agent-tui）——已关闭（2026-09-16，`a0f23d72`）
+- 落地回执：[R6_R7_R8_B3_SECOND_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R6_R7_R8_B3_SECOND_BATCH_RECEIPT.md)。普通文本改走 `SessionCommand::Input` 同一有界通道；`CommandLane` 带未开始计数，`run_session` 持有 worker `JoinHandle`，退出时停收＋取消＋报数（转录那份可见性有限）。**限制**：路由改动无直接红用例，顺序断言在 lane 层、路由由 e2e 覆盖。
 - 现状：`SessionCommand` 已覆盖任务切换/继续/挂起/保存/恢复，但**普通非 `/` 文本仍走独立 `tokio::spawn(handle.user_message(…))`**：worker 在等慢 checkpoint 时输入 `/task B` 再输入普通纠正文本，普通文本会绕过 worker 先到达当前任务 A。
 - 修复方向：具有用户语义顺序的普通文本与任务切换**共享同一有界通道**；依赖任务身份的纠正优先用既有 `expected_task_id`/steering 入口表达目标；紧急取消可保留独立入口，但**必须定义它如何处理尚未提交的队列**；worker 的 `JoinHandle` 由 session 持有，退出时停止接单并明确取消/结算未开始命令（不能只丢弃发送端就当已取消）。
 - 停止：真实键入顺序（`/task B`→普通文本、`/restore`→普通文本、取消与排队输入、退出时队列非空）每个输入都有明确的提交或拒绝回执；不把所有操作塞进一个会让取消排在慢 I/O 后的阻塞队列。
 
-### R8 — 审批滚动与折行口径复用库语义（P2，接续原 U1/U2 渲染验收，agent-tui）
+### R8 — 审批滚动与折行口径复用库语义（P2，接续原 U1/U2 渲染验收，agent-tui）——已关闭（2026-09-16，`a0f23d72`）
+- 落地回执：[R6_R7_R8_B3_SECOND_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R6_R7_R8_B3_SECOND_BATCH_RECEIPT.md)。上限改用 `Paragraph::line_count`（经 `unstable-rendered-line-info`），手写 Unicode 表删除、改委托 `unicode-width`；新增真实 TestBackend 窄窗尾部可达与组合字符光标两例。**注意该特性上游标注为不稳定**，若变更只需改 `wrapped_line_count`。
 - 现状：`wrapped_rows` 与 conversation 行数仍用 `display_width(line).div_ceil(width)` 估算，而 Ratatui `Paragraph` 按**词边界**折行（未填满即换行）→ 滚动上限被低估，长参数尾部或 sentinel 可能到不了；同处**手写 Unicode 宽字符表**把组合附加符/ZWJ 算成 1，不等价于 `UnicodeWidthStr`。
 - 修复方向：复用项目锁定比例版本的宽度/布局语义——评估该版本受特性门控的 `Paragraph::line_count`，或**先统一折行一次、渲染不再二次 Wrap**；不要为减少修改文件数维护第二份 Unicode 与折行算法。
 - 停止：真实 `ui::render` + `TestBackend` 覆盖窄宽度、大量不能同行的单词、组合字符/ZWJ、中文、缩进与尾部 sentinel；不只比较字符串或宽度辅助函数。本轮**未执行**这些后端渲染反例，不得把静态差异当作已测得的像素结果。
 
-### B1／B2 — 沿原后端工单推进（不重新编号）
-`3bdb269c` 区间未改动 `context-simple`；原 B1（批量 required 的有界版本绑定计划）与 B2（首次认领 existing card 的校验）沿既有所有权继续，B3（ledger 导出取消安全）可后置。文档记载"他人本地在飞"不等于 main 已包含——先与实际工作树核对，不覆盖在飞改动。
+### B3 — ledger 导出取消安全——已关闭（2026-09-16，`3fe396c9`）
+- 落地回执：[R6_R7_R8_B3_SECOND_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c/R6_R7_R8_B3_SECOND_BATCH_RECEIPT.md)。导出改为「快照→提交→确认消费」，取消不再丢行；`ContextLifecycleRecord` 增 `PartialEq/Eq`。
+B3 已关闭（见上）。**B1（批量 required 的有界版本绑定计划）与 B2（首次认领 existing card 的校验）仍未做**——`context-simple` 的在飞工作已先行按归属提交（`ca6c7254`、`99218532`），因此两者现在有了干净基线。文档记载"他人本地在飞"不等于 main 已包含——先与实际工作树核对，不覆盖在飞改动。
 
 ### T8 — 条件性供应商成本对照
 **先有 R2 的完整结算**再测真实供应商，否则只比较最终成功调用会漏掉失败/取消成本（取消频繁的长任务成本可能被低估）。场景固定同一任务/起点/验收，至少覆盖前缀稳定、动态尾部、文件版本变化、checkpoint、维护、失败重试与取消补账；报告 uncached/read/write/output、主/维护调用、尝试数、未知覆盖与任务质量。无授权/凭据/预算则 `NOT_RUN`，不借用环境密钥发起付费实验。
