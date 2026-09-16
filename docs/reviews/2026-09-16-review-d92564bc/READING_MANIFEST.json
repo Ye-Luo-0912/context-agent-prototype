@@ -1,0 +1,152 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "commit": "d92564bcfa41dda44f752e1e49e88a321abdf942",
+  "review_date": "2026-09-16",
+  "ci": {
+    "run_id": 35036238204,
+    "attempt": 1,
+    "conclusion": "success",
+    "source": "GitHub Actions read"
+  },
+  "local_execution": {
+    "git_remote": "DNS failure: github.com",
+    "cargo": "not found",
+    "rustc": "not found",
+    "dotnet": "not found",
+    "rust_tests": "NOT_RUN",
+    "pty_tests": "NOT_RUN",
+    "paid_provider": "NOT_RUN"
+  },
+  "full_repository_line_by_line_complete": false,
+  "tui_src_full_files": 8,
+  "tui_integration_test_files_read_full": 1,
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "read_coverage": "全文",
+      "purpose": "工作区 20 crate 及依赖版本",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/Cargo.toml"
+    },
+    {
+      "path": "crates/agent-tui/Cargo.toml",
+      "read_coverage": "全文",
+      "purpose": "TUI 依赖/测试依赖",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/Cargo.toml"
+    },
+    {
+      "path": "crates/agent-tui/src/main.rs",
+      "read_coverage": "全文（1–520 窗口读至 EOF）",
+      "purpose": "启动、审批组合、终端设置/清理、headless",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/main.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/args.rs",
+      "read_coverage": "全文（1–290；291–650 读至 EOF）",
+      "purpose": "参数、默认配置、内联测试",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/args.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/work.rs",
+      "read_coverage": "全文",
+      "purpose": "共享长任务入口薄适配",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/work.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/ui.rs",
+      "read_coverage": "全文",
+      "purpose": "真实 render、Line/Paragraph、视窗/光标、测试",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/ui.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/session.rs",
+      "read_coverage": "全文（1–945；946–1300；1301–1700；1701–2300 读至 EOF）",
+      "purpose": "事件循环、命令分发、保存/恢复、CaptureSink/E2E 与有界读取测试",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/session.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/state.rs",
+      "read_coverage": "全文（1–1540；1541–1900；1901–2350 读至 EOF）",
+      "purpose": "状态折叠、审批、review、日志重放、全部内联测试",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/state.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/cli.rs",
+      "read_coverage": "全文（1–620；621–1030；990–1340；1341–1850 读至 EOF）",
+      "purpose": "生产 drain/JSONL 与全部内联测试；第一次尾部截断由后续重叠读取补齐",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/cli.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/doctor.rs",
+      "read_coverage": "全文（1–470；471–850 读至 EOF）",
+      "purpose": "检查计数、脱敏导出和内联测试",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/src/doctor.rs"
+    },
+    {
+      "path": "crates/agent-tui/tests/real_binary_startup.rs",
+      "read_coverage": "全文",
+      "purpose": "真实二进制 preflight 和 headless demo",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-tui/tests/real_binary_startup.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/status.rs",
+      "read_coverage": "1–290",
+      "purpose": "公共投影完整生产实现及测试开头；后续测试未读",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-runtime/src/status.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/instance.rs",
+      "read_coverage": "1–270 读至 EOF",
+      "purpose": "RuntimeInstance/CheckpointPlane/ordered shutdown",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-runtime/src/instance.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/command.rs",
+      "read_coverage": "1–250；290–490",
+      "purpose": "命令身份、handle Sender 所有权、expecting/reporting；非全文",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-runtime/src/command.rs"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "read_coverage": "1–100；830–1470；2090–2430；3220–3305；3440–3760",
+      "purpose": "原子搜索、导出、spill、required 解析与材料化、checkpoint；非全文",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/context-simple/src/engine.rs"
+    },
+    {
+      "path": "crates/context-simple/src/materializer.rs",
+      "read_coverage": "1010–1465",
+      "purpose": "required 计划与冷解析失败分类；非全文",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/context-simple/src/materializer.rs"
+    },
+    {
+      "path": "crates/context-contextcore/src/adapter.rs",
+      "read_coverage": "285–495 读至 EOF",
+      "purpose": "协商后原子结果/续查、旧服务拒绝、恢复尾部；前部未通读",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/context-contextcore/src/adapter.rs"
+    },
+    {
+      "path": "crates/provider-openai/src/lib.rs",
+      "read_coverage": "840–1125",
+      "purpose": "当前缓存内容块放置规则与真实 wire 构建部分；非全文",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/provider-openai/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-compose/tests/cancel_usage_settlement.rs",
+      "read_coverage": "全文",
+      "purpose": "已知取消 usage 正式事件回归；只读未运行",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/crates/agent-compose/tests/cancel_usage_settlement.rs"
+    },
+    {
+      "path": "docs/NEXT_TASKS.md",
+      "read_coverage": "返回摘录（全文请求被输出截断）",
+      "purpose": "只作为当前队列定位；不把未见后半部当作已读",
+      "source_url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d92564bcfa41dda44f752e1e49e88a321abdf942/docs/NEXT_TASKS.md"
+    }
+  ],
+  "metadata_reads": [
+    "main at start/end",
+    "agent-tui/src directory",
+    "agent-tui/tests directory",
+    "compare 4f6eb7ff...d92564bc",
+    "CI run"
+  ]
+}

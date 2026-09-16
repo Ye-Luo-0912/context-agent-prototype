@@ -15,6 +15,10 @@
 
 **2026-09-16 新审查（基线 `4f6eb7ff`，CI run `35019429861` 首次成功）**：开 V1–V7 七项发现，核心主线是"分页只改变驻留位置、不改变语义身份与保护义务；取消只改变执行结果、不抹掉已知成本"。报告与覆盖表见 [docs/reviews/2026-09-16-review-4f6eb7ff/](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)。
 
+**2026-09-16 新审查（基线 `d92564bc`，CI run `35036238204` 首次成功）**：开 U1–U7 与 B1–B3 十项发现。主线是"TUI 已经不是显示壳——它的审批、命令顺序、事件恢复和任务复核直接影响长流程可控性，应作为后端主体的一部分收口"。首次全文读取 `agent-tui/src` 八个源文件（含内联测试）、`tests/real_binary_startup.rs` 与该 crate 配置。报告与覆盖表见 [docs/reviews/2026-09-16-review-d92564bc/](reviews/2026-09-16-review-d92564bc/REVIEW.md)；派工与停止条件见同目录 [NEXT_ACTIONS.md](reviews/2026-09-16-review-d92564bc/NEXT_ACTIONS.md)。架构不重做，三线不变，GUI 继续后置。
+
+**2026-09-16 U 批次进展（第一批）**：A1（U1＋U2）与 A4（U7）已落地，A3 只剩 U6。A1（`22ab97a6`）：`PendingApproval` 保留完整请求（无 220 字符上限）＋可滚动审批详情＋`PgUp/PgDn`＋确认绑定屏上 `request_id`（过期确认不批准新请求），对话摘要截断标 `…`；`conversation_lines` 按 `'\n'` 拆真 `Line`，折行/滚动/光标共用 `display_width` 显示列宽。A3（U5，`296ec005`）：`TerminalGuard` 跟踪并逆序恢复已启用终端状态（早退回滚部分状态、`Drop`＋panic hook 链回原 hook），终端释放排在 `composed.shutdown()` 之前且两类错误分别聚合。A4（U7，同上）：`Lagged` 缺口与新 `EXIT_INCOMPLETE = 4`（`events_dropped`｜`stream_closed`），尾部 `TurnCompleted` 不再掩盖被丢段，另修 JSONL 双换行。回执：[A1](reviews/2026-09-16-review-d92564bc/A1_U1_U2_APPROVAL_AND_RENDERING_RECEIPT.md)、[A3/A4](reviews/2026-09-16-review-d92564bc/A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT.md)。**仍未做**：A2（U3 共享事件读模型＋U4 按任务 review）、U6（`session.rs` 20 处 detached spawn 不保序、慢 I/O 占住绘制循环）、B1/B2（`context-simple` 当前有他人在未提交改动）。本批新增回归均以变异恢复法在 `d92564bc` 上复验转红，agent-tui 75/0、clippy 0、fmt clean；未跑 workspace 全量 CI。
+
 **2026-09-16 V 批次收口**：W1–W4 全部关闭（见 [NEXT_TASKS.md](NEXT_TASKS.md) 第四批与各回执）。W1（`c0923af2`）：scope 退休引用闭包许可（未读冷页引用的 scope 不被退休、预算耗尽诚实推迟）＋必需正文冷解析（typed Missing/Corrupt/IoFailed/UnreadColdPage，不再把已存在正文报成 Missing）；W2（同上）：`ContextSearchResult` 原子返回＋wire 协商、fresh/resume 生命周期、restore 失效旧 token＋nonce 防ABA；W3（`9b176df0`）：工具结果断点改 `input_text` 块、未确认 sibling fallback 删除；W4（`4fa2d8a2`）：取消结算已知用量（`Cancelled{known_usage}`，observer 降级为诊断副本，全链回归在无 metrics env 下验证）。限制如实记录在各回执（退休探测预算耗尽时持续推迟、covered 集仍为累积 ID 集、maintenance lane 取消仍 unknown、真实端点接受/命中归 T8）。
 
 ## 当前阶段：可持续使用的后端开发流程
@@ -38,6 +42,7 @@
 - 跨进程连续任务轨迹已由 `host_process_variant` 证明（真实两 OS 进程、同 TaskId/lineage 恢复、指令传递证据）；仍未覆盖 watchdog/监督重初始化的全部路径。
 - 本地 HTTP 捕获只证明客户端发出了字段；端点 schema 接受、实际命中、任务净成本下降均未验证（T6/T8；V6 工具结果块类型是 W3 待修项）。
 - 冷目录分页与旧路径的跨层缺口未收口：scope 退休可漏未加载冷页引用（V1）、必需正文可被误报 Missing（V2）、service 边界丢 coverage/续查（V3）、续查状态可膨胀与 ABA（V4/V5）、取消丢已知用量（V7）——W1–W4 队列见 [NEXT_TASKS.md](NEXT_TASKS.md)。
+- **TUI 作为操作入口的完整性未收口（`d92564bc` 审查）**：审批详情不可完整查看（U1，P1）、多行正文被构造成单行且换行/光标宽度口径不一致（U2）、实时状态与重放状态分裂（U3）、review 卡片混任务且满额静默丢弃（U4）、终端恢复只在正常路径（U5）、命令不保证键入顺序且慢控制命令占住输入循环（U6）、headless 事件缺口不进成功判定（U7）；另有批量 required 冷解析互相驱逐（B1）与 existing card 仅凭 `exists` 认领（B2）。U 系列队列见 [NEXT_TASKS.md](NEXT_TASKS.md) 第五批。
 - 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
 - 尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
 

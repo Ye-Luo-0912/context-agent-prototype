@@ -1,12 +1,12 @@
 # 可执行任务队列
 
-有效范围见 [CURRENT.md](CURRENT.md)。本文件只保留本阶段仍需动作的任务；历史缺陷描述、验证日志和已关闭细节只链接到原回执，不复制正文。任务依据：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)（T 编号）＋[续审](reviews/2026-09-15-continuation-review-258eb4eb/REVIEW.md)（S 编号；R1–R6 为其发现；T1–T7、S1–S4 已关闭）＋[4f6eb7ff 审查](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)（V 编号，其 NEXT_ACTIONS 与覆盖表见同目录）。
+有效范围见 [CURRENT.md](CURRENT.md)。本文件只保留本阶段仍需动作的任务；历史缺陷描述、验证日志和已关闭细节只链接到原回执，不复制正文。任务依据：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)（T 编号）＋[续审](reviews/2026-09-15-continuation-review-258eb4eb/REVIEW.md)（S 编号；R1–R6 为其发现；T1–T7、S1–S4 已关闭）＋[4f6eb7ff 审查](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)（V 编号，其 NEXT_ACTIONS 与覆盖表见同目录）＋[d92564bc 审查](reviews/2026-09-16-review-d92564bc/REVIEW.md)（U 编号，其 NEXT_ACTIONS 与覆盖表见同目录）。
 
 ## 接手规则
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**开工顺序：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。** 每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写。
+**当前开工顺序：A2（U3＋U4，读模型与按任务 review）与 U6（保序命令提交，`session.rs`）为主线——两者都触及 `state.rs`/`session.rs`，同一 crate 内按文件所有权串行；B1/B2 待 `context-simple` 的在飞改动收口后接续（该文件当前有他人在未提交改动）。** A1（U1＋U2）与 A4（U7）已于 2026-09-16 关闭，A3 只剩 U6。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾；T8 条件任务。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -66,6 +66,63 @@ T4 一期/二期已有预算与降级，但"有界"仍是局部控制（续审 R
 - 修复：沿既有模型 operation 结算入口把 outcome 与 usage 正交表达——取消仍保持 Cancelled 分类与安全屏障/代际隔离，已知 usage 走必有的结算通道，JSONL 只留诊断副本。不许用 `FailedWithUsage(Cancelled)` 换返回值而不调调用链（会把取消误分类为失败）。
 - 回归：Compose→Retry→backoff cancel 全链、metrics 环境变量不存在：已知用量保留、取消分类不变、未执行重试不多计、未知字段不补零、同次 SSE 累计快照不重复相加。
 落地回执：[W4_CANCEL_SETTLES_KNOWN_USAGE_RECEIPT](reviews/2026-09-16-review-4f6eb7ff/W4_CANCEL_SETTLES_KNOWN_USAGE_RECEIPT.md)。`FailedWithUsage{source:Cancelled}` 携带（裸 Cancelled 不变）、`OperationOutcome::Cancelled{known_usage}` 守卫臂结算、屏障前按真实计数记账＋fence、迟到 stale completion 经有界 FIFO 一次性补记；observer 降级为诊断副本。全链回归在 env 不存在下断言正式账目。限制：maintenance lane 取消仍 unknown（token 永不取消）；迟到成功不补记（既有设计）。
+
+## 第五批（U 系列；U1 先行，A 线内部按文件所有权串行）
+
+审查基线 `d92564bc`（报告：[REVIEW.md](reviews/2026-09-16-review-d92564bc/REVIEW.md)，行动与停止条件：[NEXT_ACTIONS.md](reviews/2026-09-16-review-d92564bc/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-d92564bc/COVERAGE.md)）。共同主线：**让 TUI 成为可信的操作入口（一套读模型、一个保序提交口、一个布局/宽度模型），而不是另一份会自行漂移的运行状态；让 required 解析产生稳定的执行计划，而不是依赖最后剩下的热目录内容。** 都属于主体完善，不重做架构、不前置 GUI。行为修改与机械移动分开提交；定向测试后跑既有相关跨 crate 集成，合并沿用现有 CI。
+
+### A1 — 审批可核对与多行文本渲染（U1＋U2，agent-tui）——已关闭（2026-09-16，`22ab97a6`）
+用户动作：待审批的长命令/长路径/大段替换内容能在确认前翻到尾部核对；代码块、错误栈、计划按原行结构显示。
+- U1（P1）：审批区域固定高 3（扣边框只剩一行）却要装工具说明＋参数＋确认提示；`state::begin_approval` 总参数预览只取前 220 字符、对话参数日志最多 8 项且每项只取前 120 字符且不标记尾部截断；`session.rs` 审批中只接受允许/拒绝，PageUp 等导航被忽略。
+- U2：`conversation_lines` 把整条正文交给 `Line::from(content.clone())`，Ratatui 0.30 的 Line 构造/转换会移除换行（非多行 Text 容器）；滚动按总宽度估算折行而 Paragraph 用自己的换行规则；光标用 `chars().count()` 而非终端显示列宽。
+- 修复方向：保留受 Core 已有请求上限约束的完整审批数据或可信完整查看引用＋可滚动详情＋明确标记截断；确认始终绑定当前 `request_id`。多条 Line 或真多行 Text；视窗/滚动/光标共用同一布局宽度口径。不扩展主题/插件面板/GUI，不做 Markdown 编辑器。
+- 红例：两条长参数前 120 字符相同、关键目标只在尾部不同 → 80×24 与窄终端经真实 render ＋翻页能核对尾部 sentinel；超 8 参数有继续查看路径；过期请求不能批准新请求（旧确认不作用于新 request_id）；多行正文的第二行、缩进、空行、末行 sentinel 出现在正确 buffer 行；中文/宽字符长输入光标落在输入区内。
+- 停止：实际渲染/输入用例通过且批准/拒绝仍走同一 Core gate；不靠 CaptureSink 或对内部字符串取子集证明屏幕可见。
+- 落地回执：[A1_U1_U2_APPROVAL_AND_RENDERING_RECEIPT](reviews/2026-09-16-review-d92564bc/A1_U1_U2_APPROVAL_AND_RENDERING_RECEIPT.md)。`PendingApproval` 改 `detail: Vec<String>`＋`truncated`（完整请求，无 220 字符上限）；`approval_scroll`＋`PgUp/PgDn`（`classify_approval_key` 纯函数分离回答键与导航键）；确认绑定屏上 `request_id`（过期确认不批准新请求）；对话摘要截断标 `…` 并指向面板。`conversation_lines` 按 `'\n'` 拆真 `Line`；折行/滚动/光标共用 `display_width` 显示列宽＋横向视窗。8 条新测试经真实 `ui::render`＋`TestBackend` buffer 断言，变异恢复法复验两条关键用例转红后 sha256 还原。agent-tui 75/0、clippy 0、fmt clean。限制：无真实 PTY 端到端；`display_width` 为内联宽字符表，未覆盖全部 Unicode 组合字符；未复核 Core 侧请求上限。
+
+### A2 — 一份事件读模型与按任务 review（U3＋U4，agent-tui＋agent-runtime）
+用户动作：`/status`、`/review` 与现场画面一致；重放/重复投递不改变结论；任务 B 的修改与失败不挂在任务 A 的完成头下。
+- U3：`AppState` 同时维护公共 `StatusProjection` 与本地 `status/busy/current_model_operation/current_task`/局部 Token/对话/`result_card`；`resync_projection` 只重建公共投影；重放水位只跳过 `projection.fold`，同一已覆盖事件仍继续改后面本地字段；对话与部分 live 消息按**正文内容**去重；`StatusProjection` 自身未折叠 `TurnCancelled` 等终态；坏行被跳过、目录被截断仍报完整且把最大 seq 当连续水位。
+- U4：`ResultCard` 的 changes/checks 无各自 TaskId，A 完成后开始 B 不会切换卡片；容量上限满后直接不追加且无独立遗漏计数，`format_result_lines` 用 `len-cap` 算溢出恒不可见；`result-card-latest.json` 由独立 task 写同一路径，无单写者/版本化原子快照。
+- 修复方向：一套共享事件折叠规则，按事件与操作身份（RunId/seq、TurnId/OperationId/generation）去重，实时消费与重放同一规则；输入草稿/滚动位置等纯界面状态另留 ViewState；按任务归属或查询复核材料，显示窗口/总数/遗漏数分离，晚到失败不被容量限制静默掩盖；快照写入单写者或版本化原子提交。不新建任务真相、不从 prose 推断完成。
+- 红例：实时逐条消费得状态 A，另一实例先遗漏一段再重放＋重复投递已覆盖的 **ModelUsed/TurnCompleted/操作切换**事件（不是 `RunStarted`——它只置 bool，去重失效也可能通过）后必须等价；取消无 usage 清理 in-flight；相同文字不同 turn 保留；A 完成 → B 修改并校验失败 → `/review B` 不得出现 A 的完成头；第 33 个 check 的失败不得静默消失；坏 JSON 中间行/日志覆盖不全保持 Partial。
+- 停止：现场画面、`/status`、`/review` 与相同已验证事件视图一致；旧事件不能反向激活操作。
+
+### A3 — 保序控制与可退出的终端（U5＋U6，agent-tui）——**部分关闭**：U5 已关闭（2026-09-16，`296ec005`）；**U6 待做**
+用户动作：终端在任何早退/异常/退出路径后都恢复；用户键入顺序就是命令提交顺序；慢磁盘操作期间仍能取消/退出。
+- U5：`main.rs` 手工 `enable_raw_mode` → `EnterAlternateScreen` → `Terminal::new` → clear，raw 开启后任一 `?` 早退可绕过尾部恢复；正常退出先 `await composed.shutdown()` 才关 raw/退出 alternate/显示光标；手工 `Terminal::new` 不等于安装 panic hook。
+- U6：`/focus`、`/task`、`/done`、`/continue` 各自 detached spawn，Actor 只保证"到达之后"的顺序；`/checkpoint`、`/restore`（含磁盘读）在输入循环内直接 await，占住唯一的输入/绘制循环。
+- 修复方向：小型 TerminalSession guard 跟踪已启用状态＋保留原行为的 panic hook；终端恢复与 Runtime 异步清理分别完成和聚合错误；有界保序命令提交入口＋可观测回执＋任务身份校验（用 Runtime 已有带 `expected_task_id` 的接口）；慢 I/O 离开绘制循环；每帧 drain 有预算。不另建调度器（RuntimeActor 仍是唯一执行权威），不把 TUI 强制改成 IPC 客户端，不宣称能恢复 SIGKILL 后的终端。
+- 红例：raw 开启后注入 alternate/创建终端失败/绘制失败/session 返 Err/Runtime shutdown 慢/panic 各路径终端均恢复；人为延迟 `/task` 发送后再 `/continue` 不得推进旧任务；恢复读取被暂停时仍能处理退出/取消；已取消回执不覆盖新代际；事件洪泛时键盘响应仍有界。
+- 停止：不因前端调度重排用户动作；终端先恢复，Runtime 按既有规则完成取消与清理。
+- **U5 落地回执**：[A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT](reviews/2026-09-16-review-d92564bc/A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT.md)。`TerminalGuard` 经 `TermBackend` 抽象跟踪本进程已启用状态，早退/失败先回滚部分状态再返回错误，`Drop`＋panic hook（链回原 hook）恢复；终端释放排在 `composed.shutdown()` **之前**，两类错误分别聚合。2 条可注入 backend 单测，变异恢复法复验。
+- **U6 待做（本片剩余）**：`session.rs` 仍有 20 处 detached `tokio::spawn`——`/focus`、`/task`、`/done`、`/continue` 不保证按用户键入顺序送达；`/checkpoint`、`/restore` 仍在输入循环内 `await`（慢盘占住绘制循环）；未使用 Runtime 已有的 `expected_task_id` 接口。先补红例：人为延迟 `/task` 发送后再 `/continue` 不得推进旧任务；恢复读取被暂停时仍能处理退出/取消；已取消回执不覆盖新代际；事件洪泛时键盘响应仍有界。
+
+### A4 — headless 正面终态与完整性（U7，agent-tui）——已关闭（2026-09-16，`296ec005`）
+用户动作：headless 只有拿到相关任务/回合的正面终态证据才报成功；事件有缺口时明确报告不完整。
+- U7：`run_headless` 收到 broadcast `Lagged` 只写 warning 继续，缺口不进 `Drain`/`session_end`；丢掉 ApprovalDenied/Failure/结算后若尾随 `TurnCompleted` 仍可能 exit 0；`Closed` 直接 break 而 `Drain::finish` 兜底不要求确认 `turn_completed`（**正常 `RuntimeHandle` 自持 broadcast Sender，此项是防御性接口边界，不是正常 actor 退出必然可达的生产故障**）；timeout/输出失败后才等待 sink 收尾再 shutdown，取消启动过晚；返回的 writer 又被同步 flush 一次，不受该 writer 线程 close bound 约束。
+- 修复方向：成功需要对应任务/回合的正面终态证据；有缺口先从可信水位补齐，补不齐返回明确 incomplete；停止工作与输出收尾分离；修 JSONL 双换行；保持现有出口含义或对新 outcome 做明确版本兼容。不把"不完整"解释成审批拒绝，不给缺测费用补零。
+- 红例：被丢区间含拒绝事件而尾部有 `TurnCompleted` → 不得按完整成功；无终态的独立 `Closed` receiver 不得成功（标注为防御接口用例）；慢 writer 下取消不等待输出 flush；执行状态与最终 JSONL/进程 exit 一致。
+- 停止：事件流、`session_end`、exit 与实际结算/完整性一致；未知不冒充拒绝、失败或零费用。
+- 落地回执：[A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT](reviews/2026-09-16-review-d92564bc/A3_A4_U5_U7_TERMINAL_AND_HEADLESS_RECEIPT.md)。`Lagged` 记 `events_dropped`/`dropped_count`，终态前关闭记 `closed_without_completion`，两者任一命中新守卫臂 → 新 `EXIT_INCOMPLETE = 4` / `status: "incomplete"`（`stop` = `events_dropped`｜`stream_closed`）；尾部 `TurnCompleted` 不再掩盖被丢段；不补零、不把缺口当拒绝；`Closed` 限定为防御接口边界。另修 JSONL 双换行、非终态先取消在途回合再等输出排空、返回 writer 不再超界 re-flush。4 条新测试，变异恢复法复验两条转红后 sha256 还原。限制：`EXIT_INCOMPLETE = 4` 是新增出口码，脚本调用方需知悉；真实 PTY 端到端未执行；U3（TUI 侧事件缺口）不在本片。
+
+### B1 — 多 required 的有界解析计划（B，context-simple）
+用户动作：多个必需正文依次从冷目录加载时，先加载的目标不因随后驱逐又被报成 `Missing`。
+- `resolve_required_cold_refs` 每个 exact ID 调 `hydrate_card_for_outcome`，装完立即 `settle_metadata_residency`，protect 只含刚装的这一个 ID；解析只保存 `Installed/AlreadyOwned`，不持已验证 owner 快照；整批结束才 `plan_required_with_resolution` 按热表查找。热容量 2、required A/B/C、总量在模型预算内时，C 的安装把 A 降回 pending，规划 A 找不到 owner，`Installed` 的兜底 miss 又映射为 `Missing`。
+- 修复方向：解析时直接产生**有界的、版本/范围绑定的 `RequiredPlanSource`**（或明确受预算约束的短期租赁），不依赖整批结束时谁还恰好驻留。临时计划计入资源预算；预算不足用准确的 `BudgetExcluded/UnreadColdPage`，不宣称 `Missing`；不无限 pin、不全历史 hydration。
+- 红例：hot cap=2 ＋ required A/B/C 三个合法可降级冷页 ＋ 模型 budget 足够 → 读取均成功且 A 不因随后驱逐成为 Missing；再覆盖 entity/foreground 干扰与真实预算不足；混合 exact ID 与路径。
+- 停止：材料化与最终装箱要么给出正确正文，要么报告真正的容量/读取原因。这是对 W1 的批量补齐，不是重开"完全没有冷解析"。
+
+### B2 — 捕获完整性证明与取消安全（B2＋B3，context-simple）
+用户动作：同名坏卡片存在时不把唯一可靠元数据换成坏引用；导出过程中取消不丢内存日志。
+- B2：`run_external_spill_io` 的 plan.writes 分支遇到已有路径，`try_exists` 后直接放进 `io.written/io.spilled`，既未比对现有内容与计划 bytes/hash/身份，也未走受检卡片读取；`checkpoint` 随后 `record_card` 并从 inline external 段排除它们 → 同名文件损坏/截断时新 checkpoint 只引用坏卡片，下次 restore 才发现。
+- B3（后续收口）：`export_ledger` 先 `mem::take(state.ledger)` 再 await 写临时文件与 rename；普通 I/O 错误有 merge back，但 future 在 await 中被取消/丢弃时不会运行该错误分支，记录随局部变量消失。
+- 修复方向：首次认领未验证 existing card 时做有界校验（identity/schema/hash 与计划内容一致），或按内容寻址规则安全原子写入；无法证明时本次保留 inline。导出改为成功提交后再确认消费相应记录。不引入新存储层，不做无差别全量重读，ledger 子项可晚于恢复卡片完整性。
+- 红例：无有效 claim 的 fixture 中预置同名坏文件 → capture → 新引擎 restore，原元数据仍可恢复或 capture 明确保留 inline；覆盖 existing directory／hash 不匹配／读取权限故障；在 write/rename 边界暂停并取消导出后记录仍有归属。
+- 停止：证据不因同名文件损坏而失去唯一可靠副本；已有有效不可变 claim 的复用性能不被全量重读破坏。
+
+### C（续）— 实际请求序列的 KV 与成本比较
+不重开 W3 已修的内容块类型任务。沿实际 request 序列核对连续请求首差异、稳定证据范围与工具 schema 变化、失败/取消的已知用量只结算一次；TUI 的 Token 显示取自同一份结算事实（与 A2 的读模型一致），不因重放再算一份不同的账。质量、指令、证据新鲜度、权限撤销不得因缓存倒退。真实端点接受/命中/净成本仍是 T8 条件实验，无预算无凭据保持 NOT_RUN。
 
 ## T1–T7 完成记录（历史）
 
