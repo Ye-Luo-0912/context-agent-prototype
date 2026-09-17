@@ -67,7 +67,8 @@
       "schema": {
         "reference": {"type": "string", "required": true, "note": "artifact:// reference returned by another tool (spilled listings, grep hit sets, process logs)"},
         "start_line": {"type": "integer", "minimum": 1, "default": 1},
-        "end_line": {"type": "integer", "minimum": 1, "default": 200}
+        "end_line": {"type": "integer", "minimum": 1, "note": "absent means one bounded page anchored at start_line (start_line..start_line+199, checked arithmetic) — the continuation footer only suggests start_line, so its suggestion must execute under the parser's own defaults; an explicit end_line keeps the exact range semantics"},
+        "line_byte_offset": {"type": "integer", "minimum": 0, "note": "raw byte offset inside start_line where the rendered window begins; the continuation footer emits it when a line was cut mid-line by the capture cap, so a 3 MiB single-line artifact stays fully readable; must fall on a UTF-8 character boundary"}
       },
       "limits": {
         "max_read_bytes": 2097152,
@@ -75,7 +76,7 @@
         "note": "reference confined to .focus-agent/artifacts; foreign schemes, query/fragment components and traversal refused; the read itself is byte-capped (append-only artifacts cannot grow past the bound between a size probe and the read); non-UTF-8 content shown lossily"
       },
       "output": {
-        "paging": "metadata has_more / next_start_line let the model walk a spilled snapshot one page at a time without guessing filesystem paths"
+        "paging": "metadata has_more / next_start_line / next_line_byte_offset let the model walk a spilled snapshot one page at a time without guessing filesystem paths; the coverage footer carries the same continuation verbatim (survives the output broker's head/tail preview); 'end of artifact' is claimed only when no unshown region remains"
       },
       "effects": ["read:workspace"],
       "context_disposition": "PersistObservation",
@@ -367,7 +368,7 @@
         "max_bytes_per_file": 2097152,
         "model_symbols": 100,
         "max_symbol_name_chars": 256,
-        "note": "pure local lexical scan (no language server, no index, no embeddings/vector storage); per-language declaration rules for rs/py/js/jsx/mjs/cjs/ts/tsx/go/c/h/cpp/hpp/cc/hh/cxx/hxx/java/cs/kt/kts/scala/swift/zig; comments, ignored dirs and inline comments skipped; C-like function detection is a documented heuristic; rows are file:line:col  kind name with snapshot-backed cursor paging"
+        "note": "pure local lexical scan (no language server, no index, no embeddings/vector storage); per-language declaration rules for rs/py/js/jsx/mjs/cjs/ts/tsx/go/c/h/cpp/hpp/cc/hh/cxx/hxx/java/cs/kt/kts/scala/swift/zig; comments, ignored dirs and inline comments skipped; C-like function detection is a documented heuristic; rows are file:line:col  kind name with snapshot-backed cursor paging; a known partial scan (walk cap or result limit) states its scope, stop reason and unsearched candidates in a coverage footer on the model-visible body — no scan continuation exists, the honest next step is narrowing path=/query="
       },
       "effects": ["read:workspace"],
       "context_disposition": "PersistObservation",
