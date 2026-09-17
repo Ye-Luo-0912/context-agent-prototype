@@ -308,6 +308,7 @@ async fn reconcile_cleans_orphan_cards_and_honors_protection() {
         dir.path(),
         &map_checksums,
         &resident_ids,
+        &std::collections::HashSet::new(),
         &protected,
         true,
         true,
@@ -374,6 +375,7 @@ async fn an_incomplete_root_enumeration_defers_card_deletion() {
         dir.path(),
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
         &[],
         false,
         true,
@@ -395,6 +397,7 @@ async fn an_incomplete_root_enumeration_defers_card_deletion() {
     let io_complete = crate::store::run_reconcile_io_protecting(
         dir.path(),
         &std::collections::HashMap::new(),
+        &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
         &[],
         true,

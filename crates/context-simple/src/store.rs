@@ -1593,7 +1593,16 @@ pub(crate) async fn run_reconcile_io(
     map_checksums: &HashMap<ContextItemId, Option<String>>,
     resident_ids: &HashSet<ContextItemId>,
 ) -> ReconcileIo {
-    run_reconcile_io_protecting(dir, map_checksums, resident_ids, &[], true, true).await
+    run_reconcile_io_protecting(
+        dir,
+        map_checksums,
+        resident_ids,
+        &HashSet::new(),
+        &[],
+        true,
+        true,
+    )
+    .await
 }
 
 /// Phase 2 of the reconcile (no lock held): scan the store directory, read
@@ -1613,10 +1622,20 @@ pub(crate) async fn run_reconcile_io(
 /// deletion branches — the stale-duplicate sweep and the orphan-card sweep
 /// — defer with their own reason rows instead of turning a read failure
 /// into a deletion.
+///
+/// G1: `pending_card_ids` is the pending-cold part of the logical owner
+/// snapshot — ids whose `(id, card hash)` row is queued in
+/// `pending_external_cards`. A blob (or card) for one of those ids is
+/// owned: it is kept and never re-adopted, because unread cold metadata
+/// means "details unknown", never "ownerless". Re-adopting it would leave
+/// the id owned twice (hot entry + pending placement) and push the hot
+/// directory past its fixed caps, and a blob-rebuilt entry would silently
+/// replace the version the cold card captured.
 pub(crate) async fn run_reconcile_io_protecting(
     dir: &Path,
     map_checksums: &HashMap<ContextItemId, Option<String>>,
     resident_ids: &HashSet<ContextItemId>,
+    pending_card_ids: &HashSet<ContextItemId>,
     protected: &[ContextItemId],
     roots_complete: bool,
     metadata_complete: bool,
@@ -1763,8 +1782,17 @@ pub(crate) async fn run_reconcile_io_protecting(
             // A `protected` id reverses the first arm: the blob backs a
             // still-retained checkpoint's restore (R03), so it is kept even
             // though the current view made the id resident.
+            //
+            // G1: a pending cold row is checked first — the blob backs the
+            // body the row's card will serve once paged in, so it is kept
+            // (never re-adopted, never deleted) and the id keeps exactly
+            // one owner while its metadata stays unread.
             None => {
-                if !resident_ids.contains(&item_id) {
+                if pending_card_ids.contains(&item_id) {
+                    io.reasons.push(format!(
+                        "kept blob {name}: a pending cold card owns the id (metadata unread, not ownerless)"
+                    ));
+                } else if !resident_ids.contains(&item_id) {
                     io.rebuilt_candidates.push((item, checksum));
                 } else if !roots_complete {
                     // W03: with the root enumeration incomplete, residency
@@ -1855,7 +1883,14 @@ pub(crate) async fn run_reconcile_io_protecting(
                 .await;
                 continue;
             };
-            if map_checksums.contains_key(&card_id) || protected.contains(&card_id) {
+            if map_checksums.contains_key(&card_id)
+                || protected.contains(&card_id)
+                // G1: a pending cold row's card is the row's only locator —
+                // its id is owned, so the sweep keeps it by ownership (the
+                // B2 metadata gates below remain the belt for the branches
+                // that would delete).
+                || pending_card_ids.contains(&card_id)
+            {
                 continue;
             }
             // N01: the card shares the blob sweep's deletion permit — it is
@@ -1940,6 +1975,15 @@ async fn quarantine(
 /// rebuilt blobs re-enter the map as external entries (re-checking that
 /// nothing claimed the id while the lock was down), and the report is
 /// assembled.
+///
+/// G1: the re-check covers *every* live owner location, not only the
+/// external map. The scan's snapshot was taken before the lock-free IO
+/// phase, so by commit time a pending cold row (a demotion from a
+/// concurrent per-id settlement), an admitted resident body, a warm/retry
+/// body or a fresh map entry may have claimed the id. Only a true orphan —
+/// owned nowhere — is adopted; the shared `loaded_owner_count` keeps one
+/// definition of the loaded locations, and the pending locator is checked
+/// alongside it because a queued row is ownership, not absence.
 pub(crate) fn commit_reconcile(
     state: &mut State,
     io: ReconcileIo,
@@ -1948,7 +1992,12 @@ pub(crate) fn commit_reconcile(
 ) -> StoreReconcileReport {
     let mut rebuilt = 0usize;
     for (item, checksum) in io.rebuilt_candidates {
-        if state.external.get(item.id).is_some() {
+        let claimed_elsewhere = crate::engine::loaded_owner_count(state, item.id) > 0
+            || state
+                .pending_external_cards
+                .iter()
+                .any(|(row_id, _)| *row_id == item.id);
+        if claimed_elsewhere {
             continue; // claimed concurrently; the blob keeps its owner
         }
         let context_ref = make_context_ref(&item);
@@ -2891,6 +2940,7 @@ mod tests {
             dir.path(),
             &HashMap::new(),
             &resident,
+            &HashSet::new(),
             &protected,
             true,
             true,
@@ -2936,6 +2986,106 @@ mod tests {
             "stale duplicate reclaimed: {report:?}"
         );
         assert!(!dir.path().join(format!("{id}.json")).exists());
+    }
+
+    /// G1（红-first 由 tests::owner_reconcile 的引擎级反例建立）：pending
+    /// 冷行的 blob 不是孤儿。扫描层：文件被保留（可解释），既不进入
+    /// rebuilt_candidates 也不被删除——未读冷元数据意味着「详情未知」，
+    /// 不是「无主」。
+    #[tokio::test]
+    async fn reconcile_keeps_a_pending_owned_blob_without_readopting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ContextItemId::new();
+        let item = test_item(id, "pending owned content");
+        let bytes = serde_json::to_vec(&item).unwrap();
+        externalize_async(dir.path(), id, &bytes).await.unwrap();
+        let pending: HashSet<_> = [id].into_iter().collect();
+
+        let io = run_reconcile_io_protecting(
+            dir.path(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &pending,
+            &[],
+            true,
+            false,
+        )
+        .await;
+        assert!(
+            io.rebuilt_candidates.is_empty(),
+            "a pending owner is not re-adopted: {:?}",
+            io.rebuilt_candidates
+        );
+        assert_eq!(io.deleted_stale, 0, "an owned blob is not deleted");
+        assert!(
+            dir.path().join(format!("{id}.json")).exists(),
+            "the pending owner's blob survives the scan"
+        );
+        assert!(
+            io.reasons
+                .iter()
+                .any(|reason| reason.contains("pending cold card owns the id")),
+            "the keep is explainable: {:?}",
+            io.reasons
+        );
+
+        // 对照：同一文件在无 pending 行时仍会被认领——保留分支是所有权
+        // 判断，不是把恢复功能关掉。
+        let io = run_reconcile_io_protecting(
+            dir.path(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            true,
+            true,
+        )
+        .await;
+        assert_eq!(io.rebuilt_candidates.len(), 1, "the control adopts it");
+    }
+
+    /// G1：commit 复核覆盖所有 owner 位置。扫描与 commit 之间的无锁窗口
+    /// 里，pending 行或常驻正文都可能认领 id——候选被拒绝且不产生第二
+    /// 个 owner；只有真正的孤儿被接纳。
+    #[test]
+    fn commit_reconcile_rejects_candidates_claimed_by_any_owner_location() {
+        // pending 行持有：候选被拒，行保持其 owner。
+        let mut state = State::default();
+        let pending_id = ContextItemId::new();
+        state
+            .pending_external_cards
+            .push((pending_id, "cardhash".into()));
+        let mut io = ReconcileIo::default();
+        io.rebuilt_candidates
+            .push((test_item(pending_id, "claimed by a row"), "checksum".into()));
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(report.rebuilt, 0, "{report:?}");
+        assert!(state.external.get(pending_id).is_none());
+        assert_eq!(
+            state.pending_external_cards.len(),
+            1,
+            "the pending row keeps its owner"
+        );
+
+        // 常驻正文持有（heap）：扫描快照之后被认领的 id 同样被拒。
+        let mut state = State::default();
+        let resident_id = ContextItemId::new();
+        let resident = test_item(resident_id, "claimed by the heap");
+        state.items.push(resident.clone());
+        let mut io = ReconcileIo::default();
+        io.rebuilt_candidates.push((resident, "checksum".into()));
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(report.rebuilt, 0, "{report:?}");
+        assert!(state.external.get(resident_id).is_none());
+
+        // 真孤儿：任何位置都无 owner，commit 照常接纳。
+        let orphan = test_item(ContextItemId::new(), "true orphan");
+        let orphan_id = orphan.id;
+        let mut io = ReconcileIo::default();
+        io.rebuilt_candidates.push((orphan, "checksum".into()));
+        let report = commit_reconcile(&mut state, io, 1, 1);
+        assert_eq!(report.rebuilt, 1, "a true orphan is adopted: {report:?}");
+        assert!(state.external.get(orphan_id).is_some());
     }
 
     /// One reconcile pass over a store holding every damaged state at once:

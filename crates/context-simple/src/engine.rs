@@ -2536,7 +2536,12 @@ fn plan_external_spill(state: &State, config: &SimpleContextConfig) -> ExternalS
 /// all four locations is O(1) plus small bounded scans rather than
 /// O(total history). The catalog skips a duplicate on rebuild, so it
 /// cannot be the duplicate detector.
-fn loaded_owner_count(state: &State, item_id: ContextItemId) -> usize {
+///
+/// G1: the reconcile commit reuses this as its live-owner check — a blob
+/// may only be adopted when every loaded location reports zero owners (a
+/// pending cold row is checked alongside by the caller, since its claim is
+/// a `(id, card hash)` locator rather than a loaded body).
+pub(crate) fn loaded_owner_count(state: &State, item_id: ContextItemId) -> usize {
     let resident = usize::from(state.items.indexes().get(item_id).is_some());
     let warm = usize::from(state.eviction_buffer.iter().any(|item| item.id == item_id));
     let retry = usize::from(
@@ -3310,8 +3315,16 @@ impl ContextEngine for SimpleContextEngine {
         // the sweep sees `metadata_complete = hydration.complete == false`
         // and defers, while the queued rows stay resumable for the next
         // pass.
+        //
+        // G1: the owner snapshot is *logical*, not loaded-only. A pending
+        // cold row is a live owner whose metadata is simply not in memory
+        // (details unknown is not ownerless): its ids join the snapshot so
+        // the scan cannot mistake a pending-owned blob for an ownerless
+        // orphan and re-adopt it into the hot directory while its pending
+        // placement stays — that shape left one id owned twice and pushed
+        // the hot map past its fixed cap.
         let hydration = self.hydrate_pending_cards_within_budget(&[]).await;
-        let (map_checksums, resident_ids) = {
+        let (map_checksums, resident_ids, pending_card_ids) = {
             let mut state = self.state.lock().await;
             state.event_seq += 1;
             let map_checksums: std::collections::HashMap<_, _> = state
@@ -3330,13 +3343,19 @@ impl ContextEngine for SimpleContextEngine {
                 .chain(state.pending_externalize_retry.iter())
                 .map(|item| item.id)
                 .collect();
-            (map_checksums, resident_ids)
+            let pending_card_ids: std::collections::HashSet<_> = state
+                .pending_external_cards
+                .iter()
+                .map(|(id, _)| *id)
+                .collect();
+            (map_checksums, resident_ids, pending_card_ids)
         };
         let dir = crate::store::store_dir(&self.config);
         let io = crate::store::run_reconcile_io_protecting(
             &dir,
             &map_checksums,
             &resident_ids,
+            &pending_card_ids,
             protected,
             roots_complete,
             hydration.complete,
@@ -3345,9 +3364,27 @@ impl ContextEngine for SimpleContextEngine {
         let mut state = self.state.lock().await;
         let now_tick = state.event_seq;
         let gc_epoch = state.gc_epoch;
-        Ok(crate::store::commit_reconcile(
-            &mut state, io, now_tick, gc_epoch,
-        ))
+        let mut report = crate::store::commit_reconcile(&mut state, io, now_tick, gc_epoch);
+        // G1: an orphan rebuild is an install into the hot directory, so it
+        // runs the same post-install settlement every other install site runs
+        // (S3: `settle_metadata_residency` is the single entry). A recovered
+        // orphan may not silently grow the hot map past the caps: the oldest
+        // carded entries demote back to the pending directory (their blobs
+        // and card claims survive), and a residual that demotion cannot
+        // repair surfaces as a typed reason row instead of passing silently.
+        if report.rebuilt > 0 {
+            let pressure = settle_metadata_residency(&mut state, &self.config, &[]);
+            if !pressure.within_budget() {
+                report.reasons.push(format!(
+                    "hot metadata over budget after orphan adoption: {} entries / {} bytes over (backpressure)",
+                    pressure.over_entries, pressure.over_bytes
+                ));
+                report.reasons_truncated = report
+                    .reasons_truncated
+                    .saturating_add(truncate_report_rows(&mut report.reasons, MAX_REPORT_ROWS));
+            }
+        }
+        Ok(report)
     }
 
     /// Item ids a stored context checkpoint references as external blobs.

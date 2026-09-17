@@ -16,6 +16,7 @@ mod gc_bounds;
 mod gc_many_roots;
 mod harness;
 mod lifecycle;
+mod owner_reconcile;
 mod pending_owner;
 mod required;
 mod residency;
