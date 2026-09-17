@@ -38,9 +38,7 @@ const CAPTURE_CAP: usize = MAX_READ_BYTES - MAX_READ_LINES * RENDER_PREFIX_CHARS
 /// are `0b10xxxxxx`). `str::is_char_boundary` is not available on `&[u8]`,
 /// and the F2 cursor works in raw artifact bytes.
 fn is_char_boundary(bytes: &[u8], index: usize) -> bool {
-    index == 0
-        || index == bytes.len()
-        || (bytes[index] & 0xC0) != 0x80
+    index == 0 || index == bytes.len() || (bytes[index] & 0xC0) != 0x80
 }
 /// Per-call scan budget (W06). Producers cap captured logs at 8 MiB, so
 /// every legally produced artifact is fully reachable; the scan streams —
@@ -794,7 +792,10 @@ mod tests {
                 output.summary
             );
             pages += 1;
-            assert!(pages < 8, "520 lines at 200 per page must end within a few pages");
+            assert!(
+                pages < 8,
+                "520 lines at 200 per page must end within a few pages"
+            );
             if output.model_content.contains("sentinel-line-500") {
                 seen_sentinel = true;
             }
@@ -858,7 +859,11 @@ mod tests {
         // A bare start_line gets a bounded page (start_line..start_line+199),
         // not the stale global default of 200.
         let paged = read(serde_json::json!({"reference": reference, "start_line": 2})).await;
-        assert!(paged.model_content.contains(&format!("{:>6} | filler-line-2", 2)));
+        assert!(
+            paged
+                .model_content
+                .contains(&format!("{:>6} | filler-line-2", 2))
+        );
         assert!(
             paged
                 .model_content
@@ -872,7 +877,11 @@ mod tests {
         let past_end = read(serde_json::json!({"reference": reference, "start_line": 1000})).await;
         assert!(past_end.ok);
         assert!(past_end.model_content.contains("no lines in range"));
-        assert!(past_end.model_content.contains("end of artifact (520 lines)"));
+        assert!(
+            past_end
+                .model_content
+                .contains("end of artifact (520 lines)")
+        );
         assert_eq!(past_end.metadata["has_more"], false);
 
         // An extreme start_line is checked arithmetic: rejected cleanly, no
@@ -886,7 +895,10 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
-        assert!(overflow.is_err(), "an unrepresentable window must be refused");
+        assert!(
+            overflow.is_err(),
+            "an unrepresentable window must be refused"
+        );
 
         // A single-line file with pure defaults stays a plain complete read.
         let single = read(serde_json::json!({"reference": single_reference})).await;
@@ -898,8 +910,10 @@ mod tests {
         );
 
         // Repeating the same read does not double-count the lines.
-        let first = read(serde_json::json!({"reference": reference, "start_line": 5, "end_line": 9})).await;
-        let second = read(serde_json::json!({"reference": reference, "start_line": 5, "end_line": 9})).await;
+        let first =
+            read(serde_json::json!({"reference": reference, "start_line": 5, "end_line": 9})).await;
+        let second =
+            read(serde_json::json!({"reference": reference, "start_line": 5, "end_line": 9})).await;
         assert_eq!(first.metadata["total_lines"], 520);
         assert_eq!(second.metadata["total_lines"], 520);
     }
@@ -1258,10 +1272,16 @@ mod tests {
                 .get("line_byte_offset")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
-            assert!((start, offset) > previous, "the raw byte cursor must advance");
+            assert!(
+                (start, offset) > previous,
+                "the raw byte cursor must advance"
+            );
             previous = (start, offset);
         }
-        assert!(seen_sentinel, "the multibyte sentinel must survive resumption");
+        assert!(
+            seen_sentinel,
+            "the multibyte sentinel must survive resumption"
+        );
     }
 
     /// F2：字节上限边界。内容字节恰好等于捕获预算：只有行终止符被切，没有
@@ -1368,7 +1388,10 @@ mod tests {
                 .get("line_byte_offset")
                 .and_then(Value::as_u64)
                 .unwrap_or(0) as usize;
-            assert!((start, offset) > previous, "the raw byte cursor must advance");
+            assert!(
+                (start, offset) > previous,
+                "the raw byte cursor must advance"
+            );
             previous = (start, offset);
         }
     }
