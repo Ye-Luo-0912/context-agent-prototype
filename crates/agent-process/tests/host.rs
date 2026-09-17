@@ -10,6 +10,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_contracts::CancellationToken;
@@ -248,6 +249,277 @@ async fn cancel_before_write_leaves_the_connection_usable() {
     cancel.cancel();
     let error = host
         .call_with_cancel(json!({ "op": "ping" }), &cancel)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, agent_contracts::AgentError::Cancelled));
+    assert_eq!(host.status().health, ConnectionHealth::Ready);
+    let value = host.call(json!({ "op": "ping" })).await.unwrap();
+    assert_eq!(value, json!("pong"));
+    host.shutdown().await;
+}
+
+/// The blocked-write tests each hold a real wedged child for their whole
+/// body; serializing them keeps the suite's self-inflicted process load
+/// flat so the tight pre-existing cancel-budget assertions that share the
+/// machine stay reliable.
+static BLOCKED_WRITE_SLOT: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Wait until the mock child confirms it consumed `expected` bytes of the
+/// frame the host is writing — parent-side proof that the write had
+/// actually started before the test fires the cancel token.
+async fn wait_for_partial_write_evidence(path: &std::path::Path, expected: usize) {
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(consumed) = text.trim().parse::<usize>()
+            && consumed >= expected
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the child never confirmed consuming {expected} bytes of the frame");
+}
+
+#[tokio::test]
+async fn cancel_stops_a_blocked_request_write_within_the_cancel_budget() {
+    let _slot = BLOCKED_WRITE_SLOT.lock().await;
+    // The child answers the handshake and then stops reading stdin. The
+    // request (256 KiB, inside the frame contract but far above any OS pipe
+    // buffer) wedges the host's `write_all` on pipe backpressure — the mock
+    // confirms it consumed the first 64 KiB, so the write had really
+    // started. The cancel token must stop the call in a cancel-sized
+    // budget, not at the 30s request deadline; the half-written frame
+    // poisons the connection and the child is terminated.
+    let dir = tempfile::tempdir().unwrap();
+    let snapshot = dir.path().join("read.snapshot");
+    let heartbeat = dir.path().join("alive.ticks");
+    let host = Arc::new(
+        spawn_mock(|config| {
+            config.request_timeout = Duration::from_secs(30);
+            config.max_frame_bytes = 1024 * 1024;
+            config.max_call_bytes = 4 * 1024 * 1024;
+            config.env.push((
+                "MOCK_HEARTBEAT".into(),
+                heartbeat.to_string_lossy().into_owned(),
+            ));
+            config
+                .env
+                .push(("MOCK_STOP_READING_AFTER_BYTES".into(), "65536".into()));
+            config.env.push((
+                "MOCK_READ_SNAPSHOT".into(),
+                snapshot.to_string_lossy().into_owned(),
+            ));
+        })
+        .await,
+    );
+
+    let cancel = CancellationToken::new();
+    let fire = cancel.clone();
+    let call_host = Arc::clone(&host);
+    let call_task = tokio::spawn(async move {
+        call_host
+            .call_with_cancel(
+                json!({ "op": "ping", "payload": "x".repeat(256 * 1024) }),
+                &cancel,
+            )
+            .await
+    });
+
+    wait_for_partial_write_evidence(&snapshot, 65536).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !call_task.is_finished(),
+        "the frame write must still be wedged: the child stopped reading at 64 KiB of a 256 KiB frame"
+    );
+
+    fire.cancel();
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(10), call_task)
+        .await
+        .expect("the call must end after cancel, not at the request deadline")
+        .unwrap()
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(error, agent_contracts::AgentError::Cancelled),
+        "a cancelled half-written request must surface as Cancelled, got: {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cancel must stop a wedged write inside the cancel budget, took {elapsed:?}"
+    );
+    assert_eq!(
+        host.status().health,
+        ConnectionHealth::Quarantined,
+        "a connection with a half-written frame must not be reusable"
+    );
+    let second = host.call(json!({ "op": "ping" })).await.unwrap_err();
+    assert!(
+        second.to_string().contains("poisoned"),
+        "the half-frame connection must be fenced off: {second}"
+    );
+    // The child tree was terminated: its heartbeat stops ticking.
+    let before = std::fs::read(&heartbeat).unwrap_or_default();
+    assert!(
+        !before.is_empty(),
+        "the child must have been alive to cancel"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after = std::fs::read(&heartbeat).unwrap_or_default();
+    assert_eq!(
+        before, after,
+        "the child must be terminated after the cancel"
+    );
+}
+
+#[tokio::test]
+async fn cancel_stops_a_blocked_broker_answer_write_within_the_cancel_budget() {
+    let _slot = BLOCKED_WRITE_SLOT.lock().await;
+    // Same wedge, one stage later: the child emits a mid-invoke system
+    // request and stops reading; the broker's 256 KiB answer wedges the
+    // host's answer write. Cancel must still stop the call promptly.
+    struct BigBroker;
+    #[async_trait::async_trait]
+    impl agent_process::SystemBroker for BigBroker {
+        async fn handle(
+            &self,
+            _request: serde_json::Value,
+        ) -> agent_contracts::AgentResult<serde_json::Value> {
+            Ok(json!({ "content_b64": "x".repeat(256 * 1024) }))
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let snapshot = dir.path().join("read.snapshot");
+    let host = Arc::new(
+        spawn_mock(|config| {
+            config.request_timeout = Duration::from_secs(30);
+            config.max_frame_bytes = 1024 * 1024;
+            config.max_call_bytes = 4 * 1024 * 1024;
+            config.max_system_answer_bytes = 1024 * 1024;
+            config
+                .env
+                .push(("MOCK_STOP_READING_AFTER_BYTES".into(), "65536".into()));
+            config
+                .env
+                .push(("MOCK_EMIT_SYSTEM_FRAME".into(), "1".into()));
+            config.env.push((
+                "MOCK_READ_SNAPSHOT".into(),
+                snapshot.to_string_lossy().into_owned(),
+            ));
+        })
+        .await,
+    );
+
+    let cancel = CancellationToken::new();
+    let fire = cancel.clone();
+    let call_host = Arc::clone(&host);
+    let call_task = tokio::spawn(async move {
+        call_host
+            .call_with_cancel_and_broker(json!({ "op": "ping" }), &cancel, &BigBroker)
+            .await
+    });
+
+    wait_for_partial_write_evidence(&snapshot, 65536).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !call_task.is_finished(),
+        "the broker answer write must still be wedged"
+    );
+
+    fire.cancel();
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(10), call_task)
+        .await
+        .expect("the call must end after cancel, not at the request deadline")
+        .unwrap()
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(error, agent_contracts::AgentError::Cancelled),
+        "a cancelled half-written broker answer must surface as Cancelled, got: {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cancel must stop a wedged broker answer inside the cancel budget, took {elapsed:?}"
+    );
+    assert_eq!(host.status().health, ConnectionHealth::Quarantined);
+    let second = host.call(json!({ "op": "ping" })).await.unwrap_err();
+    assert!(
+        second.to_string().contains("poisoned"),
+        "the half-frame connection must be fenced off: {second}"
+    );
+}
+
+#[tokio::test]
+async fn request_deadline_stops_a_blocked_write_and_poisons() {
+    let _slot = BLOCKED_WRITE_SLOT.lock().await;
+    // Without a cancel token the request deadline is the bound: a write
+    // wedged on pipe backpressure must end at the deadline with the
+    // connection poisoned (the child consumed only the first 64 KiB of the
+    // 256 KiB frame, so the frame was half-written).
+    let dir = tempfile::tempdir().unwrap();
+    let snapshot = dir.path().join("read.snapshot");
+    let host = spawn_mock(|config| {
+        config.request_timeout = Duration::from_secs(2);
+        config.max_frame_bytes = 1024 * 1024;
+        config.max_call_bytes = 4 * 1024 * 1024;
+        config
+            .env
+            .push(("MOCK_STOP_READING_AFTER_BYTES".into(), "65536".into()));
+        config.env.push((
+            "MOCK_READ_SNAPSHOT".into(),
+            snapshot.to_string_lossy().into_owned(),
+        ));
+    })
+    .await;
+
+    let call = host.call(json!({ "op": "ping", "payload": "x".repeat(256 * 1024) }));
+    let started = std::time::Instant::now();
+    // Drive the call while waiting for the partial-write evidence.
+    let error = tokio::select! {
+        result = call => result.unwrap_err(),
+        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+            panic!("the wedged write must end at the request deadline");
+        }
+    };
+    wait_for_partial_write_evidence(&snapshot, 65536).await;
+    let elapsed = started.elapsed();
+    assert!(
+        error.to_string().contains("timed out"),
+        "a deadline-stopped wedged write must report the timeout, got: {error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the deadline must bound the wedged write, took {elapsed:?}"
+    );
+    assert_eq!(host.status().health, ConnectionHealth::Quarantined);
+    let second = host.call(json!({ "op": "ping" })).await.unwrap_err();
+    assert!(second.to_string().contains("poisoned"));
+}
+
+#[tokio::test]
+async fn cancel_before_any_write_keeps_the_brokered_connection_usable() {
+    // Cancel fired before the exchange wrote anything: the call ends as
+    // Cancelled with no bytes on the pipe, so the same connection must
+    // still complete a normal exchange afterwards.
+    struct UnusedBroker;
+    #[async_trait::async_trait]
+    impl agent_process::SystemBroker for UnusedBroker {
+        async fn handle(
+            &self,
+            _request: serde_json::Value,
+        ) -> agent_contracts::AgentResult<serde_json::Value> {
+            panic!("no system request may be brokered after a pre-write cancel");
+        }
+    }
+
+    let host = spawn_mock(|_| {}).await;
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let error = host
+        .call_with_cancel_and_broker(json!({ "op": "ping" }), &cancel, &UnusedBroker)
         .await
         .unwrap_err();
     assert!(matches!(error, agent_contracts::AgentError::Cancelled));

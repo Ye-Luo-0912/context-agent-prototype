@@ -52,5 +52,5 @@ pub use lifecycle::{
     inspect_process, kill_matching_process_tree, process_identity_matches, process_is_running,
     terminate_matching_process_tree,
 };
-pub use session::{DuplexTransport, FramedProtocolSession, StdioDuplexTransport};
+pub use session::{BoundedSendError, DuplexTransport, FramedProtocolSession, StdioDuplexTransport};
 pub use supervisor::ProcessSupervisor;
