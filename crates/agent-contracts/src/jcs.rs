@@ -155,24 +155,21 @@ fn scientific_from_ryu(mantissa: &str, exponent: &str) -> String {
     let exponent: i32 = exponent.parse().unwrap_or(0);
     let digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
     let k = digits.len() as i32;
-    // `point` = 小数点在最短数字串中的位置（V8 DoubleToCString）。
+    // `point` = 小数点在最短数字串中的位置，即 ECMA-262
+    // `Number::toString` 的 n。四个分支与该算法（RFC 8785 §3.2.2.3 引用）
+    // 一一对应，开闭边界不可调换：plain 形式要求 k ≤ n ≤ 21 与 0 < n < k，
+    // 前导零形式要求 -6 < n ≤ 0（n = -6 的 1e-7 一带必须保持指数形式）。
     let point = exponent + 1;
-    if (0..=21).contains(&point) && point >= k {
+    if (k..=21).contains(&point) {
+        // k ≤ n ≤ 21：数字后补零。
         let mut out = digits;
         for _ in 0..(point - k) {
             out.push('0');
         }
         return out;
     }
-    if (-6..0).contains(&point) {
-        let mut out = String::from("0.");
-        for _ in 0..(-point) {
-            out.push('0');
-        }
-        out.push_str(&digits);
-        return trim_trailing_zeros(out);
-    }
-    if (0..=21).contains(&point) && point < k {
+    if (1..=21).contains(&point) {
+        // 0 < n < k：小数点落在数字串内。
         let split = point as usize;
         let mut out = String::new();
         out.push_str(&digits[..split]);
@@ -180,6 +177,16 @@ fn scientific_from_ryu(mantissa: &str, exponent: &str) -> String {
         out.push_str(&digits[split..]);
         return trim_trailing_zeros(out);
     }
+    if (-5..=0).contains(&point) {
+        // -6 < n ≤ 0：前缀 0. 补零。
+        let mut out = String::from("0.");
+        for _ in 0..(-point) {
+            out.push('0');
+        }
+        out.push_str(&digits);
+        return trim_trailing_zeros(out);
+    }
+    // 其余（n ≤ -6 或 n > 21）：指数形式，exp = n - 1。
     let exp = point - 1;
     let mut out = String::new();
     out.push(digits.as_bytes()[0] as char);
@@ -264,6 +271,98 @@ mod tests {
         for (bits, expected) in cases {
             let value = Value::Number(Number::from_f64(f64::from_bits(bits)).unwrap());
             assert_eq!(serialize(&value).unwrap(), expected, "bits {bits:016x}");
+        }
+    }
+
+    /// Full RFC 8785 Appendix B vector set, expected values cross-checked
+    /// against ECMAScript `Number::toString` (Node v24, this machine).
+    #[test]
+    fn rfc8785_appendix_b_vectors() {
+        let cases = [
+            (0x0000_0000_0000_0000, "0"),
+            (0x8000_0000_0000_0000, "0"),
+            (0x0000_0000_0000_0001, "5e-324"),
+            (0x8000_0000_0000_0001, "-5e-324"),
+            (0x0000_0000_0000_0002, "1e-323"),
+            (0x8000_0000_0000_0002, "-1e-323"),
+            (0x0000_0000_0000_000f, "7.4e-323"),
+            (0x8000_0000_0000_000f, "-7.4e-323"),
+            (0x0000_0000_0000_0010, "8e-323"),
+            (0x3ff0_0000_0000_0000, "1"),
+            (0x3ff0_0000_0000_0001, "1.0000000000000002"),
+            (0x3ff0_0000_0000_0002, "1.0000000000000004"),
+            (0x4000_0000_0000_0000, "2"),
+            (0x4008_0000_0000_0000, "3"),
+            (0x400c_0000_0000_0000, "3.5"),
+            (0x4010_0000_0000_0000, "4"),
+            (0x4014_0000_0000_0000, "5"),
+            (0x4020_0000_0000_0000, "8"),
+            (0x4024_0000_0000_0000, "10"),
+            (0x4059_0000_0000_0000, "100"),
+            (0x40ac_2000_0000_0000, "3600"),
+            (0x4462_0000_0000_0000, "2.6563311466141754e+21"),
+            (0x7fef_ffff_ffff_ffff, "1.7976931348623157e+308"),
+            (0xffef_ffff_ffff_ffff, "-1.7976931348623157e+308"),
+            (0x0ffe_ffff_ffff_ffff, "1.2479725741094444e-231"),
+            (0x4340_0000_0000_0000, "9007199254740992"),
+            (0xc340_0000_0000_0000, "-9007199254740992"),
+            (0x44b5_2d02_c7e1_4af6, "1e+23"),
+            (0x44b5_2d02_c7e1_4af7, "1.0000000000000001e+23"),
+            (0x444b_1ae4_d6e2_ef50, "1e+21"),
+            (0x3eb0_c6f7_a0b5_ed8d, "0.000001"),
+            (0x41b3_de43_5555_5553, "333333333.3333332"),
+        ];
+        for (bits, expected) in cases {
+            let value = Value::Number(Number::from_f64(f64::from_bits(bits)).unwrap());
+            assert_eq!(serialize(&value).unwrap(), expected, "bits {bits:016x}");
+        }
+    }
+
+    /// RFC 8785 §3.2.2.3 (ECMA-262 `Number::toString`): the zero-prefixed
+    /// plain-decimal form requires -6 < n ≤ 0, where n is the decimal point
+    /// position in the shortest digit string. n = -6 — the 1e-7 band — must
+    /// keep the exponential form. The old `(-6..0)` window accepted n = -6,
+    /// so `1e-7` was rewritten to `0.0000001` and its ArgumentDigest hashed
+    /// bytes no other JCS implementation produces. Expected values are Node
+    /// `JSON.stringify` output (this machine, v24).
+    #[test]
+    fn sub_unit_numbers_stay_scientific_across_the_1e6_threshold() {
+        let cases = [
+            (1e-7, "1e-7"),
+            (1.2e-7, "1.2e-7"),
+            (-1e-7, "-1e-7"),
+            (-1.2e-7, "-1.2e-7"),
+            (1.5e-7, "1.5e-7"),
+            (9.9e-7, "9.9e-7"),
+            (1e-8, "1e-8"),
+            (1e-20, "1e-20"),
+            // Legal controls: inside the plain-decimal band.
+            (1e-6, "0.000001"),
+            (1.5e-6, "0.0000015"),
+            (1e-5, "0.00001"),
+            (0.5, "0.5"),
+        ];
+        for (value, expected) in cases {
+            let number = Value::Number(Number::from_f64(value).unwrap());
+            assert_eq!(serialize(&number).unwrap(), expected, "value {value:?}");
+        }
+    }
+
+    /// The upper boundary must stay on the spec side too: plain digits only
+    /// while n ≤ 21, exponential from n = 22 (1e21 and above).
+    #[test]
+    fn exponential_threshold_at_1e21_stays_on_the_spec_side() {
+        let cases = [
+            (1e20, "100000000000000000000"),
+            (9e20, "900000000000000000000"),
+            (9.999e20, "999900000000000000000"),
+            (1e21, "1e+21"),
+            (1.5e21, "1.5e+21"),
+            (1e22, "1e+22"),
+        ];
+        for (value, expected) in cases {
+            let number = Value::Number(Number::from_f64(value).unwrap());
+            assert_eq!(serialize(&number).unwrap(), expected, "value {value:?}");
         }
     }
 }

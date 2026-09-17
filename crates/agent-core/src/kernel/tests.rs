@@ -2133,6 +2133,118 @@ async fn schema_valid_arguments_reach_approval_and_dispatch() {
     assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// A boolean tool argument whose schema narrows to `enum: [false]`.
+fn boolean_enum_surface() -> ToolSurfaceSnapshot {
+    let profile = agent_contracts::SchemaProfile::compile(&serde_json::json!({
+        "type": "object",
+        "properties": {"flag": {"type": "boolean", "enum": [false]}},
+        "required": ["flag"],
+    }))
+    .unwrap();
+    ToolSurfaceSnapshot {
+        specs: vec![ToolSpec {
+            name: "typed.tool".into(),
+            description: "typed surface fixture".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }],
+        schema_profiles: std::collections::BTreeMap::from([("typed.tool".to_string(), profile)]),
+        ..ToolSurfaceSnapshot::default()
+    }
+}
+
+/// A boolean `enum` must survive schema compilation into the Core gate:
+/// `flag: true` against `enum:[false]` is a typed no-dispatch refusal — the
+/// approval gate is never consulted, dispatch never runs, no lease or effect
+/// row attaches. The profile used to drop the allowed set when building the
+/// boolean node, letting `true` pass a gate that only `false` satisfies.
+#[tokio::test]
+async fn boolean_enum_mismatch_refuses_before_approval_or_dispatch() {
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let kernel = Arc::new(CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        Arc::new(PanicDispatcher),
+        Arc::new(CountingApproval(approvals.clone())),
+        None,
+        None,
+    ));
+    let surface = boolean_enum_surface();
+    let mut tool_call = call("typed.tool");
+    tool_call.arguments = serde_json::json!({"flag": true});
+    let generation = kernel.current_authority_epoch();
+    let execution = kernel
+        .execute_tool(
+            operation_identity(&kernel, &tool_call, generation),
+            tool_call,
+            CancellationToken::new(),
+            &surface,
+            generation,
+        )
+        .await;
+    let ToolOutcome::Value(output) = execution.outcome else {
+        panic!("schema refusal is a plain value outcome")
+    };
+    assert!(!output.ok, "{}", output.model_content);
+    assert_eq!(output.metadata["schema"]["pointer"], "/flag");
+    assert!(
+        output.metadata["schema"]["expected"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("one of [")),
+        "{}",
+        output.metadata
+    );
+    assert!(execution.lease.is_none());
+    assert!(execution.effect_id.is_none());
+    assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// The legal control: `flag: false` satisfies `enum:[false]` and reaches
+/// approval plus dispatch exactly as before.
+#[tokio::test]
+async fn boolean_enum_valid_argument_reaches_approval_and_dispatch() {
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dispatcher = Arc::new(EchoDispatcher {
+        output: ToolOutput {
+            call_id: "call-ok".into(),
+            tool_name: "typed.tool".into(),
+            ok: true,
+            summary: "ok".into(),
+            model_content: "ok".into(),
+            artifact_ref: None,
+            metadata: serde_json::Value::Null,
+        },
+    });
+    let kernel = Arc::new(CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        dispatcher,
+        Arc::new(CountingApproval(approvals.clone())),
+        None,
+        None,
+    ));
+    let surface = boolean_enum_surface();
+    let mut tool_call = call("typed.tool");
+    tool_call.arguments = serde_json::json!({"flag": false});
+    let generation = kernel.current_authority_epoch();
+    let execution = kernel
+        .execute_tool(
+            operation_identity(&kernel, &tool_call, generation),
+            tool_call,
+            CancellationToken::new(),
+            &surface,
+            generation,
+        )
+        .await;
+    let ToolOutcome::Value(output) = execution.outcome else {
+        panic!("a valid call executes to a plain value")
+    };
+    assert!(output.ok, "{}", output.model_content);
+    assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
 /// A plain `integer` profile like any production tool surface.
 fn integer_surface() -> ToolSurfaceSnapshot {
     let profile = agent_contracts::SchemaProfile::compile(&serde_json::json!({
