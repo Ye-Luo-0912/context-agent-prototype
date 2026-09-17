@@ -67,6 +67,9 @@ use agent_workspace::Workspace;
 use provider_openai::{
     DEFAULT_MAX_STREAM_BYTES, OpenAiConfig, OpenAiPromptCacheMode, OpenAiProtocol, OpenAiProvider,
 };
+// Eleventh batch (C 线): the production retry wrapper, for the failure/retry
+// and maintenance-lane tests below.
+use provider_openai::RetryingTransport;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1898,4 +1901,1214 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
             page_diagnostics.join(" "),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Eleventh batch (C 线): three settlement classes the trajectory above cannot
+// see because it is deliberately all-Unknown and all-main — (a) NON-ZERO
+// cache buckets, (b) a billed failed attempt plus its successful retry, and
+// (c) a REAL maintenance-lane model call. The existing trajectory and every
+// helper above stay untouched; this section only ADDS.
+//
+// Honesty boundary (applies to ALL three tests below): every cache and
+// attempt counter is LOCAL SYNTHETIC — the scripted 127.0.0.1 capture server
+// reports usage numbers this test invented, so the assertions prove
+// TRANSPORT + PARSING + SETTLEMENT bookkeeping only. They say NOTHING about
+// real provider cache hit rates, real cache writes or real price savings.
+// ENDPOINT_ACCEPTED / SERVER_HIT / NET_TASK_COST remain NOT_RUN here (T8).
+// ---------------------------------------------------------------------------
+
+/// A scripted decision for the lane server below. Separate from `Script` on
+/// purpose: the shared enum's shape is pinned by the tenth-batch trajectory,
+/// and these variants must not disturb it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaneScript {
+    /// A plain text completion whose usage may carry LOCAL SYNTHETIC
+    /// provider cache counters. `None` = the provider "did not report" that
+    /// counter (the SSE body simply omits it).
+    Text {
+        delta: &'static str,
+        input_tokens: u64,
+        output_tokens: u64,
+        cached: Option<u64>,
+        cache_write: Option<u64>,
+        miss: Option<u64>,
+    },
+    /// A billed RETRYABLE transport failure (`response.failed` with the
+    /// non-retry-listed code `server_error`, which the Responses transport
+    /// classifies retryable). NO text delta is emitted before the failure:
+    /// the live sink's replay barrier is exactly a TextDelta, so a
+    /// barrier-free failure is the one a production retry can recover.
+    RetryableFail {
+        input_tokens: u64,
+        output_tokens: u64,
+        cached: Option<u64>,
+        miss: Option<u64>,
+    },
+}
+
+impl LaneScript {
+    fn input_tokens(&self) -> u64 {
+        match self {
+            LaneScript::Text { input_tokens, .. }
+            | LaneScript::RetryableFail { input_tokens, .. } => *input_tokens,
+        }
+    }
+
+    fn output_tokens(&self) -> u64 {
+        match self {
+            LaneScript::Text { output_tokens, .. }
+            | LaneScript::RetryableFail { output_tokens, .. } => *output_tokens,
+        }
+    }
+}
+
+/// The Responses usage JSON with the LOCAL SYNTHETIC counters placed exactly
+/// where the transport reads them: `input_tokens_details.cached_tokens`,
+/// `input_tokens_details.cache_write_tokens`, and DeepSeek-style top-level
+/// `prompt_cache_miss_tokens`. An unreported counter is OMITTED from the
+/// body — the wire never carries an invented zero.
+fn synthetic_usage_json(
+    input: u64,
+    output: u64,
+    cached: Option<u64>,
+    cache_write: Option<u64>,
+    miss: Option<u64>,
+) -> Value {
+    let mut usage = json!({"input_tokens": input, "output_tokens": output});
+    if cached.is_some() || cache_write.is_some() {
+        let mut details = json!({});
+        if let Some(value) = cached {
+            details["cached_tokens"] = json!(value);
+        }
+        if let Some(value) = cache_write {
+            details["cache_write_tokens"] = json!(value);
+        }
+        usage["input_tokens_details"] = details;
+    }
+    if let Some(value) = miss {
+        usage["prompt_cache_miss_tokens"] = json!(value);
+    }
+    usage
+}
+
+/// One maintenance-lane settlement the server produced, in order: the LOCAL
+/// SYNTHETIC (input, output, cached, write, miss) it reported for that
+/// compactor call. Ground truth for the `ContextCompacted` rows.
+type MaintenanceServed = (u64, u64, Option<u64>, Option<u64>, Option<u64>);
+
+struct LaneServerState {
+    bodies: Mutex<Vec<String>>,
+    /// Main-lane decisions, popped in order.
+    main_scripts: Mutex<VecDeque<LaneScript>>,
+    /// Every main-lane decision actually served, in order.
+    served_main: Mutex<Vec<LaneScript>>,
+    /// Requests whose `prompt_cache_key` equals this value are answered as
+    /// MAINTENANCE-lane compactor calls instead of consuming a main script.
+    /// `None` (tests a/b) keeps every round on the main lane.
+    maintenance_key: Mutex<Option<String>>,
+    /// Maintenance calls served so far, in order.
+    served_maintenance: Mutex<Vec<MaintenanceServed>>,
+    unexpected_rounds: AtomicUsize,
+}
+
+/// The per-call LOCAL SYNTHETIC usage of one maintenance-lane compactor
+/// call. The n-th maintenance call of a test reports input `4300 + n`
+/// (unique per call, so each settlement is attributable), output 91,
+/// cached `400 + n`, an explicit write counter of 60, and a miss of 3900 —
+/// with `cached + miss == input` so the reported split re-adds to the total.
+fn maintenance_call_usage(n: u64) -> MaintenanceServed {
+    (4300 + n, 91, Some(400 + n), Some(60), Some(3900))
+}
+
+fn lane_sse_frame(event: &str, payload: &Value) -> String {
+    format!("event: {event}\r\ndata: {payload}\r\n\r\n")
+}
+
+/// The SSE body for one scripted decision — the same event shapes the
+/// tenth-batch server emits, plus the two eleventh-batch additions
+/// (synthetic cache counters on `response.completed`, and a delta-free
+/// retryable `response.failed`).
+fn lane_sse_body(script: &LaneScript) -> String {
+    match script {
+        LaneScript::Text {
+            delta,
+            cached,
+            cache_write,
+            miss,
+            ..
+        } => {
+            let delta = json!({
+                "type": "response.output_text.delta",
+                "output_index": 0,
+                "delta": delta
+            });
+            let usage = synthetic_usage_json(
+                script.input_tokens(),
+                script.output_tokens(),
+                *cached,
+                *cache_write,
+                *miss,
+            );
+            let completed = json!({
+                "type": "response.completed",
+                "response": {"usage": usage}
+            });
+            lane_sse_frame("response.output_text.delta", &delta)
+                + &lane_sse_frame("response.completed", &completed)
+        }
+        LaneScript::RetryableFail { cached, miss, .. } => {
+            let usage = synthetic_usage_json(
+                script.input_tokens(),
+                script.output_tokens(),
+                *cached,
+                None,
+                *miss,
+            );
+            let failed = json!({
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "server_error",
+                        "message": "scripted retryable transport failure",
+                    },
+                    "usage": usage,
+                }
+            });
+            // NO delta event before the failure (see the variant's doc).
+            lane_sse_frame("response.failed", &failed)
+        }
+    }
+}
+
+async fn spawn_lane_server(state: Arc<LaneServerState>) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let body = match read_request_body(&mut socket).await {
+                    Some(body) => body,
+                    None => return,
+                };
+                let wire: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                state.bodies.lock().unwrap().push(body);
+                let on_maintenance_lane = {
+                    let expected = state.maintenance_key.lock().unwrap();
+                    let actual = wire["prompt_cache_key"].as_str();
+                    matches!(
+                        (&*expected, actual),
+                        (Some(expected_key), Some(actual_key)) if expected_key == actual_key
+                    )
+                };
+                let sse_body = if on_maintenance_lane {
+                    // The MAINTENANCE lane: a compactor call. It always gets
+                    // a plain non-empty summary text plus its own LOCAL
+                    // SYNTHETIC usage — an empty summary would surface as an
+                    // EmptyCompactionSummary failure instead of a billable
+                    // successful fold.
+                    let mut server = state.served_maintenance.lock().unwrap();
+                    let n = server.len() as u64;
+                    let (input, output, cached, write, miss) = maintenance_call_usage(n);
+                    server.push((input, output, cached, write, miss));
+                    drop(server);
+                    let delta = json!({
+                        "type": "response.output_text.delta",
+                        "output_index": 0,
+                        "delta": "folded summary note: earlier history compressed"
+                    });
+                    let usage = synthetic_usage_json(input, output, cached, write, miss);
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {"usage": usage}
+                    });
+                    lane_sse_frame("response.output_text.delta", &delta)
+                        + &lane_sse_frame("response.completed", &completed)
+                } else {
+                    let script = match state.main_scripts.lock().unwrap().pop_front() {
+                        Some(script) => script,
+                        None => {
+                            // An unscripted round: serve a harmless
+                            // completion, count it, fail at the end.
+                            state.unexpected_rounds.fetch_add(1, Ordering::SeqCst);
+                            LaneScript::Text {
+                                delta: "unexpected-round",
+                                input_tokens: 1,
+                                output_tokens: 1,
+                                cached: None,
+                                cache_write: None,
+                                miss: None,
+                            }
+                        }
+                    };
+                    state.served_main.lock().unwrap().push(script.clone());
+                    lane_sse_body(&script)
+                };
+                let sse = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse_body}",
+                    sse_body.len()
+                );
+                let _ = socket.write_all(sse.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    addr.port()
+}
+
+/// The production composition for the eleventh-batch tests: the SAME
+/// wiring as `production_compose` above, but with the caller-supplied
+/// transport (test b wraps the provider in the production RetryingTransport)
+/// and caller-supplied context engine (test c attaches the production
+/// compactor over it). Never modifies the tenth-batch helper.
+async fn lane_production_compose(
+    workspace: agent_workspace::Workspace,
+    routing: &PromptCacheRouting,
+    model: Arc<dyn agent_contracts::ModelTransport>,
+    context_engine: Arc<dyn agent_contracts::ContextEngine>,
+) -> anyhow::Result<agent_compose::ComposedRuntime> {
+    let config = ComposeConfig {
+        provider_profile_digest: None,
+        cache_routing: Some(routing.clone()),
+        defer_proof_refresh: false,
+        shadow_context_frame: false,
+        workspace: workspace.clone(),
+        context_engine,
+        model,
+        approval: Arc::new(PolicyApprovalGate::permissive()),
+        base_tools: Arc::new(tool_runtime::BuiltinToolDispatcher::new(workspace.clone()).unwrap()),
+        capability_aware: false,
+        journal: None,
+        artifact_store: Some(Arc::new(workspace.clone())),
+        output_broker: None,
+        max_tool_rounds: None,
+        project_task_progress: true,
+        project_settlement: false,
+        settlement_projection_diagnostics: false,
+        project_completion_opportunity: false,
+        recovery_surface: false,
+        host_policies: None,
+        effect_reservation_journal: None,
+        verification_recipes: None,
+        project_proof_refresh: false,
+        host_death_watchdog: false,
+        mcp_servers: Vec::new(),
+        plugins: None,
+    };
+    compose(config).await
+}
+
+/// The production transport assembly for the retry/maintenance tests: the
+/// same provider shape the trajectory uses, wrapped in the same
+/// `RetryingTransport` shape the composition roots build
+/// (`RetryingTransport::new(provider, N, base_delay)`). The wrapper takes
+/// the concrete provider, so the Arc boxing happens AFTER the retry layer —
+/// exactly the production order. Two attempts and a 1 ms base delay keep
+/// one scripted failure recoverable and the test fast.
+fn retrying_model(base_url: String) -> Arc<dyn agent_contracts::ModelTransport> {
+    let config = OpenAiConfig {
+        api_key: "test-key".into(),
+        base_url,
+        model: "capture-model".into(),
+        protocol: OpenAiProtocol::Responses,
+        max_output_tokens: 256,
+        timeout: Duration::from_secs(20),
+        send_stream_options: false,
+        send_max_tokens: true,
+        max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
+        context_window: Some(64_000),
+        sampling: provider_openai::SamplingPolicy::ProviderDefault,
+    };
+    // NO_PROXY for the loopback capture server (same documented pattern as
+    // `responses_provider` above).
+    unsafe { std::env::set_var("NO_PROXY", "127.0.0.1,localhost") };
+    let provider = OpenAiProvider::with_client(
+        config,
+        reqwest::Client::builder().no_proxy().build().unwrap(),
+    )
+    .with_prompt_cache_mode(OpenAiPromptCacheMode::ResponsesExplicit)
+    .expect("responses protocol supports the explicit cache mode");
+    Arc::new(RetryingTransport::new(
+        provider,
+        2,
+        Duration::from_millis(1),
+    ))
+}
+
+/// The `ContextCompacted` settlement facts of one compactor call, copied
+/// field-for-field off the event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactionRow {
+    reason: agent_contracts::CompactionReason,
+    input_tokens: u64,
+    output_tokens: u64,
+    usage_identity: UsageIdentity,
+    cached_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
+    cache_miss_input_tokens: Option<u64>,
+    attempts: u32,
+    retries: u32,
+}
+
+/// Collects every `ContextCompacted` row of one session on its OWN
+/// subscription (the maintenance lane settles there, never on `ModelUsed`).
+fn spawn_compaction_collector(
+    mut events: tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
+    rows: Arc<Mutex<Vec<CompactionRow>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match events.try_recv() {
+                Ok(envelope) => {
+                    if let RuntimeEvent::ContextCompacted {
+                        reason,
+                        input_tokens,
+                        output_tokens,
+                        usage_identity,
+                        cached_input_tokens,
+                        cache_write_input_tokens,
+                        cache_miss_input_tokens,
+                        attempts,
+                        retries,
+                        ..
+                    } = envelope.event
+                    {
+                        rows.lock().unwrap().push(CompactionRow {
+                            reason,
+                            input_tokens,
+                            output_tokens,
+                            usage_identity,
+                            cached_input_tokens,
+                            cache_write_input_tokens,
+                            cache_miss_input_tokens,
+                            attempts,
+                            retries,
+                        });
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Focus the trajectory's task and return its id (the routing-key identity).
+async fn wait_for_focus(
+    events: &mut tokio::sync::broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
+    marker: &str,
+) -> agent_contracts::TaskId {
+    let mut task_id = None;
+    wait_for(
+        events,
+        |event| {
+            if let RuntimeEvent::FocusChanged { task_id: id, goal } = event
+                && goal.contains(marker)
+            {
+                task_id = Some(*id);
+                return true;
+            }
+            false
+        },
+        "report FocusChanged",
+    )
+    .await;
+    task_id.expect("the focus event carries the task id")
+}
+
+/// (a) NON-ZERO cache buckets: a four-round trajectory whose usage carries
+/// LOCAL SYNTHETIC cached/write/miss counters. Every ledger row must carry
+/// the synthetic values verbatim in its typed buckets, the flatten fallback
+/// must agree with the typed read bucket, an unreported counter must stay
+/// the explicit Unknown marker (never an invented zero, never a derived
+/// split), and each round's known split must re-add to its input total —
+/// with per-row, per-bucket, and trajectory-total recomputation agreeing.
+#[tokio::test]
+async fn synthetic_cache_buckets_settle_per_round_without_invented_zeros() {
+    // Per-round LOCAL SYNTHETIC values: rounds 1/2 report the DeepSeek-style
+    // split (cached + miss == input) with an EXTRA explicit write counter on
+    // round 1 (write != the derived remainder, so a relabeled miss cannot
+    // fake it); round 3 reports NO cache counters at all (the missing-
+    // measurement round); round 4 reports read+write but NO miss (a derived
+    // split would invent input-cached here; honesty requires Unknown).
+    let scripts = vec![
+        LaneScript::Text {
+            delta: "t1 done",
+            input_tokens: 4101,
+            output_tokens: 8,
+            cached: Some(300),
+            cache_write: Some(40),
+            miss: Some(3801), // 300 + 3801 == 4101
+        },
+        LaneScript::Text {
+            delta: "t2 done",
+            input_tokens: 4102,
+            output_tokens: 8,
+            cached: Some(310),
+            cache_write: None,
+            miss: Some(3792), // 310 + 3792 == 4102
+        },
+        LaneScript::Text {
+            delta: "t3 done",
+            input_tokens: 4103,
+            output_tokens: 8,
+            cached: None,
+            cache_write: None,
+            miss: None,
+        },
+        LaneScript::Text {
+            delta: "t4 done",
+            input_tokens: 4104,
+            output_tokens: 8,
+            cached: Some(320),
+            cache_write: Some(44),
+            miss: None,
+        },
+    ];
+
+    let state = Arc::new(LaneServerState {
+        bodies: Mutex::new(Vec::new()),
+        main_scripts: Mutex::new(VecDeque::from(scripts.clone())),
+        served_main: Mutex::new(Vec::new()),
+        maintenance_key: Mutex::new(None),
+        served_maintenance: Mutex::new(Vec::new()),
+        unexpected_rounds: AtomicUsize::new(0),
+    });
+    let port = spawn_lane_server(Arc::clone(&state)).await;
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let routing = PromptCacheRouting {
+        isolation: "kv-cache-buckets-isolation".into(),
+        workspace: root.display().to_string(),
+        endpoint: base_url.clone(),
+    };
+
+    // The default composition: no compactor attached, so every round is a
+    // main-lane round and every settlement is a `ModelUsed` row.
+    let composed = production_compose(&root, &base_url, &routing)
+        .await
+        .unwrap();
+    let mut events = composed.subscribe();
+    let ledger: Arc<Mutex<Vec<LedgerRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let ledger_lags = Arc::new(AtomicUsize::new(0));
+    let collector = spawn_ledger_collector(
+        composed.subscribe(),
+        Arc::clone(&ledger),
+        Arc::clone(&ledger_lags),
+    );
+    composed.instance.start().await.unwrap();
+    let handle = composed.handle().clone();
+
+    handle
+        .set_focus("bucket trajectory: one task, four billed rounds".into())
+        .await
+        .unwrap();
+    let task_id = wait_for_focus(&mut events, "bucket trajectory").await;
+
+    for turn in 1..=4 {
+        handle
+            .user_message(format!("bucket turn {turn}: plain completion"))
+            .await
+            .unwrap();
+        wait_turn_completed(&mut events).await;
+    }
+
+    drop(handle);
+    drop(events);
+    composed.shutdown().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), collector).await;
+
+    // Every scripted round reached the wire exactly once.
+    let bodies = state.bodies.lock().unwrap().clone();
+    let served = state.served_main.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        served.len(),
+        "one captured request per served round (unexpected extras: {})",
+        state.unexpected_rounds.load(Ordering::SeqCst)
+    );
+    assert_eq!(state.unexpected_rounds.load(Ordering::SeqCst), 0);
+    assert_eq!(served, scripts, "the four scripted rounds ran verbatim");
+    assert_eq!(
+        ledger_lags.load(Ordering::SeqCst),
+        0,
+        "the ledger collector must never lag"
+    );
+
+    // Cache-profile stability while cache counters flow: same explicit mode
+    // and the same per-task main-lane key on every request.
+    for (round, body) in bodies.iter().enumerate() {
+        let wire: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            wire["prompt_cache_key"].as_str(),
+            Some(routing.key_for(&task_id.to_string(), "main").as_str()),
+            "round {}: the main-lane routing key",
+            round + 1
+        );
+        assert_eq!(
+            wire["prompt_cache_options"]["mode"].as_str(),
+            Some("explicit"),
+            "round {}: the explicit cache profile stays declared",
+            round + 1
+        );
+    }
+
+    // One ledger row per round, matched to its script by the round-unique
+    // synthetic input identity.
+    let rows = ledger.lock().unwrap().clone();
+    assert_eq!(
+        rows.len(),
+        scripts.len(),
+        "one settled row per scripted round"
+    );
+    let by_input: std::collections::BTreeMap<u64, LedgerRow> =
+        rows.iter().map(|row| (row.input_tokens, *row)).collect();
+    assert_eq!(
+        by_input.len(),
+        rows.len(),
+        "round identities stay unique across the ledger"
+    );
+
+    for script in &scripts {
+        let input = script.input_tokens();
+        let row = by_input.get(&input).unwrap_or_else(|| {
+            panic!("round with synthetic input {input} must settle exactly one ledger row")
+        });
+        let LaneScript::Text {
+            cached,
+            cache_write,
+            miss,
+            output_tokens,
+            ..
+        } = script
+        else {
+            unreachable!("this trajectory scripts Text rounds only");
+        };
+        let typed = |known: &Option<u64>| {
+            known
+                .map(CostCounter::Known)
+                .unwrap_or(CostCounter::Unknown)
+        };
+        assert_eq!(row.output_tokens, *output_tokens, "round {input}: output");
+        assert_eq!(
+            row.cached_input_tokens,
+            typed(cached),
+            "round {input}: LOCAL SYNTHETIC cache-read bucket must ride the row verbatim \
+             (or stay Unknown when unreported)"
+        );
+        assert_eq!(
+            row.cache_write_input_tokens,
+            typed(cache_write),
+            "round {input}: the explicit LOCAL SYNTHETIC write counter must ride the row \
+             verbatim (or stay Unknown when unreported)"
+        );
+        assert_eq!(
+            row.cache_miss_input_tokens,
+            typed(miss),
+            "round {input}: the LOCAL SYNTHETIC miss counter must ride the row verbatim \
+             (or stay Unknown when unreported)"
+        );
+        // Three-way agreement: the typed read bucket, the legacy event-level
+        // flatten, and the scripted value are the same fact. The flatten is
+        // 0 exactly when the provider "reported nothing" — never when a
+        // value exists.
+        match cached {
+            Some(value) => assert_eq!(
+                row.event_cached_input_tokens, *value,
+                "round {input}: the event-level flatten must equal the typed cache-read bucket"
+            ),
+            None => assert_eq!(
+                row.event_cached_input_tokens, 0,
+                "round {input}: an unreported cache read flattens to 0 on the legacy field \
+                 while the typed bucket stays Unknown"
+            ),
+        }
+        // Per-round recomputation: where the synthetic split reports both
+        // halves, they re-add to the input total (hit + miss == prompt).
+        if let (Some(read), Some(uncached)) = (cached, miss) {
+            assert_eq!(
+                read + uncached,
+                input,
+                "round {input}: the known cache split must re-add to the round's input total"
+            );
+        }
+        // No derived buckets: a reported read without a reported miss must
+        // NOT grow an invented miss (input - read) — it stays Unknown.
+        if cached.is_some() && miss.is_none() {
+            assert!(
+                matches!(row.cache_miss_input_tokens, CostCounter::Unknown),
+                "round {input}: the unreported miss must stay Unknown, not be derived as \
+                 input-minus-cached"
+            );
+        }
+        assert_eq!(row.attempts, 1, "round {input}: one clean attempt");
+        assert_eq!(row.retries, 0, "round {input}: no retries");
+        assert_eq!(row.role, ModelCallRole::Main, "round {input}: main lane");
+        assert!(
+            matches!(row.identity, UsageIdentity::Observed),
+            "round {input}: fully reported usage is Observed"
+        );
+        assert!(
+            row.typed_usage_reported,
+            "round {input}: the typed per-field usage report arrived"
+        );
+    }
+
+    // Trajectory-total recomputation: the ledger totals are the sums of the
+    // per-row values, and the per-row values are the served synthetic wire
+    // usage (each round settled once — nothing doubled, nothing lost).
+    let rows_input_total: u64 = rows.iter().map(|row| row.input_tokens).sum();
+    let rows_output_total: u64 = rows.iter().map(|row| row.output_tokens).sum();
+    let served_input_total: u64 = served.iter().map(LaneScript::input_tokens).sum();
+    let served_output_total: u64 = served.iter().map(LaneScript::output_tokens).sum();
+    assert_eq!(rows_input_total, served_input_total);
+    assert_eq!(rows_output_total, served_output_total);
+    // The known cache-read total is the sum of the per-row KNOWN values —
+    // computed over Known rows only, never over invented zeros.
+    let served_cached_total: u64 = scripts
+        .iter()
+        .filter_map(|script| match script {
+            LaneScript::Text {
+                cached: Some(value),
+                ..
+            } => Some(*value),
+            _ => None,
+        })
+        .sum();
+    let rows_cached_total: u64 = rows
+        .iter()
+        .map(|row| match row.cached_input_tokens {
+            CostCounter::Known(value) => value,
+            CostCounter::Unknown => 0,
+        })
+        .sum();
+    assert_eq!(
+        rows_cached_total, served_cached_total,
+        "the known cache-read total is the sum of the synthetic per-round values"
+    );
+    // The composition attaches no compactor: no maintenance-lane row may
+    // exist beside the four main rounds.
+    assert!(
+        rows.iter().all(|row| row.role == ModelCallRole::Main),
+        "every row is a main-lane round on this composition"
+    );
+}
+
+/// (b) FAILURE/RETRY ACCUMULATION: one billed retryable transport failure
+/// (`response.failed`, `server_error`, LOCAL SYNTHETIC usage) followed by a
+/// successful retry in the SAME model round, then one clean round. The
+/// settled row must merge BOTH attempts' usage (each attempt settles exactly
+/// once — the failed attempt's cost is not erased and not counted twice),
+/// carry attempts=2/retries=1, and the retry must really have hit the wire.
+#[tokio::test]
+async fn billed_retryable_failure_and_its_retry_settle_exactly_once() {
+    let scripts = vec![
+        // Turn 1, ATTEMPT 1: billed retryable failure (300+3901 == 4201).
+        LaneScript::RetryableFail {
+            input_tokens: 4201,
+            output_tokens: 7,
+            cached: Some(300),
+            miss: Some(3901),
+        },
+        // Turn 1, ATTEMPT 2 (the production retry): succeeds with its own
+        // usage; it reports no miss counter.
+        LaneScript::Text {
+            delta: "t1 recovered",
+            input_tokens: 4202,
+            output_tokens: 8,
+            cached: Some(300),
+            cache_write: None,
+            miss: None,
+        },
+        // Turn 2: a clean round — its attempt counters must not leak.
+        LaneScript::Text {
+            delta: "t2 clean",
+            input_tokens: 4203,
+            output_tokens: 8,
+            cached: None,
+            cache_write: None,
+            miss: None,
+        },
+    ];
+
+    let state = Arc::new(LaneServerState {
+        bodies: Mutex::new(Vec::new()),
+        main_scripts: Mutex::new(VecDeque::from(scripts.clone())),
+        served_main: Mutex::new(Vec::new()),
+        maintenance_key: Mutex::new(None),
+        served_maintenance: Mutex::new(Vec::new()),
+        unexpected_rounds: AtomicUsize::new(0),
+    });
+    let port = spawn_lane_server(Arc::clone(&state)).await;
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let routing = PromptCacheRouting {
+        isolation: "kv-retry-isolation".into(),
+        workspace: root.display().to_string(),
+        endpoint: base_url.clone(),
+    };
+
+    // Production retry assembly: the provider inside a RetryingTransport
+    // (two attempts, 1 ms base delay). The engine is the default dynamic
+    // one — no compactor, so every row is a main-lane row.
+    let workspace = agent_workspace::Workspace::open(&root).await.unwrap();
+    let context_engine = agent_compose::build_context_engine(
+        agent_compose::ContextPolicy::Dynamic,
+        workspace.state_dir(),
+        None,
+        None,
+        &MaintenanceBudget::default(),
+        None,
+    )
+    .await
+    .unwrap();
+    let composed = lane_production_compose(
+        workspace,
+        &routing,
+        retrying_model(base_url.clone()),
+        context_engine,
+    )
+    .await
+    .unwrap();
+    let mut events = composed.subscribe();
+    let ledger: Arc<Mutex<Vec<LedgerRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let ledger_lags = Arc::new(AtomicUsize::new(0));
+    let collector = spawn_ledger_collector(
+        composed.subscribe(),
+        Arc::clone(&ledger),
+        Arc::clone(&ledger_lags),
+    );
+    composed.instance.start().await.unwrap();
+    let handle = composed.handle().clone();
+
+    handle
+        .set_focus("retry trajectory: one billed failure, one recovery".into())
+        .await
+        .unwrap();
+
+    handle
+        .user_message("retry turn 1: the first attempt will fail".into())
+        .await
+        .unwrap();
+    // The production retry is observable on the live surface: the sink got
+    // the typed ModelRetrying event BEFORE the turn could complete.
+    wait_for(
+        &mut events,
+        |event| matches!(event, RuntimeEvent::ModelRetrying { attempt: 2, .. }),
+        "report the live ModelRetrying(attempt=2)",
+    )
+    .await;
+    wait_turn_completed(&mut events).await;
+
+    handle
+        .user_message("retry turn 2: clean round".into())
+        .await
+        .unwrap();
+    wait_turn_completed(&mut events).await;
+
+    drop(handle);
+    drop(events);
+    composed.shutdown().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), collector).await;
+
+    // THREE captured requests for two turns: the failure's attempt AND its
+    // retry both really hit the wire, then the clean round.
+    let bodies = state.bodies.lock().unwrap().clone();
+    let served = state.served_main.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "the failed attempt, its retry, and the clean round must each reach the wire \
+         (unexpected extras: {})",
+        state.unexpected_rounds.load(Ordering::SeqCst)
+    );
+    assert_eq!(state.unexpected_rounds.load(Ordering::SeqCst), 0);
+    assert_eq!(served, scripts, "the three scripted attempts ran verbatim");
+    assert_eq!(
+        ledger_lags.load(Ordering::SeqCst),
+        0,
+        "the ledger collector must never lag"
+    );
+
+    // TWO ledger rows for THREE wire attempts: the two attempts of turn 1
+    // settle as ONE row — the retry is not a second round.
+    let rows = ledger.lock().unwrap().clone();
+    assert_eq!(
+        rows.len(),
+        2,
+        "one settled row per model ROUND, not per attempt"
+    );
+    let mut sorted = rows.clone();
+    sorted.sort_by_key(|row| row.input_tokens);
+    let recovery_row = &sorted[1];
+    let clean_row = &sorted[0];
+
+    // R2/QB semantics: the failed attempt's known cost survives. The merged
+    // row carries BOTH attempts' counters exactly once each — the failure's
+    // 4201/7 plus the retry's 4202/8 — so the failure neither erased its
+    // cost nor duplicated it.
+    assert_eq!(
+        recovery_row.input_tokens,
+        4201 + 4202,
+        "the settled row merges the failed attempt's input with the retry's input — \
+         each real attempt settles exactly once"
+    );
+    assert_eq!(
+        recovery_row.output_tokens,
+        7 + 8,
+        "the failed attempt's output tokens are not erased by the failure"
+    );
+    // The cache buckets merge with the same discipline: both attempts
+    // reported read 300 -> 600; only the FAILED attempt reported a miss, so
+    // the merged row keeps that known cost verbatim instead of dropping or
+    // zero-filling it; the unreported write stays Unknown.
+    assert_eq!(
+        recovery_row.cached_input_tokens,
+        CostCounter::Known(600),
+        "both attempts' synthetic cache-read counters merge (300 + 300)"
+    );
+    assert_eq!(
+        recovery_row.cache_miss_input_tokens,
+        CostCounter::Known(3901),
+        "the failed attempt's reported miss survives the merge — a failure must not \
+         erase known cost (R2/QB)"
+    );
+    assert!(
+        matches!(recovery_row.cache_write_input_tokens, CostCounter::Unknown),
+        "the write counter went unreported on both attempts: Unknown, never a zero"
+    );
+    // Note on recomputation: the hit+miss==input identity holds PER attempt
+    // (300+3901==4201), not across the merge — the retry attempt reported no
+    // miss counter, and a counter absent on one attempt stays absent on the
+    // merged total (never back-filled from the input sum). The per-attempt
+    // merge facts are exactly the row assertions above.
+    assert_eq!(
+        recovery_row.attempts, 2,
+        "the row records the real transport attempt count"
+    );
+    assert_eq!(
+        recovery_row.retries, 1,
+        "retries == attempts - 1 for the recovered round"
+    );
+    assert_eq!(recovery_row.role, ModelCallRole::Main);
+    assert!(
+        matches!(recovery_row.identity, UsageIdentity::Observed),
+        "the merged usage is fully provider-reported (synthetically): Observed"
+    );
+
+    // The clean round: one attempt, no retries, nothing leaked from turn 1.
+    assert_eq!(clean_row.input_tokens, 4203);
+    assert_eq!(clean_row.output_tokens, 8);
+    assert_eq!(clean_row.attempts, 1);
+    assert_eq!(clean_row.retries, 0);
+    assert_eq!(clean_row.role, ModelCallRole::Main);
+    assert!(
+        matches!(clean_row.cached_input_tokens, CostCounter::Unknown)
+            && matches!(clean_row.cache_write_input_tokens, CostCounter::Unknown)
+            && matches!(clean_row.cache_miss_input_tokens, CostCounter::Unknown),
+        "the clean round reported no cache counters: all buckets stay Unknown"
+    );
+
+    // Trajectory-total recomputation across both rows and all three wire
+    // attempts: every attempt's usage is in the account exactly once.
+    let rows_input_total: u64 = rows.iter().map(|row| row.input_tokens).sum();
+    assert_eq!(
+        rows_input_total,
+        served.iter().map(LaneScript::input_tokens).sum::<u64>(),
+        "ledger input total == the sum over ALL wire attempts (failed one included, \
+         nothing counted twice)"
+    );
+    let rows_output_total: u64 = rows.iter().map(|row| row.output_tokens).sum();
+    assert_eq!(
+        rows_output_total,
+        served.iter().map(LaneScript::output_tokens).sum::<u64>(),
+    );
+}
+
+/// (c) REAL MAINTENANCE CALL: the rolling context engine with the production
+/// compactor attached (`build_context_engine` wiring, the maintenance lane's
+/// own stable routing key), threshold crossed by seeding records through the
+/// engine's real ingest. The fold then fires on the ACTOR's in-turn
+/// maintenance path (the turn-start/turn-tail maintain passes), so real
+/// compactor requests reach the capture server on the maintenance key.
+/// Assertions: the maintenance wire shape (no tools, compaction system
+/// prompt, explicit no-breakpoint profile, the compactor's own output cap),
+/// a `ContextCompacted` settlement per call with the synthetic usage and
+/// transport attempt facts, and STRICT lane separation — maintenance tokens
+/// settle on their own rows and never merge into the main `ModelUsed` lane.
+#[tokio::test]
+async fn maintenance_lane_compaction_settles_on_its_own_lane() {
+    let main_scripts = vec![
+        LaneScript::Text {
+            delta: "t1 done",
+            input_tokens: 4311,
+            output_tokens: 8,
+            cached: None,
+            cache_write: None,
+            miss: None,
+        },
+        LaneScript::Text {
+            delta: "t2 done",
+            input_tokens: 4312,
+            output_tokens: 8,
+            cached: None,
+            cache_write: None,
+            miss: None,
+        },
+    ];
+
+    let state = Arc::new(LaneServerState {
+        bodies: Mutex::new(Vec::new()),
+        main_scripts: Mutex::new(VecDeque::from(main_scripts.clone())),
+        served_main: Mutex::new(Vec::new()),
+        maintenance_key: Mutex::new(None),
+        served_maintenance: Mutex::new(Vec::new()),
+        unexpected_rounds: AtomicUsize::new(0),
+    });
+    let port = spawn_lane_server(Arc::clone(&state)).await;
+    let base_url = format!("http://127.0.0.1:{port}/v1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let routing = PromptCacheRouting {
+        isolation: "kv-maintenance-isolation".into(),
+        workspace: root.display().to_string(),
+        endpoint: base_url.clone(),
+    };
+    // Same lane-key derivation as the host/TUI composition roots: the
+    // maintenance lane owns its own stable namespace under the same routing.
+    let maintenance_key = routing.key_for("compaction", "maintenance");
+    *state.maintenance_key.lock().unwrap() = Some(maintenance_key.clone());
+
+    // Production maintenance assembly: rolling engine + compactor over the
+    // (retry-wrapped) transport, default maintenance budget (calls allowed).
+    let model = retrying_model(base_url.clone());
+    let workspace = agent_workspace::Workspace::open(&root).await.unwrap();
+    let context_engine = agent_compose::build_context_engine(
+        agent_compose::ContextPolicy::Rolling,
+        workspace.state_dir(),
+        Some(Arc::clone(&model)),
+        None,
+        &MaintenanceBudget::default(),
+        Some(maintenance_key.clone()),
+    )
+    .await
+    .unwrap();
+    // Cross the fold threshold through the engine's real ingest BEFORE the
+    // run (the seam `cache_routing_wire_acceptance` uses): ~40 records,
+    // ~10k synthetic tokens over the 9k default fold threshold. The FOLD
+    // itself only fires when the actor runs its in-turn maintenance passes.
+    for index in 0..40 {
+        context_engine
+            .ingest(agent_contracts::ContextIngress::AssistantMessage {
+                content: format!("maintenance seed {index}: {}", "detail ".repeat(140)),
+            })
+            .await
+            .unwrap();
+    }
+
+    let composed = lane_production_compose(workspace, &routing, model, context_engine)
+        .await
+        .unwrap();
+    let mut events = composed.subscribe();
+    let ledger: Arc<Mutex<Vec<LedgerRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let ledger_lags = Arc::new(AtomicUsize::new(0));
+    let collector = spawn_ledger_collector(
+        composed.subscribe(),
+        Arc::clone(&ledger),
+        Arc::clone(&ledger_lags),
+    );
+    let compactions: Arc<Mutex<Vec<CompactionRow>>> = Arc::new(Mutex::new(Vec::new()));
+    let compaction_collector =
+        spawn_compaction_collector(composed.subscribe(), Arc::clone(&compactions));
+    composed.instance.start().await.unwrap();
+    let handle = composed.handle().clone();
+
+    handle
+        .set_focus("maintenance trajectory: folds must ride their own lane".into())
+        .await
+        .unwrap();
+    let task_id = wait_for_focus(&mut events, "maintenance trajectory").await;
+
+    for turn in 1..=2 {
+        handle
+            .user_message(format!("maintenance turn {turn}: plain completion"))
+            .await
+            .unwrap();
+        wait_turn_completed(&mut events).await;
+    }
+
+    drop(handle);
+    drop(events);
+    composed.shutdown().await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), collector).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), compaction_collector).await;
+
+    // ---- The maintenance lane really reached the wire, at least once. ----
+    let bodies = state.bodies.lock().unwrap().clone();
+    let served_maintenance = state.served_maintenance.lock().unwrap().clone();
+    let served_main = state.served_main.lock().unwrap().clone();
+    assert_eq!(state.unexpected_rounds.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        served_main, main_scripts,
+        "the two scripted main rounds ran verbatim"
+    );
+    assert!(
+        !served_maintenance.is_empty(),
+        "at least one real maintenance-lane compactor call must have been triggered in-task"
+    );
+    let main_key = routing.key_for(&task_id.to_string(), "main");
+    assert_ne!(
+        main_key, maintenance_key,
+        "the two lanes must own different routing keys"
+    );
+
+    let mut maintenance_bodies = 0usize;
+    for body in &bodies {
+        let wire: Value = serde_json::from_str(body).unwrap();
+        let key = wire["prompt_cache_key"].as_str().unwrap_or("");
+        if key == maintenance_key {
+            maintenance_bodies += 1;
+            // The compactor's contract on the wire: NO tools, the
+            // compaction system prompt, the explicit profile (the
+            // compactor declares ExplicitOnly), and the compactor's OWN
+            // output cap — not the main profile's.
+            let tools = wire["tools"].as_array().unwrap();
+            assert!(
+                tools.is_empty(),
+                "the maintenance call must not offer tools: {tools:?}"
+            );
+            let first = item_text(&wire["input"][0]);
+            assert!(
+                first.contains("You compress folded coding-agent history"),
+                "the maintenance request carries the compaction system prompt, got: {first:?}"
+            );
+            assert_eq!(
+                wire["prompt_cache_options"]["mode"].as_str(),
+                Some("explicit"),
+                "the maintenance lane declares the explicit cache profile"
+            );
+            assert_eq!(
+                wire["max_output_tokens"].as_u64(),
+                Some(512),
+                "the compactor's own bounded-output cap rides the request (not the main \
+                 profile's cap)"
+            );
+        } else {
+            assert_eq!(
+                key, main_key,
+                "every non-maintenance body carries the task's main-lane key"
+            );
+        }
+    }
+    assert_eq!(
+        maintenance_bodies,
+        served_maintenance.len(),
+        "one captured maintenance request per maintenance settlement"
+    );
+    assert!(maintenance_bodies >= 1);
+
+    // ---- Each maintenance call settles EXACTLY ONE ContextCompacted row,
+    // with its own synthetic usage and the transport's attempt facts. ----
+    let compaction_rows = compactions.lock().unwrap().clone();
+    assert_eq!(
+        compaction_rows.len(),
+        served_maintenance.len(),
+        "each maintenance call settles exactly once, on its own typed row"
+    );
+    let mut served_inputs: Vec<u64> = served_maintenance.iter().map(|s| s.0).collect();
+    served_inputs.sort_unstable();
+    let mut settled_inputs: Vec<u64> = compaction_rows.iter().map(|row| row.input_tokens).collect();
+    settled_inputs.sort_unstable();
+    assert_eq!(
+        settled_inputs, served_inputs,
+        "the settled maintenance rows are exactly the served calls (each synthetic \
+         round-unique identity appears once — nothing doubled, nothing lost)"
+    );
+    for row in &compaction_rows {
+        assert_eq!(
+            row.reason,
+            agent_contracts::CompactionReason::RollingFold,
+            "the maintenance rows come from the rolling fold"
+        );
+        assert!(
+            matches!(row.usage_identity, UsageIdentity::Observed),
+            "the compactor call's usage was fully reported: Observed, never Unknown-by-default"
+        );
+        let n = row.input_tokens - 4300;
+        let (input, output, cached, write, miss) = maintenance_call_usage(n);
+        assert_eq!(row.input_tokens, input);
+        assert_eq!(row.output_tokens, output);
+        assert_eq!(
+            row.cached_input_tokens, cached,
+            "the LOCAL SYNTHETIC cache-read bucket rides the maintenance row verbatim"
+        );
+        assert_eq!(
+            row.cache_write_input_tokens, write,
+            "the explicit write counter rides verbatim"
+        );
+        assert_eq!(
+            row.cache_miss_input_tokens, miss,
+            "the miss counter rides verbatim"
+        );
+        assert_eq!(
+            cached.unwrap() + miss.unwrap(),
+            input,
+            "the maintenance row's known split re-adds to its input total"
+        );
+        assert_eq!(row.attempts, 1, "one clean transport attempt per fold call");
+        assert_eq!(row.retries, 0);
+    }
+
+    // ---- STRICT lane separation on the main account: every ModelUsed row
+    // is a main-lane round, and NO maintenance token identity leaked into
+    // it — the maintenance usage is settled beside the main lane, not
+    // merged into it. ----
+    let rows = ledger.lock().unwrap().clone();
+    assert_eq!(
+        rows.len(),
+        main_scripts.len(),
+        "one main-lane row per main round — maintenance calls never produce ModelUsed rows"
+    );
+    assert!(
+        rows.iter().all(|row| row.role == ModelCallRole::Main),
+        "every ModelUsed row is main-lane"
+    );
+    for row in &rows {
+        assert!(
+            !served_inputs.contains(&row.input_tokens),
+            "main row {} must not carry a maintenance call's synthetic usage",
+            row.input_tokens
+        );
+    }
+    let rows_input_total: u64 = rows.iter().map(|row| row.input_tokens).sum();
+    let main_input_total: u64 = served_main.iter().map(LaneScript::input_tokens).sum();
+    assert_eq!(
+        rows_input_total, main_input_total,
+        "the main-lane account sums to the MAIN rounds only — the maintenance usage \
+         stays on its own rows"
+    );
+    // The maintenance tokens ARE accounted, on their own typed rows.
+    let maintenance_input_total: u64 = compaction_rows.iter().map(|row| row.input_tokens).sum();
+    assert_eq!(
+        maintenance_input_total,
+        served_maintenance.iter().map(|s| s.0).sum::<u64>(),
+        "the maintenance lane's own account equals the sum of its calls"
+    );
+
+    eprintln!(
+        "KV_SEQ_MAINTENANCE maintenance_calls={maintenance_bodies} \
+         maintenance_input_total={maintenance_input_total} main_input_total={main_input_total}"
+    );
 }
