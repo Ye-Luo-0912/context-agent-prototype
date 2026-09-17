@@ -57,6 +57,11 @@ struct OperationWriterState {
     recovery: OperationJournalRecovery,
     operation_indexes: HashMap<OperationId, usize>,
     metadata: AuthorityJournalMetadata,
+    /// Sticky fence (H4): set ONLY for write-phase failures — bytes may have
+    /// reached the WAL and the tail is torn or of unknown durability, so
+    /// every later operation on this handle is refused until a fresh open
+    /// recovers from disk. Pre-write rejections (frame size, projected byte
+    /// capacity) leave the file untouched and never set this.
     failed: Option<String>,
 }
 
@@ -600,6 +605,50 @@ fn sync_directory(path: &Path) -> AgentResult<()> {
     )))
 }
 
+/// H4 test injection: an alternative byte-capacity quota for the WAL append
+/// path. Thread-local so parallel tests never observe each other's quota;
+/// the production threshold stays `MAX_OPERATION_JOURNAL_FILE_BYTES` and is
+/// never derived from this hook.
+#[cfg(test)]
+fn operation_journal_byte_capacity() -> u64 {
+    INJECTED_WAL_BYTE_CAPACITY
+        .with(std::cell::Cell::get)
+        .unwrap_or(MAX_OPERATION_JOURNAL_FILE_BYTES)
+}
+
+#[cfg(not(test))]
+fn operation_journal_byte_capacity() -> u64 {
+    MAX_OPERATION_JOURNAL_FILE_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    static INJECTED_WAL_BYTE_CAPACITY: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    /// Write-phase fault cut point: `Some(false)` fails after the payload
+    /// bytes are written but before the trailing newline (a torn tail);
+    /// `Some(true)` fails after the complete frame is in the file but before
+    /// `sync_all` (durability unknown).
+    static WRITE_PHASE_FAULT: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// H4 test injection: the write-phase cut points whose failure must keep the
+/// sticky fence exactly as before. Thread-local like `SYNC_DIRECTORY_FAULT`.
+#[cfg(test)]
+fn injected_write_phase_failure(before_sync: bool) -> std::io::Result<()> {
+    if WRITE_PHASE_FAULT.with(std::cell::Cell::get) == Some(before_sync) {
+        return Err(std::io::Error::other("injected write phase failure"));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn injected_write_phase_failure(before_sync: bool) -> std::io::Result<()> {
+    let _ = before_sync;
+    Ok(())
+}
+
 impl OperationJournal for FileOperationJournal {
     fn append_and_sync(
         &self,
@@ -624,24 +673,53 @@ impl OperationJournal for FileOperationJournal {
                 )));
             }
         }
-        let record = OperationJournalRecord {
+        let mut record = OperationJournalRecord {
             version: OPERATION_JOURNAL_VERSION,
             seq: writer.next_seq,
             transition: transition.clone(),
         };
         validate_cached_record(&writer.recovery, &writer.operation_indexes, &record)
             .map_err(AgentError::RecoveryRequired)?;
-        let next_seq = writer.next_seq.checked_add(1).ok_or_else(|| {
+        let mut next_seq = writer.next_seq.checked_add(1).ok_or_else(|| {
             AgentError::RecoveryRequired("operation journal sequence exhausted".into())
         })?;
-        let result = append_operation_record(&mut writer.file, &record);
-        if let Err(error) = result {
-            let message = format!(
-                "operation journal {} failed permanently: {error}",
-                self.path.display()
-            );
-            writer.failed = Some(message.clone());
-            return Err(AgentError::Storage(message));
+        // H4: the failure phase decides the recovery permission. A pre-write
+        // rejection (frame size, projected byte capacity) happens before the
+        // first WAL byte is touched, so the writer stays healthy — and for
+        // the byte-capacity rejection, whose message prescribes
+        // compaction, retry exactly once after a successful compaction. A
+        // write-phase failure may have left a torn or unsynced tail and
+        // still fences the writer for recovery.
+        match append_operation_record(&mut writer.file, &record) {
+            Ok(()) => {}
+            Err(AppendFailure::RejectedBeforeWrite { capacity: true, .. }) => {
+                compact_locked(&self.path, &mut writer)?;
+                // Compaction restarts the sequence numbering (a fresh WAL
+                // begins at its Compacted baseline), so re-stage the record
+                // before the single bounded retry. If it still does not fit,
+                // reject explicitly — never loop.
+                record.seq = writer.next_seq;
+                validate_cached_record(&writer.recovery, &writer.operation_indexes, &record)
+                    .map_err(AgentError::RecoveryRequired)?;
+                next_seq = writer.next_seq.checked_add(1).ok_or_else(|| {
+                    AgentError::RecoveryRequired("operation journal sequence exhausted".into())
+                })?;
+                match append_operation_record(&mut writer.file, &record) {
+                    Ok(()) => {}
+                    Err(AppendFailure::RejectedBeforeWrite { error, .. }) => {
+                        return Err(AgentError::RecoveryRequired(format!(
+                            "operation journal still exceeds its byte capacity after compaction: {error}"
+                        )));
+                    }
+                    Err(AppendFailure::WriteFailed { error }) => {
+                        return Err(fence_operation_writer(&mut writer, &self.path, error));
+                    }
+                }
+            }
+            Err(AppendFailure::RejectedBeforeWrite { error, .. }) => return Err(error),
+            Err(AppendFailure::WriteFailed { error }) => {
+                return Err(fence_operation_writer(&mut writer, &self.path, error));
+            }
         }
         let OperationWriterState {
             recovery,
@@ -1071,38 +1149,114 @@ fn apply_cached_record(
     recovery.last_seq = record.seq;
 }
 
-fn append_operation_record(file: &mut File, record: &OperationJournalRecord) -> AgentResult<()> {
-    let payload = serde_json::to_vec(record)
-        .map_err(|error| AgentError::Storage(format!("serialize operation record: {error}")))?;
+/// Failure phase of an operation-journal append (H4). The WAL bytes are only
+/// touched from the write phase onward, so the phase decides the recovery
+/// permission: a pre-write rejection leaves the file byte-for-byte unchanged
+/// and the writer healthy, while a write-phase failure may have left a torn
+/// or unsynced tail and must fence the writer.
+enum AppendFailure {
+    /// Rejected before any byte was written (record serialization, frame
+    /// size, projected byte capacity, or a stat needed to project it).
+    /// `capacity` marks the byte-capacity rejection — its message prescribes
+    /// checkpoint/compaction, so the caller may retry once after a
+    /// successful compaction. The writer stays healthy either way.
+    RejectedBeforeWrite { capacity: bool, error: AgentError },
+    /// The write phase (seek/write/flush/sync) failed: the WAL tail may be
+    /// torn or of unknown durability, so the writer must be fenced and the
+    /// journal recovered from disk.
+    WriteFailed { error: AgentError },
+}
+
+impl AppendFailure {
+    fn before_write(error: AgentError) -> Self {
+        Self::RejectedBeforeWrite {
+            capacity: false,
+            error,
+        }
+    }
+}
+
+/// The write phase of [`append_operation_record`]: everything from the first
+/// call that may move WAL bytes (the seek) through the durability barrier.
+/// Any failure here is classified as [`AppendFailure::WriteFailed`].
+fn persist_operation_frame(file: &mut File, encoded: &[u8]) -> std::io::Result<()> {
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(encoded)?;
+    // Test-only cut points: `false` tears the tail (payload without the
+    // newline), `true` skips only the durability barrier.
+    injected_write_phase_failure(false)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    injected_write_phase_failure(true)?;
+    file.sync_all()
+}
+
+/// H4: the write phase failed after bytes may have reached the WAL — the
+/// tail is torn or durability is unknown. Fence the writer exactly as
+/// before: every later operation on this handle is refused until a fresh
+/// open recovers the journal truth from disk.
+fn fence_operation_writer(
+    writer: &mut OperationWriterState,
+    path: &Path,
+    error: AgentError,
+) -> AgentError {
+    let message = format!(
+        "operation journal {} failed permanently: {error}",
+        path.display()
+    );
+    writer.failed = Some(message.clone());
+    AgentError::Storage(message)
+}
+
+fn append_operation_record(
+    file: &mut File,
+    record: &OperationJournalRecord,
+) -> Result<(), AppendFailure> {
+    let payload = serde_json::to_vec(record).map_err(|error| {
+        AppendFailure::before_write(AgentError::Storage(format!(
+            "serialize operation record: {error}"
+        )))
+    })?;
     let frame = StoredOperationFrame {
         checksum: checksum_hex(&payload),
         record: record.clone(),
     };
-    let encoded = serde_json::to_vec(&frame)
-        .map_err(|error| AgentError::Storage(format!("serialize operation frame: {error}")))?;
+    let encoded = serde_json::to_vec(&frame).map_err(|error| {
+        AppendFailure::before_write(AgentError::Storage(format!(
+            "serialize operation frame: {error}"
+        )))
+    })?;
     if encoded.len() > MAX_OPERATION_JOURNAL_FRAME_BYTES {
-        return Err(AgentError::Storage(format!(
+        return Err(AppendFailure::before_write(AgentError::Storage(format!(
             "operation journal frame exceeds {MAX_OPERATION_JOURNAL_FRAME_BYTES} bytes"
-        )));
+        ))));
     }
     let projected = file
         .metadata()
-        .map_err(|error| AgentError::Storage(format!("stat operation journal: {error}")))?
+        .map_err(|error| {
+            AppendFailure::before_write(AgentError::Storage(format!(
+                "stat operation journal: {error}"
+            )))
+        })?
         .len()
         .checked_add(encoded.len() as u64 + 1)
-        .ok_or_else(|| AgentError::Storage("operation journal size overflow".into()))?;
-    if projected > MAX_OPERATION_JOURNAL_FILE_BYTES {
-        return Err(AgentError::RecoveryRequired(format!(
-            "operation journal reached its {} byte hard limit; checkpoint/compaction is required",
-            MAX_OPERATION_JOURNAL_FILE_BYTES
-        )));
+        .ok_or_else(|| {
+            AppendFailure::before_write(AgentError::Storage(
+                "operation journal size overflow".into(),
+            ))
+        })?;
+    let capacity = operation_journal_byte_capacity();
+    if projected > capacity {
+        return Err(AppendFailure::RejectedBeforeWrite {
+            capacity: true,
+            error: AgentError::RecoveryRequired(format!(
+                "operation journal reached its {capacity} byte hard limit; checkpoint/compaction is required"
+            )),
+        });
     }
-    file.seek(SeekFrom::End(0))
-        .and_then(|_| file.write_all(&encoded))
-        .and_then(|_| file.write_all(b"\n"))
-        .and_then(|_| file.flush())
-        .and_then(|_| file.sync_all())
-        .map_err(|error| AgentError::Storage(format!("persist operation journal: {error}")))
+    persist_operation_frame(file, &encoded).map_err(|error| AppendFailure::WriteFailed {
+        error: AgentError::Storage(format!("persist operation journal: {error}")),
+    })
 }
 
 fn recover_operation_file(file: &mut File, path: &Path) -> AgentResult<OperationJournalRecovery> {
@@ -2659,6 +2813,43 @@ mod tests {
         }
     }
 
+    /// H4 test-scoped byte-capacity quota for the WAL append path. Dropping
+    /// the guard restores the production threshold.
+    struct InjectedWalCapacity;
+    impl InjectedWalCapacity {
+        fn enable(capacity: u64) -> Self {
+            INJECTED_WAL_BYTE_CAPACITY.with(|cell| cell.set(Some(capacity)));
+            Self
+        }
+    }
+    impl Drop for InjectedWalCapacity {
+        fn drop(&mut self) {
+            INJECTED_WAL_BYTE_CAPACITY.with(|cell| cell.set(None));
+        }
+    }
+
+    /// H4 test-scoped write-phase fault. `torn_tail` fails after the payload
+    /// bytes are written but before the trailing newline; `before_sync`
+    /// fails after the complete frame is in the file but before `sync_all`.
+    struct InjectedWritePhaseFault;
+    impl InjectedWritePhaseFault {
+        fn torn_tail() -> Self {
+            Self::enable(false)
+        }
+        fn before_sync() -> Self {
+            Self::enable(true)
+        }
+        fn enable(before_sync: bool) -> Self {
+            WRITE_PHASE_FAULT.with(|cell| cell.set(Some(before_sync)));
+            Self
+        }
+    }
+    impl Drop for InjectedWritePhaseFault {
+        fn drop(&mut self) {
+            WRITE_PHASE_FAULT.with(|cell| cell.set(None));
+        }
+    }
+
     #[test]
     fn operation_journal_rejects_effect_identity_drift() {
         let dir = tempfile::tempdir().unwrap();
@@ -2693,6 +2884,307 @@ mod tests {
 
         assert!(matches!(error, AgentError::RecoveryRequired(_)));
         assert_eq!(fs::metadata(&path).unwrap().len(), before);
+    }
+
+    /// H4 main case: a byte-capacity rejection is decided before any byte is
+    /// written, so the WAL is byte-for-byte unchanged and the writer stays
+    /// healthy — marker, recovery query and compaction all keep working on
+    /// the same handle, and a small frame appends normally once the quota
+    /// allows. Only write-phase failures earn the sticky fence.
+    #[test]
+    fn capacity_rejection_leaves_the_wal_untouched_and_the_writer_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        let marker_before = journal.authority_checkpoint_marker().unwrap();
+
+        // A quota smaller than any frame: the append is rejected pre-write,
+        // and the in-call bounded retry finds an empty journal (compaction
+        // is a no-op there) and rejects again — explicitly, never looping.
+        let _capacity = InjectedWalCapacity::enable(64);
+        let error = journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(&error, AgentError::RecoveryRequired(message) if message.contains("hard limit")),
+            "the capacity rejection must surface as RecoveryRequired: {error}"
+        );
+        drop(_capacity);
+
+        // The rejection touched nothing: the WAL is byte-for-byte unchanged
+        // (still the empty file open created) and the pre-rejection marker
+        // is still valid.
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            0,
+            "a pre-write capacity rejection must not write any WAL byte"
+        );
+        journal
+            .validate_authority_checkpoint_marker(&marker_before)
+            .unwrap();
+
+        // The writer is NOT fenced: recovery queries, the marker and
+        // compaction all work on the same handle.
+        assert_eq!(journal.recover().unwrap().last_seq, 0);
+        assert_eq!(journal.authority_checkpoint_marker().unwrap().generation, 1);
+        let marker = journal.compact().unwrap();
+        assert_eq!(marker.generation, 1, "an empty journal compacts as a no-op");
+
+        // With the quota lifted, the same handle appends normally.
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(journal.recover().unwrap().last_seq, 1);
+    }
+
+    /// H4: when compaction actually makes the record fit, the bounded retry
+    /// succeeds inside the same append — exactly one compaction, never a
+    /// loop — and the retried frame is durable in the published generation.
+    #[test]
+    fn capacity_rejection_compacts_once_and_the_bounded_retry_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+
+        // Nine frames describing ONE live operation (Accepted -> Executing,
+        // then idempotent re-upserts): a large WAL that compaction shrinks
+        // to a single snapshot.
+        let operation_id = OperationId::new();
+        let effect_id = EffectId::new();
+        let mut snapshot = operation_snapshot(operation_id, OperationState::Accepted);
+        journal.append_and_sync(&upsert(snapshot.clone())).unwrap();
+        snapshot.state = OperationState::Executing {
+            effect_id: Some(effect_id),
+        };
+        for _ in 0..8 {
+            journal.append_and_sync(&upsert(snapshot.clone())).unwrap();
+        }
+        let generation_len = fs::metadata(&path).unwrap().len();
+
+        // A quota the very next frame would exceed, but the compacted WAL
+        // (Compacted baseline + one snapshot) plus that frame fits under.
+        let _capacity = InjectedWalCapacity::enable(generation_len);
+        let record = journal
+            .append_and_sync(&upsert(snapshot.clone()))
+            .expect("the bounded compaction retry must make the frame fit");
+
+        assert_eq!(
+            record.seq, 3,
+            "the retry re-stages the record on the compacted baseline"
+        );
+        let recovered = journal.recover().unwrap();
+        assert_eq!(recovered.last_seq, 3);
+        assert_eq!(recovered.operations.len(), 1);
+        assert_eq!(recovered.operations[0].identity.operation_id, operation_id);
+        assert_eq!(
+            journal.authority_checkpoint_marker().unwrap().generation,
+            2,
+            "exactly one compaction may run inside the rejected append"
+        );
+        assert!(
+            !path.exists(),
+            "the compaction superseded generation 1 before the retry"
+        );
+        let generation2 = path.with_file_name("operations.jsonl.g2");
+        assert!(fs::metadata(&generation2).unwrap().len() <= generation_len);
+
+        drop(_capacity);
+        drop(journal);
+        let (_, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(recovery.last_seq, 3);
+        assert_eq!(recovery.operations.len(), 1);
+        assert!(matches!(
+            &recovery.operations[0].state,
+            OperationState::Executing { effect_id: Some(id) } if *id == effect_id
+        ));
+    }
+
+    /// H4: when even compaction cannot make the record fit, the append is
+    /// refused explicitly — and the writer STAYS healthy: the compaction
+    /// that ran inside the rejected append published the new generation,
+    /// the old marker remains a verified ancestor, and later compaction and
+    /// appends work. The sticky fence is never involved.
+    #[test]
+    fn capacity_rejection_after_a_futile_compaction_stays_a_healthy_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        let marker_before = journal.authority_checkpoint_marker().unwrap();
+
+        let _capacity = InjectedWalCapacity::enable(64);
+        let error = journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(&error, AgentError::RecoveryRequired(message) if message.contains("after compaction")),
+            "a still-oversized journal must be refused explicitly after the bounded retry: {error}"
+        );
+        drop(_capacity);
+
+        // The bounded compaction inside the rejected append DID run and
+        // publish generation 2; the old marker is still a verified ancestor
+        // of that state.
+        assert_eq!(journal.authority_checkpoint_marker().unwrap().generation, 2);
+        journal
+            .validate_authority_checkpoint_marker(&marker_before)
+            .unwrap();
+
+        // The writer was never fenced.
+        assert_eq!(journal.recover().unwrap().last_seq, 2);
+        let marker = journal.compact().unwrap();
+        assert_eq!(marker.generation, 3);
+
+        // With the quota lifted, the same handle appends normally on top of
+        // the twice-compacted journal.
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(journal.recover().unwrap().last_seq, 3);
+    }
+
+    /// H4 negative control: a torn write (payload bytes landed, newline did
+    /// not) still fences the writer strictly — every operation on the
+    /// handle is refused — and only a fresh open repairs the tail and
+    /// restores service.
+    #[test]
+    fn partial_write_failure_still_fences_the_writer_until_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        let good_len = fs::metadata(&path).unwrap().len();
+
+        let _fault = InjectedWritePhaseFault::torn_tail();
+        let error = journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(&error, AgentError::Storage(message) if message.contains("failed permanently")),
+            "a torn write must fence the writer: {error}"
+        );
+        drop(_fault);
+
+        // The payload bytes reached the WAL without the newline: the tail
+        // is torn, so the file is longer than the last good frame.
+        assert!(fs::metadata(&path).unwrap().len() > good_len);
+
+        // The fence is sticky: appends, compaction, the marker and recovery
+        // queries are all refused on this handle.
+        assert!(matches!(
+            journal.append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            ))),
+            Err(AgentError::Storage(_))
+        ));
+        assert!(
+            matches!(journal.compact(), Err(AgentError::Storage(_))),
+            "compaction must stay refused behind the write-phase fence"
+        );
+        assert!(matches!(journal.recover(), Err(AgentError::Storage(_))));
+        assert!(matches!(
+            journal.authority_checkpoint_marker(),
+            Err(AgentError::Storage(_))
+        ));
+
+        // A fresh open repairs the torn tail: the journal serves the last
+        // good prefix and appends work again.
+        drop(journal);
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert!(recovery.truncated_tail);
+        assert_eq!(recovery.last_seq, 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), good_len);
+        reopened
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(reopened.recover().unwrap().last_seq, 2);
+    }
+
+    /// H4 negative control: a durability-barrier failure (complete frame in
+    /// the file, `sync_all` failed) still fences the writer strictly —
+    /// compaction is refused — and a fresh open reconciles from disk truth,
+    /// which may already contain the unsynced frame.
+    #[test]
+    fn sync_failure_still_fences_the_writer_until_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+
+        let _fault = InjectedWritePhaseFault::before_sync();
+        let error = journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(&error, AgentError::Storage(message) if message.contains("failed permanently")),
+            "an unsynced frame must fence the writer: {error}"
+        );
+        drop(_fault);
+
+        // Compaction is refused on the fenced handle — the fence did not
+        // get looser because the bytes happened to be complete.
+        assert!(
+            matches!(journal.compact(), Err(AgentError::Storage(_))),
+            "compaction must stay refused behind the write-phase fence"
+        );
+        assert!(matches!(
+            journal.append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            ))),
+            Err(AgentError::Storage(_))
+        ));
+
+        // Recovery owns the truth: the complete, checksummed frame is
+        // served by a fresh open even though sync_all never returned.
+        drop(journal);
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert!(!recovery.truncated_tail);
+        assert_eq!(recovery.last_seq, 2);
+        reopened
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(reopened.recover().unwrap().last_seq, 3);
     }
 
     fn envelope(run_id: RunId) -> RuntimeEventEnvelope {
