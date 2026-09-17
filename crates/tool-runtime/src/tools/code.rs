@@ -25,7 +25,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use super::{Tool, display_relative, hidden_path_output, ordinary_view_blocked, walk_files};
+use super::{
+    Tool, coverage_footer, display_relative, hidden_path_output, ordinary_view_blocked, walk_files,
+    with_coverage_footer,
+};
 
 // ---------------------------------------------------------------------------
 // `code.symbols`
@@ -413,15 +416,22 @@ impl Tool for CodeSymbolsTool {
         let mut symbols: Vec<(String, usize, usize, String, String)> = Vec::new();
         let mut scanned_files = 0usize;
         let mut clipped_names = 0usize;
+        // F6: coverage accounting for the model-visible body — how far the
+        // scan actually got, and why it stopped where it did.
+        let mut examined_files = 0usize;
+        let mut unread_files = 0usize;
+        let collected_files = files.len();
 
         'files: for file in files {
             if cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
             }
+            examined_files += 1;
             let relative = display_relative(&self.workspace, &file);
             let Some(text) =
                 super::read_confined_utf8(&self.workspace, &relative, MAX_BYTES_PER_FILE).await?
             else {
+                unread_files += 1;
                 continue;
             };
             let Some(extension) = extension_of(&file) else {
@@ -491,33 +501,81 @@ impl Tool for CodeSymbolsTool {
             })
             .unwrap_or_default();
 
+        // F6: the body-level coverage statement. `scan_incomplete` metadata
+        // never reaches the model, and "no symbols found" reads the same
+        // whether the walk finished or stopped at its cap — the model sees
+        // only `model_content`, so a known partial scan must say so there:
+        // the scanned scope, the stop reason, the unsearched candidates
+        // (distinct from the display cap of a full list), and — since there
+        // is no scan-resume implementation — an honest next step instead of
+        // a continuation. A complete small scan gets no footer at all.
+        let scan_incomplete = walk_incomplete || symbols.len() >= limit;
+        let coverage = if scan_incomplete {
+            let mut clauses = Vec::new();
+            if walk_incomplete {
+                clauses.push(
+                    "the candidate file walk stopped at its cap; files beyond it were never searched"
+                        .to_string(),
+                );
+            }
+            if symbols.len() >= limit {
+                let unexamined = collected_files - examined_files;
+                let rest = if unexamined > 0 {
+                    format!("{unexamined} candidate files were not searched")
+                } else {
+                    "the rest of the file was not collected".to_string()
+                };
+                clauses.push(format!(
+                    "the scan stopped at the {limit}-symbol result cap; {rest}"
+                ));
+            }
+            clauses.push(format!(
+                "partial scan: {scanned_files} source files searched, {unread_files} unreadable or oversized files skipped"
+            ));
+            if symbols.len() > model_rows.len() {
+                clauses.push(format!(
+                    "the rows above are the first {} of {} symbols (display cap); the full list is in the artifact reference above",
+                    model_rows.len(),
+                    symbols.len()
+                ));
+            }
+            clauses.push(
+                "there is no scan continuation; narrow the scan with a path subdirectory or a query filter"
+                    .to_string(),
+            );
+            coverage_footer(clauses)
+        } else {
+            None
+        };
+        let model_body = if model_rows.is_empty() {
+            "no symbols found".to_string()
+        } else {
+            format!(
+                "{}{}",
+                model_rows
+                    .iter()
+                    .map(|(path, line, column, kind, name)| {
+                        format!("{path}:{line}:{column}  {kind} {name}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                truncated_note
+            )
+        };
+
         Ok(ToolOutcome::Value(
             ToolOutput {
                 call_id: call_id.into(),
                 tool_name: "code.symbols".into(),
                 ok: true,
                 summary: format!("{} symbols across {} files", symbols.len(), scanned_files),
-                model_content: if model_rows.is_empty() {
-                    "no symbols found".to_string()
-                } else {
-                    format!(
-                        "{}{}",
-                        model_rows
-                            .iter()
-                            .map(|(path, line, column, kind, name)| {
-                                format!("{path}:{line}:{column}  {kind} {name}")
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                        truncated_note
-                    )
-                },
+                model_content: with_coverage_footer(model_body, coverage),
                 artifact_ref,
                 metadata: json!({
                     "symbols": symbols.len(),
                     "files_scanned": scanned_files,
                     "clipped_names": clipped_names,
-                    "scan_incomplete": walk_incomplete || symbols.len() >= limit,
+                    "scan_incomplete": scan_incomplete,
                     "returned": model_rows.len(),
                     "has_more": has_more,
                     "next_start_line": has_more.then_some(model_rows.len() + 1),
@@ -896,6 +954,158 @@ mod tests {
             .await
             .unwrap();
         value(outcome)
+    }
+
+    /// Run code.symbols through the REAL trusted output broker, exactly as
+    /// the kernel does before the output reaches the actor. F6 is about the
+    /// final model-visible body, so the red cases assert on the brokered
+    /// `model_content`, never on metadata alone.
+    async fn execute_symbols_through_broker(
+        workspace: &Workspace,
+        run_id: RunId,
+        args: Value,
+    ) -> ToolOutput {
+        let tool = CodeSymbolsTool::new(workspace.clone());
+        let outcome = tool
+            .execute(run_id, "c", args, None, CancellationToken::new())
+            .await
+            .unwrap();
+        let output = value(outcome);
+        use agent_contracts::OutputBroker as _;
+        agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace.clone()))
+            .bound(run_id, None, output)
+            .await
+    }
+
+    /// F6 红例：空命中但候选文件遍历不完整。正文必须说明这是部分扫描、
+    /// 停止原因与诚实的下一步——不能让「扫完没找到」和「只扫了一部分没
+    /// 找到」在模型看来是同一句话。
+    #[tokio::test]
+    async fn an_incomplete_walk_reports_the_partial_scan_in_the_body() {
+        let (workspace, dir) = temp_workspace().await;
+        let many = dir.path().join("many");
+        std::fs::create_dir_all(&many).unwrap();
+        for index in 0..MAX_FILES_SCANNED + 10 {
+            std::fs::write(many.join(format!("f{index}.rs")), "").unwrap();
+        }
+
+        let output =
+            execute_symbols_through_broker(&workspace, RunId::new(), json!({"query": "zzz"})).await;
+        assert!(output.ok);
+        assert_eq!(output.metadata["symbols"], 0);
+        assert_eq!(output.metadata["scan_incomplete"], true);
+        assert!(
+            output.model_content.contains("no symbols found"),
+            "{}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("[coverage]"),
+            "an incomplete walk must reach the model body, not only metadata: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("never searched"),
+            "the stop reason must name the unsearched files: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("no scan continuation"),
+            "without a real scan-resume the next step must be honest: {}",
+            output.model_content
+        );
+    }
+
+    /// F6 红例：命中达到 limit，扫描提前停止。正文必须给出停止原因与未
+    /// 搜索的候选文件数——「只显示了前 K 个」替代不了「没扫完」。
+    #[tokio::test]
+    async fn a_result_cap_stop_names_the_unsearched_candidates_in_the_body() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        let body = (0..250)
+            .map(|i| format!("fn func_{i}() {{}}\n"))
+            .collect::<String>();
+        write(&root, "big.rs", &body).await;
+
+        let output =
+            execute_symbols_through_broker(&workspace, RunId::new(), json!({"limit": 10})).await;
+        assert!(output.ok);
+        assert_eq!(output.metadata["symbols"], 10);
+        assert_eq!(output.metadata["scan_incomplete"], true);
+        assert!(output.model_content.contains("fn func_9"));
+        assert!(
+            output.model_content.contains("result cap"),
+            "the scan-coverage gap must be in the body: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("not collected"),
+            "the body must say symbols beyond the cap were not collected: {}",
+            output.model_content
+        );
+    }
+
+    /// F6：既有结果又被 limit 截断时，正文必须同时、区分地给出「显示上
+    /// 限」（前 K 个＋完整列表工件）与「扫描覆盖」（limit 处停止）。
+    #[tokio::test]
+    async fn the_body_separates_display_cap_from_scan_coverage() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        let body = (0..250)
+            .map(|i| format!("fn func_{i}() {{}}\n"))
+            .collect::<String>();
+        write(&root, "big.rs", &body).await;
+
+        let output =
+            execute_symbols_through_broker(&workspace, RunId::new(), json!({"limit": 150})).await;
+        assert!(output.ok);
+        assert_eq!(output.metadata["symbols"], 150);
+        assert!(output.artifact_ref.is_some());
+        // Display cap: the first 100 of 150, full list spilled.
+        assert!(
+            output.model_content.contains("50 more symbols"),
+            "display-cap note must stay: {}",
+            output.model_content
+        );
+        // Scan coverage: distinct fact, also in the body.
+        assert!(
+            output.model_content.contains("result cap"),
+            "the scan-coverage stop must be in the body too: {}",
+            output.model_content
+        );
+        assert!(
+            !output.model_content.contains("never searched"),
+            "the walk itself completed here: {}",
+            output.model_content
+        );
+    }
+
+    /// 对照：小型完整扫描的输出语义不变——命中只有符号行；空工作区的完
+    /// 整扫描就是朴素的 "no symbols found"，没有 coverage 脚注。
+    #[tokio::test]
+    async fn a_small_complete_scan_keeps_its_plain_output() {
+        let (workspace, _dir) = temp_workspace().await;
+        let root = workspace.root().to_path_buf();
+        write(
+            &root,
+            "src/lib.rs",
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        )
+        .await;
+
+        let hits = execute_symbols_through_broker(&workspace, RunId::new(), json!({})).await;
+        assert_eq!(hits.metadata["scan_incomplete"], false);
+        assert!(hits.model_content.contains("fn one"));
+        assert!(
+            !hits.model_content.contains("[coverage]"),
+            "a complete small scan stays plain: {}",
+            hits.model_content
+        );
+
+        let (empty, _empty_dir) = temp_workspace().await;
+        let none = execute_symbols_through_broker(&empty, RunId::new(), json!({})).await;
+        assert_eq!(none.metadata["scan_incomplete"], false);
+        assert_eq!(none.model_content, "no symbols found");
     }
 
     #[tokio::test]
