@@ -356,12 +356,17 @@ fn attest_sandbox(
         }
         actual.process_count_quota = windows_job;
         if actual.process_count_quota {
-            evidence.process_count_quota = Some("job object active-process count quota".into());
+            evidence.process_count_quota = Some(
+                "job object (assigned before the child's first instruction) \
+                 active-process count quota"
+                    .into(),
+            );
         }
         actual.memory_quota = windows_job && sandbox.job_max_memory_bytes > 0;
         if actual.memory_quota {
             evidence.memory_quota = Some(format!(
-                "job object memory={} bytes",
+                "job object (assigned before the child's first instruction) \
+                 memory={} bytes",
                 sandbox.job_max_memory_bytes
             ));
         }
@@ -527,35 +532,42 @@ impl ProcessHost {
         // child — a runaway subprocess must not survive its caller.
         #[cfg(unix)]
         command.process_group(0);
-        // Sandbox (Windows): create the Job-Object before spawning so the
-        // child is assigned in the same breath as it starts. The kernel
-        // enforces the active-process and per-process-memory ceilings and
-        // kills the whole tree when the handle closes.
+        // Sandbox (Windows): create the Job-Object before spawning, then
+        // spawn the child through the contained-spawn entry: CREATE_SUSPENDED,
+        // the required job assignment while the child has not executed a
+        // single instruction, and only then the confirmed resume. A
+        // descendant born before the assignment never joins the job and
+        // survives the job's host-death kill, so the assignment must
+        // precede any target code. A refused assignment (nested-job
+        // confinement, a reached ceiling) or an unconfirmed resume fails
+        // closed: the never-running child is killed and its death
+        // confirmed within a bound, and a typed error refuses the
+        // connection. An outer job may already confine this tree — the
+        // refusal states only that the configured inner containment was
+        // not established, never that the tree would have escaped.
         #[cfg(windows)]
         let created_job = job_object::create_job_object(&config.sandbox)?;
+        #[cfg(windows)]
+        let mut child = {
+            let required_job = created_job.as_ref().map(JobObject::raw_handle);
+            match crate::contained_spawn::spawn_contained(&mut command, required_job) {
+                Ok(child) => child,
+                Err(error) => {
+                    return Err(map_contained_spawn_error(error, &config.program));
+                }
+            }
+        };
+        #[cfg(not(windows))]
         let mut child = command
             .spawn()
             .map_err(|e| AgentError::Context(format!("spawn '{}': {e}", config.program)))?;
         let pid = child.id().unwrap_or(0);
 
-        // Sandbox (Windows): assign the child to the Job-Object. When the
-        // kernel refuses (outer Job-Object confinement on CI runners, or a
-        // ceiling), degrade to no job rather than failing the connection —
-        // the child still runs under env/cwd hardening, it just loses the
-        // Windows quota layer here.
+        // Assignment (when a job was required) and resume were both
+        // confirmed by the contained-spawn entry, so `job` is exactly the
+        // established containment — never "a job object was created".
         #[cfg(windows)]
-        let job = match created_job {
-            Some(created) => match created.assign(pid) {
-                Ok(true) => Some(created),
-                Ok(false) | Err(_) => {
-                    eprintln!(
-                        "job object assign skipped: process {pid} is already confined by an outer job"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
+        let job = created_job;
 
         let attestation = attest_sandbox(
             &config.sandbox,
@@ -1390,6 +1402,32 @@ fn bounded_progress_note(response: &Value) -> String {
     note.chars().take(MAX_PROGRESS_NOTE_CHARS).collect()
 }
 
+/// Map a contained-spawn refusal to the host's typed error surface. A
+/// refusal whose fail-closed recovery confirmed the child's death is a
+/// sandbox-establishment refusal; a recovery that could not observe the
+/// death is a recovery concern (the pid may still need attention), never
+/// a clean refusal.
+#[cfg(windows)]
+fn map_contained_spawn_error(
+    error: crate::contained_spawn::ContainedSpawnError,
+    program: &str,
+) -> AgentError {
+    match error {
+        crate::contained_spawn::ContainedSpawnError::Spawn(io) => {
+            AgentError::Context(format!("spawn '{program}': {io}"))
+        }
+        crate::contained_spawn::ContainedSpawnError::Containment(failure) => {
+            if failure.death_confirmed() {
+                AgentError::Context(format!("process '{program}' refused: {failure}"))
+            } else {
+                AgentError::RecoveryRequired(format!(
+                    "process '{program}' refused; the never-running child's death was not confirmed: {failure}"
+                ))
+            }
+        }
+    }
+}
+
 /// Kill a process and every descendant, without touching the caller's own
 /// process group. A cancelled or timed-out operation must not leave a
 /// runaway subtree alive — the child's own side effects (spawned
@@ -1438,7 +1476,7 @@ mod job_object {
     use super::{AgentError, AgentResult, ProcessSandbox};
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
         JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOB_OBJECT_LIMIT_PRIORITY_CLASS, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -1460,11 +1498,21 @@ mod job_object {
     unsafe impl Sync for JobObject {}
 
     impl JobObject {
+        /// The raw job handle, borrowed (the `JobObject` keeps ownership).
+        /// The contained-spawn entry performs the required assignment
+        /// through it before the child resumes.
+        pub(crate) fn raw_handle(&self) -> HANDLE {
+            self.0
+        }
+
         /// Assign one process (by pid) to this job. `Ok(false)` means the
         /// kernel refused the assignment — most commonly because the
         /// process already belongs to an outer Job-Object (CI runners
         /// confine every process under one), which blocks nesting, or the
-        /// active-process ceiling is already reached.
+        /// active-process ceiling is already reached. The production spawn
+        /// path assigns through the child's owned handle instead (the
+        /// contained-spawn entry) and fails closed on a refusal; this
+        /// pid-based wrapper remains for direct job-quota tests.
         pub fn assign(&self, pid: u32) -> AgentResult<bool> {
             unsafe {
                 let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
@@ -1473,9 +1521,9 @@ mod job_object {
                         "open process {pid} to assign the job object failed"
                     )));
                 }
-                let assigned = AssignProcessToJobObject(self.0, process);
+                let assigned = crate::contained_spawn::assign_process_handle(self.0, process);
                 let _ = CloseHandle(process);
-                Ok(assigned != 0)
+                Ok(assigned)
             }
         }
 
@@ -1777,8 +1825,10 @@ mod tests {
     fn job_object_assigns_and_terminates() {
         // Assigning a real process to the sandbox's Job-Object must let the
         // host terminate it in one kernel call. Skipped (not failed) when
-        // the runner itself is confined by an outer Job-Object — CI runners
-        // cannot nest, and the production path degrades the same way.
+        // the runner itself is confined by an outer Job-Object that blocks
+        // nesting — the production spawn path no longer degrades that way:
+        // it refuses the connection fail-closed when the required
+        // assignment is refused.
         use super::job_object::create_job_object;
         let sandbox = ProcessSandbox {
             process_limit: 4,
@@ -1823,7 +1873,9 @@ mod tests {
     fn job_object_caps_active_processes() {
         // The kernel enforces the active-process ceiling: once one job
         // holds its limit, assigning another process to it fails. Skipped
-        // (not failed) under an outer job on CI runners.
+        // (not failed) under an outer job on CI runners. In production this
+        // refusal is fail-closed: the contained spawn recovers the
+        // never-running child and surfaces a typed error.
         use super::job_object::create_job_object;
         let sandbox = ProcessSandbox {
             process_limit: 2,
@@ -1866,6 +1918,80 @@ mod tests {
         let _ = second.wait();
         let _ = third.kill();
         let _ = third.wait();
+    }
+
+    /// Entry-level host-death containment: a child spawned through the
+    /// contained-spawn entry spawns its descendant immediately; closing
+    /// the only job handle (what a dead host process does, no explicit
+    /// terminate) must kill both — proof that the required assignment,
+    /// established before the child ran, covers descendants born right
+    /// after the confirmed resume. PID-reuse-safe via creation tokens.
+    #[cfg(windows)]
+    #[test]
+    fn contained_spawn_job_close_kills_descendants_born_after_the_resume() {
+        use super::job_object::create_job_object;
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = ProcessSandbox {
+            process_limit: 4,
+            ..ProcessSandbox::default()
+        };
+        let job = create_job_object(&sandbox)
+            .expect("create the job")
+            .expect("a quota was requested");
+        let probe = resolve_program(Some("CARGO_BIN_EXE_sandbox_probe"), "sandbox_probe");
+        let mut command = std::process::Command::new(&probe);
+        command
+            .args(["tree", dir.path().to_str().expect("utf-8 tempdir")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child =
+            crate::contained_spawn::spawn_contained(&mut command, Some(job.raw_handle()))
+                .expect("the contained spawn must succeed with a valid job");
+        let pidfile = dir.path().join("tree.pids");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (child_pid, descendant_pid) = loop {
+            if let Ok(content) = std::fs::read_to_string(&pidfile)
+                && let Some((first, second)) = content.lines().next().zip(content.lines().nth(1))
+                && let (Ok(child_pid), Ok(descendant_pid)) = (first.parse(), second.parse())
+            {
+                break (child_pid, descendant_pid);
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tree fixture never published its pids"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        let child_token = crate::capture_process_identity(child_pid)
+            .expect("capture the child identity")
+            .identity_token;
+        let descendant_token = crate::capture_process_identity(descendant_pid)
+            .expect("capture the descendant identity")
+            .identity_token;
+        // Host death: close the only job handle without terminating.
+        drop(job);
+        let assert_gone = |pid: u32, token: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                match crate::inspect_process(pid).expect("observe the process") {
+                    crate::ProcessState::Exited => return,
+                    crate::ProcessState::Running(identity) if identity.identity_token != token => {
+                        return;
+                    }
+                    crate::ProcessState::Running(_) => {}
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "pid {pid} survived the job-handle close"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        };
+        assert_gone(child_pid, &child_token);
+        assert_gone(descendant_pid, &descendant_token);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// A chatty child must not grow the parent's memory or flood the

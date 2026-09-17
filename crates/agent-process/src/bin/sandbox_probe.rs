@@ -1,5 +1,5 @@
 //! Probe binary for OS sandbox tests (`tests/landlock.rs`,
-//! `tests/integrity.rs`, `tests/rlimits.rs`).
+//! `tests/integrity.rs`, `tests/rlimits.rs`, `tests/containment.rs`).
 //!
 //! Usage:
 //! - `sandbox_probe <write-root> <denied-dir>` — write-fence checks
@@ -13,6 +13,12 @@
 //!   `no_new_privs` after sandbox `pre_exec`
 //! - `sandbox_probe jobmem` — print this process's Job-Object commit ceiling
 //! - `sandbox_probe jobprio` — print this process's Job-Object priority class
+//! - `sandbox_probe tree <dir>` — spawn `sandbox_probe park` immediately and
+//!   write `<dir>/tree.pids` ("self\ndescendant\n"), then park: the
+//!   containment regressions use this to prove a job established before the
+//!   child ran covers descendants born right after resume
+//! - `sandbox_probe park` — sleep without exiting (the tree fixture's
+//!   descendant)
 //!
 //! Write-fence: under a landlock / Low-IL confinement with `write-root`
 //! as the only write root, the probe must create a file inside
@@ -37,14 +43,47 @@ fn main() {
         [_, cmd] if cmd == "pri" => pri_main(),
         [_, cmd] if cmd == "jobmem" => jobmem_main(),
         [_, cmd] if cmd == "jobprio" => jobprio_main(),
+        [_, cmd] if cmd == "park" => park_main(),
+        [_, cmd, dir] if cmd == "tree" => tree_main(dir),
         [_, write_root, denied] => write_fence_main(write_root, denied),
         _ => {
             eprintln!(
-                "usage: sandbox_probe <write-root> <denied-dir>\n       sandbox_probe alloc <bytes>\n       sandbox_probe fsize <path> <bytes>\n       sandbox_probe signal <pid>\n       sandbox_probe nofile <count>\n       sandbox_probe inherit-fd <fd>\n       sandbox_probe core\n       sandbox_probe pri\n       sandbox_probe jobmem\n       sandbox_probe jobprio"
+                "usage: sandbox_probe <write-root> <denied-dir>\n       sandbox_probe alloc <bytes>\n       sandbox_probe fsize <path> <bytes>\n       sandbox_probe signal <pid>\n       sandbox_probe nofile <count>\n       sandbox_probe inherit-fd <fd>\n       sandbox_probe core\n       sandbox_probe pri\n       sandbox_probe jobmem\n       sandbox_probe jobprio\n       sandbox_probe tree <dir>\n       sandbox_probe park"
             );
             std::process::exit(2);
         }
     }
+}
+
+/// The containment-fixture descendant: never exit on its own. Killed only
+/// by the job the regressions prove covers it.
+fn park_main() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+/// The containment-fixture parent: spawn the park descendant immediately
+/// (the earliest possible descendant birth), publish both pids, then park.
+/// `tree.pids` has two lines: this process, then the descendant.
+fn tree_main(dir: &str) -> ! {
+    let exe = std::env::current_exe().expect("locate the probe executable");
+    // The park descendant is the containment fixture: it must stay alive
+    // until the regressions kill it through the job. Never waited on
+    // purpose (and on Windows an unwaited child is reaped by the kernel,
+    // not a zombie).
+    #[allow(clippy::zombie_processes)]
+    let descendant = std::process::Command::new(&exe)
+        .arg("park")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the park descendant");
+    let pids = format!("{}\n{}\n", std::process::id(), descendant.id());
+    std::fs::write(std::path::Path::new(dir).join("tree.pids"), pids)
+        .expect("write tree.pids into the given directory");
+    park_main()
 }
 
 fn alloc_main(bytes: &str) {

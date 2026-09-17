@@ -24,6 +24,8 @@ mod supervisor;
 pub mod watchdog;
 
 #[cfg(windows)]
+mod contained_spawn;
+#[cfg(windows)]
 pub mod integrity;
 #[cfg(target_os = "linux")]
 pub mod landlock;

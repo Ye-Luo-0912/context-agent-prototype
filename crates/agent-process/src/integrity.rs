@@ -18,6 +18,11 @@
 //! stays unset. ProcessHost's job covers the wrap process; this job
 //! covers the program the wrap CreateProcess-es (stdio MCP children take
 //! this path on Windows).
+//!
+//! The real child is created suspended and assigned to this job before it
+//! executes a single instruction (the shared `contained_spawn` entry); a
+//! refused assignment or an unconfirmed resume recovers the never-running
+//! child fail-closed instead of leaving an uncontained child running.
 
 use std::ffi::OsString;
 use std::io;
@@ -26,7 +31,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
 use windows_sys::Win32::Security::{
     ACL, ACL_REVISION, AddMandatoryAce, CONTAINER_INHERIT_ACE, CreateWellKnownSid, GetLengthSid,
@@ -34,7 +39,7 @@ use windows_sys::Win32::Security::{
     TOKEN_ADJUST_DEFAULT, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, WinLowLabelSid,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+    CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -43,8 +48,7 @@ use windows_sys::Win32::System::SystemServices::{
     SE_GROUP_INTEGRITY, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, NORMAL_PRIORITY_CLASS, OpenProcess, OpenProcessToken, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE,
+    GetCurrentProcess, NORMAL_PRIORITY_CLASS, OpenProcessToken,
 };
 
 /// First argument that turns this executable into the Low-IL wrap.
@@ -151,17 +155,22 @@ fn run_wrap(args: &[OsString]) -> i32 {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            eprintln!(
-                "integrity wrap: spawn '{}': {error}",
-                Path::new(program).display()
-            );
-            return 1;
-        }
-    };
-    let _ = assign_pid_to_job(job.as_raw_handle(), child.id());
+    // Contained spawn (C0 pattern): the real child is created suspended, so
+    // it cannot run — or spawn descendants — before the wrap's job
+    // assignment. The assignment result is checked (never ignored) and the
+    // resume is confirmed; on either failure the never-running child is
+    // killed, its death is confirmed within a bound, and the wrap exits
+    // nonzero — no runnable child is left behind. An outer job may still
+    // confine the tree; the refusal only states that this wrap's own job
+    // was not established before the child would have run.
+    let mut child =
+        match crate::contained_spawn::spawn_contained(&mut command, Some(job.as_raw_handle())) {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("integrity wrap: {error}");
+                return 1;
+            }
+        };
     match child.wait() {
         Ok(status) => status.code().unwrap_or(1),
         Err(_) => 1,
@@ -281,17 +290,5 @@ fn create_wrap_job() -> io::Result<OwnedHandle> {
             return Err(io::Error::last_os_error());
         }
         Ok(job)
-    }
-}
-
-fn assign_pid_to_job(job: HANDLE, pid: u32) -> bool {
-    unsafe {
-        let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
-        if process.is_null() {
-            return false;
-        }
-        let assigned = AssignProcessToJobObject(job, process);
-        let _ = CloseHandle(process);
-        assigned != 0
     }
 }

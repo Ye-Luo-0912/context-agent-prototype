@@ -105,6 +105,39 @@ async fn server_loop() {
         let _ = writeln!(sink, "STDERR_TAIL_MARKER");
     }
 
+    // Containment test hook: when the parent injects
+    // `MOCK_DESCENDANT_PIDFILE=<path>`, the mock spawns `sandbox_probe
+    // park` immediately at startup and writes "<self>\n<descendant>\n" to
+    // the path. The descendant is born as early as any target code can
+    // manage, so a Windows job established only after the child started
+    // running cannot cover it — the containment regressions kill the host
+    // and require both pids gone.
+    if let Ok(pidfile) = std::env::var("MOCK_DESCENDANT_PIDFILE") {
+        let probe = agent_process::probe_siblings(
+            &std::env::current_exe().expect("current exe"),
+            if cfg!(windows) {
+                "sandbox_probe.exe"
+            } else {
+                "sandbox_probe"
+            },
+        )
+        .expect("locate sandbox_probe next to mock_host");
+        // The park descendant is the containment fixture: it must stay
+        // alive until the regressions kill it through the job. Never
+        // waited on purpose (and on Windows an unwaited child is reaped
+        // by the kernel, not a zombie).
+        #[allow(clippy::zombie_processes)]
+        let descendant = std::process::Command::new(probe)
+            .arg("park")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the park descendant");
+        let pids = format!("{}\n{}\n", std::process::id(), descendant.id());
+        std::fs::write(&pidfile, pids).expect("write the descendant pidfile");
+    }
+
     if let Ok(path) = std::env::var("MOCK_HEARTBEAT") {
         let path = std::path::PathBuf::from(path);
         // A dedicated thread, decoupled from the tokio runtime: the
