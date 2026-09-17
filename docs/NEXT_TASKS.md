@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**当前开工顺序（第九批）：C0 Windows 清理失败调查先行；取回切片（F1/F2/F6）与参数契约切片（F3/F4）并行；F5 通用进程发送取消单独收口；KV 生产装配序列推进（不等非阻塞观察清零）。** C（续）端点侧与条件任务 T8（需授权预算/凭据）保持 NOT_RUN。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**第九批已全部关闭（2026-09-17，本地集成回归全绿；CI 收尾见 CURRENT.md）。** 剩余：条件任务 T8（需授权预算/凭据；含 KV 端点三态 NOT_RUN 的补测与 `context_manage` 租赁进出对供应商复用边界的影响核对），以及 C0 回执指出的同构 spawn→assign 窗口（agent-process `create_job_object`、`integrity.rs`）的后续同模式收口。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -244,14 +244,16 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 ### T8 — 条件性供应商成本对照
 **先有 R2 的完整结算**再测真实供应商，否则只比较最终成功调用会漏掉失败/取消成本（取消频繁的长任务成本可能被低估）。场景固定同一任务/起点/验收，至少覆盖前缀稳定、动态尾部、文件版本变化、checkpoint、维护、失败重试与取消补账；报告 uncached/read/write/output、主/维护调用、尝试数、未知覆盖与任务质量。无授权/凭据/预算则 `NOT_RUN`，不借用环境密钥发起付费实验。
 
-## 第九批（`71f8a586` 续审：C0 调查先行；取回与契约并行；进程取消与 KV 序列随后）
+## 第九批（`71f8a586` 续审）——已全部关闭（2026-09-17，回执见各条目）
 
 审查基线 `71f8a586`（报告：[REVIEW.md](reviews/2026-09-16-review-71f8a586/REVIEW.md)，任务：[NEXT_ACTIONS.md](reviews/2026-09-16-review-71f8a586/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-16-review-71f8a586/COVERAGE.md)，CI 摘录：[CI_OBSERVATION.md](reviews/2026-09-16-review-71f8a586/CI_OBSERVATION.md)，schema 回归规格：[SCHEMA_CASES.json](reviews/2026-09-16-review-71f8a586/SCHEMA_CASES.json)）。主线：**返回的"继续"必须真的可执行、位置正确；已接受的约束不能被编译丢弃；取消要覆盖正在发生的写 I/O。** CI run `35156892711` Windows full Rust test 已实际失败（C0），不与本轮静态发现混为同一根因。审查环境未执行 Rust 测试，红-first 由实施补；上轮 E1–E4、O1/O2、C 线修复保留不重开。GUI 后置不变。
 
-### C0 — Windows 验证进程树清理失败（调查先行，agent-compose＋监督实现）
-现状：run `35156892711` job `104999146984`，`crates/agent-compose/tests/proof_supervision.rs:116` 的 `killing_the_rust_host_cleans_the_exact_proof_tree_without_a_completion_receipt` 在 `proof_supervision.rs:171` 报 leader 已 `Exited` 而同 `identity_token` 成员 20 秒仍 `Running`。测试用真实 `crash_child` 主动杀宿主，identity 检查防 PID 重用，等待窗口刻意短于 worker 自退出——**不许延长到 worker 自退出、不许 ignore、不许移除成员检查、不以一次重跑成功或 Linux 通过宣称修复**。本机为 Windows 且工具链齐全，先本地复现：`cargo test -p agent-compose --test proof_supervision -- --nocapture --test-threads 1`（远端日志可用 `gh run view 35156892711 --log-failed` 取回）。沿 Job 关联、子进程创建/继承、containment 建立时点、宿主死亡顺序核对，补必要的有界可归因回执。停止：故障机制被解释并有回归，或明确保留未解决阻塞与证据；不新建进程框架，不牵连无关功能重写。
+### C0 — Windows 验证进程树清理失败（agent-compose＋tool-runtime）——已关闭（2026-09-17，`2e70efc9`）
+落地回执：[C0_PROOF_SUPERVISION_RECEIPT](reviews/2026-09-16-review-71f8a586/C0_PROOF_SUPERVISION_RECEIPT.md)。根因因果确认：`crates/tool-runtime/src/tools/process.rs` 里子进程 spawn 与 `AssignProcessToJobObject` 之间存在窗口，窗口内出生的 member 不入 host-death job——宿主被 TerminateProcess 后 KILL_ON_JOB_CLOSE 只杀已入 Job 的 leader，member 在 Job 外存活到自身超时。注入 25ms spawn→assign 延迟 3/3 复现 CI 同签名 panic（同 panic 行、leader `Ok(Exited)`、member 同 token `Ok(Running)`）；修复（`CREATE_SUSPENDED` 创建＋assign 完成后确认 resume；不可确认则杀树＋有界确认死亡＋类型化拒绝，fail-closed）后同注入 3/3＋2/2 绿、proof_supervision 10/10 绿。本机不自发复现（16 核低载），远端同二进制哈希 20:52 过/22:26 挂证明间歇性，与窗口竞态一致。残余（同缺陷类、不在本次失败路径，留后续同模式收口）：agent-process `create_job_object` 与 `integrity.rs` 的 spawn→assign 窗口。
+原始现状：run `35156892711` job `104999146984`，`proof_supervision.rs:116` 报 leader 已 `Exited` 而同 `identity_token` 成员 20 秒仍 `Running`；测试用真实 `crash_child` 主动杀宿主，identity 检查防 PID 重用。
 
-### F1/F2/F6 — 取回切片：可继续、位置正确、覆盖诚实（tool-runtime，一个切片）
+### F1/F2/F6 — 取回切片：可继续、位置正确、覆盖诚实（tool-runtime）——已关闭（2026-09-17，`33d797d5`/`8053c3b0`/`a6bd208c`）
+落地回执：[F1_F2_F6_RETRIEVAL_RECEIPT](reviews/2026-09-16-review-71f8a586/F1_F2_F6_RETRIEVAL_RECEIPT.md)。F1：`end_line` 改 `Option<usize>`，缺省按 `start_line` 派生 `start..start+199`（checked，溢出干净拒绝），显式范围与 EOF clamp 语义不变，生成/解析同源。F2：新增 `line_byte_offset` 行内原始字节游标（绑定既有 artifact reference，UTF-8 码点边界切割；红例在真实 broker 16k 裁剪后的正文上 verbatim 回放续读参数——经纪截断后仍可继续）；`has_more`/`window_truncated`/EOF 声明一致，截断行尾部不再被跳过。F6：partial 扫描的停止原因/未搜索候选数/显示上限进 coverage footer 正文，不发假 continuation。红绿对照：F1 修复前 2 红、F2 前 7 红、F6 前 3 红，修复后 `cargo test -p tool-runtime` 290/0＋agent-conformance 全绿；变异恢复法承重。限制：8 MiB 扫描预算外仍只读已扫前缀（既有取舍）。
 用户动作：按工具给出的参数一路读取工件（含超长单行尾部）；符号搜索不完整时执行者能从模型正文知道未覆盖范围。
 - F1（`crates/tool-runtime/src/tools/artifact.rs`）：`default_end_line=200` 与 footer 只建议 `start_line=next` 矛盾——照返回参数调用即得 201–200 `invalid line range`。缺省 `end_line` 时按 `start_line` 派生有界终点（checked arithmetic），或返回完整合法继续参数；生成与解析共享类型化语义，兼容旧显式 `end_line`。
 - F2（同文件）：单行超过剩余 capture（≈2 MiB/次、8 MiB 扫描预算）时只存前缀补换行却把 `last_captured_line` 推过整行，`has_more` 不含 `captured_truncated`——3 MiB 单行报 `end of artifact` 且尾部不可达。给超长单行加**绑定不可变工件身份**的字节/行内游标，只有实际展示/消费的位置才推进；UTF-8 边界与原始偏移对应；经最终输出经纪（≈16k）再验证，不出现"预览工件递归替代原尾部"。
@@ -259,16 +261,19 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 - 回归红例（先红后绿）：450+ 行 fixture 用**真实工具返回的 continuation 原样连读**到 sentinel（测试不得代补产品未返回的参数）；3 MiB 单行后半 sentinel 可达、行内游标单调推进；空命中但扫描未完的正文提示；CRLF/UTF-8 多字节/字节上限边界。全部经 producer→broker→最终 tool message 检查。
 - 停止：所有返回继续参数可执行、EOF 有真实依据、小型完整输出保持原语义；不引入向量检索/AST 服务/新存储引擎。
 
-### F3/F4 — 参数契约切片（agent-contracts＋agent-core；两行为分开提交）
+### F3/F4 — 参数契约切片（agent-contracts＋agent-core）——已关闭（2026-09-17，`aa83f65e`/`d84d6ee8`）
+落地回执：[F3_F4_CONTRACT_RECEIPT](reviews/2026-09-16-review-71f8a586/F3_F4_CONTRACT_RECEIPT.md)。F3：`BoundedNode::Bool/Null` 携带 `enum_options` 走 `check_enum`（`enum:[false]` 拒绝 `true`，Core 层测试证明拒绝发生在审批 0 次与 dispatch（PanicDispatcher 不触发）之前）；空 `enum` 编译失败；无 type 节点的 shape 约束（pattern/properties/required 等）改 admission 类型化拒绝（fail-closed——外部 MCP 工具此类 schema 移出 surface 并记 diagnostics），typeless `enum` 与注解保留。F4：边界改 `(-5..=0)`（−6<n≤0），plain 分支重写为严格 ECMA-262 `Number::toString`；阈值两侧＋1e21 两侧＋Appendix B 32 向量（本机 Node 实测生成期望值）＋11,995 采样 bit-pattern 差分 0 mismatch。摘要兼容沿 E2 模式：摘要每次从内存参数派生、恢复重放持久字节不重算，历史 WAL 不动。`cargo test -p agent-contracts` 198/0（+8）、`-p agent-core` 172/0（+17）；变异恢复承重。
+- 原始要点：`NodeType::Bool => BoundedNode::Bool` 丢弃已检查的 `enum_options`；无 type 嵌套 schema 约束退成 `Any` 静默弱化；`(-6..0)` 使 `1e-7` 输出 `0.0000001` 而 JCS/ECMAScript 应为 `1e-7`。
 - F3（`crates/agent-contracts/src/schema_profile.rs`）：`NodeType::Bool => BoundedNode::Bool` 丢弃已读取并检查过的 `enum_options`——`{"type":"boolean","enum":[false]}` 接受 `true`；无 type 嵌套 schema 的 `pattern`/`properties`/`required` 退成 `Any` 静默弱化。保留独立约束或**在 admission 明确拒绝不支持组合**；编译 profile、渲染给模型的 schema、dispatcher gate 三者同义。回归走 compile→validate→Core no-dispatch：`flag=true` 对 `enum[false]` 拒绝且不进审批/执行，合法对照通过；用例规格见 SCHEMA_CASES.json。E2 已修的非精确整数域不重开。
 - F4（`crates/agent-contracts/src/jcs.rs`）：`scientific_from_ryu` 的 `(-6..0).contains(&point)` 使 Ryu 的 `1e-7`/`1.2e-7`/`-1e-7` 被写成 `0.0000001` 等，而 JCS（ECMAScript 数值格式）应为 `1e-7` 等（Node 实测对照在 MECHANISM_CHECKS.json）。修正 plain/scientific 开闭边界；补 Appendix B、指数阈值两侧、正负值、有限浮点 bit-pattern 差分。`ArgumentDigest` 已用于 Core 参数身份——历史持久摘要需明确解释/兼容策略，**不放宽摘要校验、不批量重算旧 WAL**。
 - 回归：`cargo test -p agent-contracts schema_profile`、`-p agent-contracts jcs`、`-p agent-core`。schema mismatch 不得到达审批与执行。
 
-### F5 — 通用进程发送阶段取消（agent-process＋agent-capability-process）
-现状：`crates/agent-process/src/host.rs::exchange_once` 的首次请求发送与 broker 答复发送直接 await `send_encoded_line`，取消检查未覆盖写/flush；子进程握手后停读时，写阻塞只能等外层 30s 请求超时。把写、flush、等待发送权统一纳入剩余期限与取消（抽可复用有界发送机制）。**半帧规则**：可能只发送了一部分就使连接失效、回收子进程、结果如实 Unknown/Cancelled——不复用半帧连接、不自动重发副作用请求、不把停止等待解释为服务端未执行。回归：真实可控子进程握手后停读 stdin，合同上限内的大请求先确认写因背压停住再取消，须在取消预算内结束（非 30s）；broker 大答复同样覆盖；写前取消保持连接可用。MCP 的 cancel-during-write 通过属另一实现，不替代本路径、不被本发现重开。
+### F5 — 通用进程发送阶段取消（agent-process＋agent-capability-process）——已关闭（2026-09-17，`d336e5ef`/`e27d13bb`）
+落地回执：[F5_PROCESS_SEND_CANCEL_RECEIPT](reviews/2026-09-16-review-71f8a586/F5_PROCESS_SEND_CANCEL_RECEIPT.md)。`FramedProtocolSession::send_bounded` 统一首次请求/broker 答复/cancel 帧三处写入的期限＋取消（biased select、取消优先），`Abandoned` 如实表示半帧并 poison＋kill_tree，不对对端是否执行作断言；等待发送权（transport Mutex）纳入同一期限；写前取消零字节过线、连接可复用的既有语义有守卫测试。真实 `mock_host` 新增停读模式（消费恰好 N 字节后停读，快照即部分写入证据）：256 KiB 帧阻塞写＋取消实测 ~0.6s（对照 30s 超时）。`--test host` 28/28、capability_process 26/26、conformance adapter_fault_matrix 11/11；三处变异复验。限制：锁等待期限分支无直接测试（防御性收口）；一次共享 CPU 下的偶发超界经负载对比确认非语义回归（22 连绿）。
+原始现状：`exchange_once` 首次请求与 broker 答复直接 await `send_encoded_line`，取消检查未覆盖写/flush；子进程停读时只能等外层 30s 超时。
 
-### KV — 生产装配序列验收（agent-compose 测试层；承接第八批 C 续）
-保留 `provider-openai/src/task_sequence_tests.rs` 手工矩阵与既有 `two_production_requests…` smoke（不推翻）。在 `agent-compose/tests` 层延长**同 TaskId/workspace** 的生产轨迹：真实读取/工件续读→新证据进入→焦点改变→文件版本改变→工具撤销→checkpoint/恢复→失败/取消结算；逐步捕获最终 HTTP，核对工具表、稳定前缀、首个差异原因、有效正文完整性与已知/未知 usage。fixture 必须断言**真实工具结果与磁盘产物**（既有 smoke 为 read_only 审批、未断言 evidence.txt 写入，不能只沿用"发过 fs.write"的注释）。LOCAL_WIRE／ENDPOINT_ACCEPTED／SERVER_HIT／NET_TASK_COST 分开记录，未运行保持 NOT_RUN。不在 provider 反向依赖 runtime，不新建评测框架。
+### KV — 生产装配序列验收（agent-compose 测试层）——已关闭（2026-09-17，`21dece2b`）
+落地回执：[KV_SEQUENCE_RECEIPT](reviews/2026-09-16-review-71f8a586/KV_SEQUENCE_RECEIPT.md)。新增 `crates/agent-compose/tests/kv_production_sequence.rs`：同 TaskId/workspace、15 轮 HTTP/7 回合，真实 Compose/Actor/OpenAI Provider/内置工具驱动（脚本式 SSE 只决定决策）——真实读取＋fs.write（磁盘逐字节断言 evidence.txt，修正既有 smoke read_only 证明不了写入的缺口）→新证据→`steer_active_task` 焦点改变→文件版本覆写→`capability.manage` 工具撤销→checkpoint/真实重组/restore→`response.failed` 失败结算。key 恒等且=`routing.key_for(task,"main")`、B0 逐字节钉位、首差异可归类、账本 15 行精确各一次；4 次运行全过（9.6–9.9s）。既有 smoke/手工矩阵未退化。**LOCAL_WIRE=PASS；ENDPOINT_ACCEPTED/SERVER_HIT/NET_TASK_COST=NOT_RUN** 归 T8。观察（记录非缺陷）：`context_manage` 随 NeedEvidence 租赁在相邻轮间进出、每轮改变 tools 并使供应商复用边界失效——T8 供应商实验需单独核对。
 
 ## T1–T7 完成记录（历史）
 

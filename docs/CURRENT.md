@@ -32,6 +32,8 @@
 
 **2026-09-17 新审查（基线 `71f8a586`，即 O1/O2 收口提交）**：开 F1–F6 六项源码发现＋C0 一项**实际 CI 阻塞**。主线：**工具返回的"继续读取"必须真的可执行；schema 接受的约束不能在编译后静默丢弃；取消要覆盖正在发生的写 I/O。** C0——CI run `35156892711`（attempt 1 failure）Windows full Rust test 的 `proof_supervision` 报 leader 已 Exited 而同 identity 成员 20 秒仍 Running，根因未定位，不与本轮静态发现混为同一根因（本机为 Windows 且有完整工具链，可本地复现调查）。审查环境无 Cargo/.NET，F1–F6 均为源码确认＋机制移植探针，Rust 侧未执行。报告、实施任务、覆盖表与 CI 摘录见 [docs/reviews/2026-09-16-review-71f8a586/](reviews/2026-09-16-review-71f8a586/REVIEW.md)。第九批开工顺序与切片见 [NEXT_TASKS.md](NEXT_TASKS.md)。
 
+**2026-09-17 第九批收口**：C0＋F1/F2/F6＋F3/F4＋F5＋KV 序列**全部关闭**（C0 `2e70efc9`、取回 `33d797d5`/`8053c3b0`/`a6bd208c`、契约 `aa83f65e`/`d84d6ee8`、进程 `d336e5ef`/`e27d13bb`、KV `21dece2b`；五份回执在 [docs/reviews/2026-09-16-review-71f8a586/](reviews/2026-09-16-review-71f8a586/)）。五个切片在独立分支并行实施后并入 main，合并后集成回归全绿：proof_supervision ×2、tool-runtime 290/0、agent-contracts 198/0、agent-core 172/0、agent-process host 28/28、capability_process 26/26、agent-conformance 35/0、agent-compose 全套 0 失败、fmt clean、doc gate OK。C0 根因为 Windows spawn→`AssignProcessToJobObject` 窗口（member 窗口内出生不入 host-death job，宿主被杀后存活），修复为 `CREATE_SUSPENDED`＋assign 后确认 resume（fail-closed）；注入 25ms 延迟 3/3 复现 CI 同签名、修复后转绿，变异复验。取回切片让返回的继续参数可原样执行（含经纪裁剪后）、超长单行尾部经 `line_byte_offset` 可达；契约切片让 boolean enum 真正生效、typeless 约束 admission 拒绝、JCS `1e-7` 边界对齐 ECMAScript（12k 采样差分 0 mismatch）；F5 写阶段取消实测 ~0.6s（原 30s）；KV 序列 15 轮真实装配轨迹 LOCAL_WIRE=PASS。剩余：KV 端点三态与同构 spawn→assign 窗口收口，归 T8 线与后续小切片（见 NEXT_TASKS.md 第九批）。
+
 ## 当前阶段：可持续使用的后端开发流程
 
 目标：**同一 Agent 在同一任务与工作区内，持续完成计划、检索、修改、验证、中途纠正、中断、冷恢复和交付；热资源、维护工作和供应商缓存成本有明确边界，核心规则在少数实现入口维护。**
@@ -56,7 +58,7 @@
 - **TUI 作为操作入口的完整性（`d92564bc` 审查）**：U1–U7 均已实现并提交；`3bdb269c` 续审确认 U3 引入的 R1 回归已随 R1–R8 关闭（见上「续审基线」），后端侧 B1（批量 required 冷解析互相驱逐）与 B2（existing card 仅凭 `exists` 认领）亦已关闭（`de6bf061`／`2482f3ef`，回执见 [B1/B2](reviews/2026-09-16-review-3bdb269c/B1_B2_THIRD_BATCH_RECEIPT.md)）。
 - **A 线残余（`d92564bc` 审查，已记录不回退）**：`/done` 的身份校验是前置快照比对而非原子保证（需给共享 `RuntimeCommand::CompleteTask` 加 expecting 变体）；`display_width` 为内联宽字符表；结果卡归档上限 8 张、不能按 TaskId 查任意历史；`view_partial` 未覆盖 live `Lagged` 之外的缺口；真实 PTY 端到端未执行。
 - **已知抖动（不新增门禁）**：`host_t7_journey::named_pipe_t7_same_task_full_backend_journey` 的 `wait_file_content` 用 30s 墙钟截止，满载 Windows runner 上曾超时（run `35103897272` attempt 1；attempt 2 绿，本机 9.54s）。若再次出现，先看该截止而非假定功能回归。- 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
-- **CI 阻塞（C0，调查中）**：Windows full Rust test 在 run `35156892711` 因 `proof_supervision::killing_the_rust_host_cleans_the_exact_proof_tree_without_a_completion_receipt` 失败（leader Exited、同身份成员仍 Running）；修复前不宣称 Windows 验证进程树清理保证成立。摘录：[CI_OBSERVATION](reviews/2026-09-16-review-71f8a586/CI_OBSERVATION.md)。
+- **Windows 验证进程树清理（C0，已修复待 CI 终验）**：run `35156892711` 的失败根因为 spawn→`AssignProcessToJobObject` 窗口，修复 `2e70efc9`（suspend→assign→resume 合同＋fail-closed），本地变异复验＋10/10；最终结论以合入后 Windows CI 分片为准。同缺陷类残余（agent-process `create_job_object`、`integrity.rs`）不在本次失败路径，留后续收口。摘录：[CI_OBSERVATION](reviews/2026-09-16-review-71f8a586/CI_OBSERVATION.md)。
 - 尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
 
 ## 按需阅读
