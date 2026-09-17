@@ -34,6 +34,8 @@
 
 **2026-09-17 第九批收口**：C0＋F1/F2/F6＋F3/F4＋F5＋KV 序列**全部关闭**（C0 `2e70efc9`、取回 `33d797d5`/`8053c3b0`/`a6bd208c`、契约 `aa83f65e`/`d84d6ee8`、进程 `d336e5ef`/`e27d13bb`、KV `21dece2b`；五份回执在 [docs/reviews/2026-09-16-review-71f8a586/](reviews/2026-09-16-review-71f8a586/)）。五个切片在独立分支并行实施后并入 main，合并后集成回归全绿：proof_supervision ×2、tool-runtime 290/0、agent-contracts 198/0、agent-core 172/0、agent-process host 28/28、capability_process 26/26、agent-conformance 35/0、agent-compose 全套 0 失败、fmt clean、doc gate OK。C0 根因为 Windows spawn→`AssignProcessToJobObject` 窗口（member 窗口内出生不入 host-death job，宿主被杀后存活），修复为 `CREATE_SUSPENDED`＋assign 后确认 resume（fail-closed）；注入 25ms 延迟 3/3 复现 CI 同签名、修复后转绿，变异复验。取回切片让返回的继续参数可原样执行（含经纪裁剪后）、超长单行尾部经 `line_byte_offset` 可达；契约切片让 boolean enum 真正生效、typeless 约束 admission 拒绝、JCS `1e-7` 边界对齐 ECMAScript（12k 采样差分 0 mismatch）；F5 写阶段取消实测 ~0.6s（原 30s）；KV 序列 15 轮真实装配轨迹 LOCAL_WIRE=PASS。剩余：KV 端点三态与同构 spawn→assign 窗口收口，归 T8 线与后续小切片（见 NEXT_TASKS.md 第九批）。
 
+**2026-09-17 C1 收口（CI 阻塞续查）**：run `35158964457`（基线 `7631dd72`，C0 挡在序列前未暴露）暴露第二个 Windows 失败——context-simple 三测 `external_spilled` 计数短缺（15/20、19/20、12/14）。根因为 checkpoint capture 卡片写入的 2s 墙钟预算（`engine.rs:1462`）满载下中途耗尽、剩余卡片诚实内联（屏障完整性不依赖 spill 的成文契约，恢复无损跨 capture 收敛）；修复沿 cold_bounds 先例给两个漏钉 fixture 钉 `external_checkpoint_io_budget_ms: 60_000`＋补确定性回归，生产代码零改动（`8996ffeb`，回执：[C1_CHECKPOINT_SPILL_RECEIPT](reviews/2026-09-16-review-71f8a586/C1_CHECKPOINT_SPILL_RECEIPT.md)）。合并后 `cargo test -p context-simple` 442/0。
+
 ## 当前阶段：可持续使用的后端开发流程
 
 目标：**同一 Agent 在同一任务与工作区内，持续完成计划、检索、修改、验证、中途纠正、中断、冷恢复和交付；热资源、维护工作和供应商缓存成本有明确边界，核心规则在少数实现入口维护。**

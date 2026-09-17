@@ -275,6 +275,9 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 ### KV — 生产装配序列验收（agent-compose 测试层）——已关闭（2026-09-17，`21dece2b`）
 落地回执：[KV_SEQUENCE_RECEIPT](reviews/2026-09-16-review-71f8a586/KV_SEQUENCE_RECEIPT.md)。新增 `crates/agent-compose/tests/kv_production_sequence.rs`：同 TaskId/workspace、15 轮 HTTP/7 回合，真实 Compose/Actor/OpenAI Provider/内置工具驱动（脚本式 SSE 只决定决策）——真实读取＋fs.write（磁盘逐字节断言 evidence.txt，修正既有 smoke read_only 证明不了写入的缺口）→新证据→`steer_active_task` 焦点改变→文件版本覆写→`capability.manage` 工具撤销→checkpoint/真实重组/restore→`response.failed` 失败结算。key 恒等且=`routing.key_for(task,"main")`、B0 逐字节钉位、首差异可归类、账本 15 行精确各一次；4 次运行全过（9.6–9.9s）。既有 smoke/手工矩阵未退化。**LOCAL_WIRE=PASS；ENDPOINT_ACCEPTED/SERVER_HIT/NET_TASK_COST=NOT_RUN** 归 T8。观察（记录非缺陷）：`context_manage` 随 NeedEvidence 租赁在相邻轮间进出、每轮改变 tools 并使供应商复用边界失效——T8 供应商实验需单独核对。
 
+### C1 — checkpoint 分片墙钟预算满载抖动（CI 阻塞续查，context-simple）——已关闭（2026-09-17，`8996ffeb`）
+落地回执：[C1_CHECKPOINT_SPILL_RECEIPT](reviews/2026-09-16-review-71f8a586/C1_CHECKPOINT_SPILL_RECEIPT.md)。CI run `35158964457`（基线 `7631dd72`，C0 被挡住后露出）Windows 分片三测失败：`external_spilled` 计数短缺（15/20、19/20、12/14），Linux 同 run 全绿、本机 0.26s 全绿。根因：checkpoint capture 卡片写入循环的 `external_checkpoint_io_budget_ms`（默认 2s，`engine.rs:1462` 任一迭代越线即停）在满载 runner（该二进制 401s，慢约 40 倍）中途耗尽，剩余计划卡片本次静默留 inline——**屏障完整性从不依赖 spill**：截短后剩余条目以全量元数据内联进 checkpoint 值（F2 成文契约），恢复完整无损、跨 capture 收敛；两个 shortfall 不同排除写入被吞与测试互踩。修复沿 cold_bounds 先例（run `3499986097` spilled 38/40 → 钉宽）：给漏钉的两个 fixture（`spill_config`、`carded_history`）钉 `external_checkpoint_io_budget_ms: 60_000`，生产代码零改动；并补此前缺失的确定性回归 `an_exhausted_capture_io_budget_stays_inline_and_converges_on_later_captures`（预算注入 0 三测同签名转红；生产臂注入 `&& false` 变异转红→恢复）。`cargo test -p context-simple` ×3 442/0；生产默认 2s 预算保留（真实满载盘语义不变），CI 终验以合入后 Windows 分片为准。
+
 ## T1–T7 完成记录（历史）
 
 ### T1 — 统一最终装箱与发布（B/C 共享，单一集成人）
