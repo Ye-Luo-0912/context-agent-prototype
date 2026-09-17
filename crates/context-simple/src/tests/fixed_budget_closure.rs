@@ -84,6 +84,11 @@ async fn carded_history(
 ) -> (serde_json::Value, Vec<ContextItemId>, u64) {
     let first = SimpleContextEngine::new(SimpleContextConfig {
         external_checkpoint_inline_target: 0,
+        // capture 的卡片写入有墙钟预算（超时条目留在 inline、下次 capture
+        // 续写）：满载 CI runner 上 14 次小文件写入（探测读＋fsync＋rename）
+        // 可越过默认 2s（run 35158964457：spilled 12/14），墙钟噪声不是本
+        // 模块钉住的对象，这里把它钉宽。
+        external_checkpoint_io_budget_ms: 60_000,
         gc_buffer_capacity: 0,
         context_store_dir: Some(dir.path().to_path_buf()),
         ..SimpleContextConfig::default()
