@@ -1,0 +1,132 @@
+{
+  "baseline": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+  "rust_repository_tests": "NOT_RUN",
+  "cold_reconcile_owner_duplication": {
+    "scope": "reconcile decision-table port; NOT Rust execution",
+    "hydration_complete": false,
+    "initial_hot": 1,
+    "initial_pending": 2,
+    "final_hot": 3,
+    "final_pending": 2,
+    "rebuilt_existing_cold_owners": [
+      "b",
+      "c"
+    ],
+    "duplicate_hot_and_pending_ids": [
+      "b",
+      "c"
+    ],
+    "normal_fixture_condition": "positive hot cap already full; valid pending cards/blobs"
+  },
+  "artifact_cursor_vs_model_visibility": {
+    "scope": "capture/broker control-flow port, not Rust E2E",
+    "source_bytes": 3145729,
+    "pages": [
+      {
+        "request": [
+          1,
+          0
+        ],
+        "captured_chars": 2094172,
+        "visible_chars": 16000,
+        "next": [
+          1,
+          2093952
+        ],
+        "has_more": true,
+        "window_truncated": true,
+        "broker_clipped": true,
+        "end_marker_visible": false
+      },
+      {
+        "request": [
+          1,
+          2093952
+        ],
+        "captured_chars": 1051822,
+        "visible_chars": 16000,
+        "next": [
+          200,
+          0
+        ],
+        "has_more": false,
+        "window_truncated": false,
+        "broker_clipped": true,
+        "end_marker_visible": true
+      }
+    ],
+    "seen": [
+      "EXISTING-TEST-NEAR-BOUNDARY"
+    ],
+    "omitted_markers": [
+      "PAGE1-MIDDLE-SENTINEL",
+      "PAGE2-MIDDLE-SENTINEL"
+    ]
+  },
+  "ordinary_log_paging": {
+    "scope": "valid 500-line log; capture/broker port, NOT Rust E2E",
+    "source_bytes": 75500,
+    "pages": [
+      {
+        "start_line": 1,
+        "next": [
+          201,
+          0
+        ],
+        "internal_window_truncated": false,
+        "broker_clipped": true,
+        "has_more": true
+      },
+      {
+        "start_line": 201,
+        "next": [
+          401,
+          0
+        ],
+        "internal_window_truncated": false,
+        "broker_clipped": true,
+        "has_more": true
+      },
+      {
+        "start_line": 401,
+        "next": [
+          600,
+          0
+        ],
+        "internal_window_truncated": false,
+        "broker_clipped": true,
+        "has_more": false
+      }
+    ],
+    "missing_markers": [
+      "REQUIRED-MIDDLE-100",
+      "REQUIRED-MIDDLE-300"
+    ]
+  },
+  "artifact_utf8_gap": {
+    "scope": "artifact capture control-flow port, not Rust E2E",
+    "source_line_numbers_captured": [
+      1,
+      3
+    ],
+    "rendered_line_numbers": [
+      1,
+      2
+    ],
+    "omitted_source_line": 2,
+    "has_more": false,
+    "window_truncated": false,
+    "coverage_footer_present": false
+  },
+  "wal_lock_rotation": {
+    "scope": "actual Linux flock mechanism; NOT FileOperationJournal execution",
+    "b_cached_generation": 1,
+    "published_generation": 2,
+    "stale_generation_lock_acquired": true,
+    "stale_wal_unlinked": true,
+    "current_wal_size_before": 21,
+    "current_wal_size_after_open_before_lock": 0,
+    "later_lock_correctly_refused": true,
+    "product_guard_note": "Normal distinct Workspace::open calls retain an additional effect-journal lock; this experiment does not bypass it."
+  }
+}

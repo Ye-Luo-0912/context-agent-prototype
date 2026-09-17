@@ -1,0 +1,46 @@
+{
+  "baseline": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+  "scope": "fixed-SHA continuation; not full repository line-by-line completion",
+  "files": [
+    {
+      "name": "CI_OBSERVATION.json",
+      "bytes": 741,
+      "sha256": "f44dffe60e26b727c48fe54f38404e69ba1eeb686a3820e6c74e0167f46b2929"
+    },
+    {
+      "name": "CI_OBSERVATION.md",
+      "bytes": 446,
+      "sha256": "693c4e8b9be361d0c59e91c2dee1c9966792560526866e42c05184cf30100987"
+    },
+    {
+      "name": "COVERAGE.md",
+      "bytes": 3910,
+      "sha256": "7822bfc8226c235352eb55ec01588688a6d1d8cbd8e4b3877bb8a73ac0c2effa"
+    },
+    {
+      "name": "MECHANISM_RESULTS.json",
+      "bytes": 3222,
+      "sha256": "c5f095dcff92d93886c9962f35ae4a096f110c5fac71d9ec3b01b1d90624bfdf"
+    },
+    {
+      "name": "NEXT_ACTIONS.md",
+      "bytes": 7192,
+      "sha256": "423b12592cd2490d8611cd88b5b844392f17f2c3eb8253aa24c6f9470545b574"
+    },
+    {
+      "name": "REVIEW.md",
+      "bytes": 18322,
+      "sha256": "b3c0dedf2010e93e2ea59d1865c8e862ca1bedf783ac1004a12db8583445f090"
+    },
+    {
+      "name": "SOURCE_MAP.json",
+      "bytes": 11809,
+      "sha256": "ead975e80b34778ac2afe8555512b386d9571feea85d09761cdfc75ab16077a2"
+    },
+    {
+      "name": "mechanism_probes.py",
+      "bytes": 13316,
+      "sha256": "7203452c86cc9e886357c0ce6c92e4802da67aa0e6da8e1e1bce8df85c38e564"
+    }
+  ]
+}

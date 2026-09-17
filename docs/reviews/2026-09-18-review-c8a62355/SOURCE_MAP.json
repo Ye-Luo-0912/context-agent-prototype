@@ -1,0 +1,412 @@
+{
+  "baseline": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+  "files": [
+    {
+      "path": "docs/CURRENT.md",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [],
+      "coverage_note": "全文请求返回被截断；只使用实际返回内容",
+      "tool_citation_bases": [
+        "turn572file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/docs/CURRENT.md"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/lifecycle.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          300,
+          650
+        ]
+      ],
+      "coverage_note": "指定区间",
+      "tool_citation_bases": [
+        "turn574file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-runtime/src/actor/lifecycle.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/artifact.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          420
+        ],
+        [
+          380,
+          500
+        ],
+        [
+          700,
+          815
+        ],
+        [
+          890,
+          1054
+        ],
+        [
+          1050,
+          1500
+        ],
+        [
+          155,
+          380
+        ]
+      ],
+      "coverage_note": "部分宽区间返回截断；155–420 核心路径补读；未覆盖完整测试文件",
+      "tool_citation_bases": [
+        "turn575file0",
+        "turn576file0",
+        "turn586file0",
+        "turn585file0",
+        "turn583file0",
+        "turn615file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/tool-runtime/src/tools/artifact.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/tools.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          310
+        ],
+        [
+          1810,
+          2225
+        ],
+        [
+          2410,
+          2675
+        ]
+      ],
+      "coverage_note": "指定区间",
+      "tool_citation_bases": [
+        "turn578file0",
+        "turn598file0",
+        "turn597file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-runtime/src/actor/tools.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          950,
+          1160
+        ],
+        [
+          1920,
+          2105
+        ]
+      ],
+      "coverage_note": "指定区间",
+      "tool_citation_bases": [
+        "turn589file0",
+        "turn579file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-runtime/src/actor/model.rs"
+    },
+    {
+      "path": "crates/agent-process/src/host.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          460,
+          750
+        ],
+        [
+          760,
+          1170
+        ]
+      ],
+      "coverage_note": "指定区间；较宽返回可能截断；未通读全文件",
+      "tool_citation_bases": [
+        "turn582file0",
+        "turn580file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-process/src/host.rs"
+    },
+    {
+      "path": "docs/reviews/2026-09-16-review-71f8a586/C0_PROOF_SUPERVISION_RECEIPT.md",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [],
+      "coverage_note": "全文",
+      "tool_citation_bases": [
+        "turn581file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/docs/reviews/2026-09-16-review-71f8a586/C0_PROOF_SUPERVISION_RECEIPT.md"
+    },
+    {
+      "path": "crates/agent-workspace/src/broker.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          139
+        ],
+        [
+          140,
+          280
+        ]
+      ],
+      "coverage_note": "生产段与部分测试入口；不声称全部测试已读",
+      "tool_citation_bases": [
+        "turn610file0",
+        "turn587file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-workspace/src/broker.rs"
+    },
+    {
+      "path": "crates/agent-contracts/src/model.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          380,
+          700
+        ]
+      ],
+      "coverage_note": "指定区间",
+      "tool_citation_bases": [
+        "turn588file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-contracts/src/model.rs"
+    },
+    {
+      "path": "crates/agent-compose/tests/kv_production_sequence.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          290
+        ],
+        [
+          290,
+          600
+        ],
+        [
+          600,
+          860
+        ],
+        [
+          860,
+          1100
+        ]
+      ],
+      "coverage_note": "分段读至 EOF，全文",
+      "tool_citation_bases": [
+        "turn590file0",
+        "turn611file0",
+        "turn627file0",
+        "turn628file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-compose/tests/kv_production_sequence.rs"
+    },
+    {
+      "path": "crates/agent-storage/src/lib.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          360
+        ],
+        [
+          440,
+          810
+        ],
+        [
+          810,
+          1165
+        ],
+        [
+          1,
+          190
+        ],
+        [
+          180,
+          360
+        ]
+      ],
+      "coverage_note": "指定区间；open 与 compact 关键段另以窄范围核实",
+      "tool_citation_bases": [
+        "turn592file0",
+        "turn593file0",
+        "turn594file0",
+        "turn631file0",
+        "turn632file0",
+        "turn633file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-storage/src/lib.rs"
+    },
+    {
+      "path": "crates/agent-workspace/src/journal.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          240
+        ]
+      ],
+      "coverage_note": "指定区间",
+      "tool_citation_bases": [
+        "turn595file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-workspace/src/journal.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/task.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1070,
+          1380
+        ],
+        [
+          1450,
+          1575
+        ],
+        [
+          1570,
+          1880
+        ]
+      ],
+      "coverage_note": "全文请求另有截断；以下范围补读，不声称全文",
+      "tool_citation_bases": [
+        "turn602file0",
+        "turn604file0",
+        "turn606file0",
+        "turn605file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-runtime/src/task.rs"
+    },
+    {
+      "path": "crates/agent-tui/src/cli.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          310,
+          650
+        ]
+      ],
+      "coverage_note": "指定区间，关注失败终态",
+      "tool_citation_bases": [
+        "turn607file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-tui/src/cli.rs"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/Envelope.cs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          300
+        ]
+      ],
+      "coverage_note": "指定区间",
+      "tool_citation_bases": [
+        "turn609file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/clients/dotnet/Agent.Client/Envelope.cs"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/ProtocolDto.cs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          300
+        ]
+      ],
+      "coverage_note": "指定区间返回至文件尾",
+      "tool_citation_bases": [
+        "turn612file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/clients/dotnet/Agent.Client/ProtocolDto.cs"
+    },
+    {
+      "path": "crates/agent-process/src/integrity.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          350
+        ]
+      ],
+      "coverage_note": "返回至 EOF，全文",
+      "tool_citation_bases": [
+        "turn613file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-process/src/integrity.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/status.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1,
+          330
+        ]
+      ],
+      "coverage_note": "生产段与部分测试入口",
+      "tool_citation_bases": [
+        "turn614file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/agent-runtime/src/status.rs"
+    },
+    {
+      "path": "crates/context-simple/src/store.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1360,
+          1650
+        ],
+        [
+          1640,
+          1855
+        ],
+        [
+          1850,
+          2140
+        ]
+      ],
+      "coverage_note": "指定连续范围1360–2140，含 reconcile",
+      "tool_citation_bases": [
+        "turn619file0",
+        "turn624file0",
+        "turn617file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/context-simple/src/store.rs"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "ref": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+      "requested_or_verified_ranges": [
+        [
+          1960,
+          2280
+        ],
+        [
+          2850,
+          3210
+        ],
+        [
+          3210,
+          3555
+        ]
+      ],
+      "coverage_note": "指定区间，包含 reconcile/materialize/ACK 与部分生命周期",
+      "tool_citation_bases": [
+        "turn621file0",
+        "turn622file0",
+        "turn623file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/c8a623554f762505061cdfdd7466ccaa995a3de0/crates/context-simple/src/engine.rs"
+    }
+  ]
+}

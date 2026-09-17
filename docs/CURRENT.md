@@ -36,6 +36,8 @@
 
 **2026-09-17 C1 收口（CI 阻塞续查）**：run `35158964457`（基线 `7631dd72`，C0 挡在序列前未暴露）暴露第二个 Windows 失败——context-simple 三测 `external_spilled` 计数短缺（15/20、19/20、12/14）。根因为 checkpoint capture 卡片写入的 2s 墙钟预算（`engine.rs:1462`）满载下中途耗尽、剩余卡片诚实内联（屏障完整性不依赖 spill 的成文契约，恢复无损跨 capture 收敛）；修复沿 cold_bounds 先例给两个漏钉 fixture 钉 `external_checkpoint_io_budget_ms: 60_000`＋补确定性回归，生产代码零改动（`8996ffeb`，回执：[C1_CHECKPOINT_SPILL_RECEIPT](reviews/2026-09-16-review-71f8a586/C1_CHECKPOINT_SPILL_RECEIPT.md)）。合并后 `cargo test -p context-simple` 442/0；CI 终验 run `35169239599` 七 job 全绿（Windows full test 19m27s 满载通过）。
 
+**2026-09-18 新审查（基线 `c8a62355`，即第九批与 C1 收口后的 main）**：开 G1–G5 五项发现。该 SHA 的 CI run `35262371575` 审查收尾时 attempt 1 仍 `in_progress`、无最终 conclusion，不借用父提交绿色结果。主线：**冷页不驻留仍有 owner；内容被内部捕获不等于已交付给模型；某一代 WAL 加了锁不等于 journal 生命周期唯一写者；进程先运行后补必需隔离仍存在窗口。** G1（P1）：reconcile 的 owner 快照不含 pending 冷卡片与带版本冷定位，未加载被当作无主，blob 重建重新认领 → 热/pending 双重所有权与热预算失守；G2（P1）：`artifact.read` 游标按内部 ~2 MiB capture 推进，经纪最终正文只保留首尾 16,000 字符，跟随返回 continuation 会漏读中段且结束声明过强；G3（P2）：UTF-8 多字节字符放不下余量时跳过该行继续接纳后行，源行号错位且 `has_more=false`；G4（P2，库级）：`FileOperationJournal` 写者锁随 WAL 代际轮换，`open` 先读 metadata 后取锁不复核代际，compact 对候选路径先截断写入后取锁——正常 Workspace 外层 effect-journal 锁未被证明绕过；G5（P2，C0 回执已列同类残余的代码复核）：通用 ProcessHost 与 Low-IL `run_wrap` 仍为运行后关联 Job，后者忽略关联结果。报告、实施任务、覆盖表与机制探针见 [docs/reviews/2026-09-18-review-c8a62355/](reviews/2026-09-18-review-c8a62355/REVIEW.md)；第十批开工顺序见 [NEXT_TASKS.md](NEXT_TASKS.md)。
+
 ## 当前阶段：可持续使用的后端开发流程
 
 目标：**同一 Agent 在同一任务与工作区内，持续完成计划、检索、修改、验证、中途纠正、中断、冷恢复和交付；热资源、维护工作和供应商缓存成本有明确边界，核心规则在少数实现入口维护。**
@@ -60,7 +62,7 @@
 - **TUI 作为操作入口的完整性（`d92564bc` 审查）**：U1–U7 均已实现并提交；`3bdb269c` 续审确认 U3 引入的 R1 回归已随 R1–R8 关闭（见上「续审基线」），后端侧 B1（批量 required 冷解析互相驱逐）与 B2（existing card 仅凭 `exists` 认领）亦已关闭（`de6bf061`／`2482f3ef`，回执见 [B1/B2](reviews/2026-09-16-review-3bdb269c/B1_B2_THIRD_BATCH_RECEIPT.md)）。
 - **A 线残余（`d92564bc` 审查，已记录不回退）**：`/done` 的身份校验是前置快照比对而非原子保证（需给共享 `RuntimeCommand::CompleteTask` 加 expecting 变体）；`display_width` 为内联宽字符表；结果卡归档上限 8 张、不能按 TaskId 查任意历史；`view_partial` 未覆盖 live `Lagged` 之外的缺口；真实 PTY 端到端未执行。
 - **已知抖动（不新增门禁）**：`host_t7_journey::named_pipe_t7_same_task_full_backend_journey` 的 `wait_file_content` 用 30s 墙钟截止，满载 Windows runner 上曾超时（run `35103897272` attempt 1；attempt 2 绿，本机 9.54s）。若再次出现，先看该截止而非假定功能回归。- 正式 `agent-host` 未指定策略时仍默认 Rolling；Dynamic 是可选实现。配置依据 [CONFIGURATION.md](CONFIGURATION.md)。
-- **Windows 验证进程树清理（C0，已修复待 CI 终验）**：run `35156892711` 的失败根因为 spawn→`AssignProcessToJobObject` 窗口，修复 `2e70efc9`（suspend→assign→resume 合同＋fail-closed），本地变异复验＋10/10；CI 终验 run `35169239599` Windows 分片 ✓（19m27s 满载条件下通过）。同缺陷类残余（agent-process `create_job_object`、`integrity.rs`）不在本次失败路径，留后续收口。摘录：[CI_OBSERVATION](reviews/2026-09-16-review-71f8a586/CI_OBSERVATION.md)。
+- **Windows 验证进程树清理（C0，已修复待 CI 终验）**：run `35156892711` 的失败根因为 spawn→`AssignProcessToJobObject` 窗口，修复 `2e70efc9`（suspend→assign→resume 合同＋fail-closed），本地变异复验＋10/10；CI 终验 run `35169239599` Windows 分片 ✓（19m27s 满载条件下通过）。同缺陷类残余（agent-process `create_job_object`、`integrity.rs`）不在本次失败路径，留后续收口（即第十批 G5，2026-09-18 开工）。摘录：[CI_OBSERVATION](reviews/2026-09-16-review-71f8a586/CI_OBSERVATION.md)。
 - 尚不能宣称：无限历史热内存有界、全部源码逐行审查完成、供应商 KV 已实测降低任务费用。真实模型实验按预算和凭据条件执行，不阻塞无须模型的生产接线。
 
 ## 按需阅读

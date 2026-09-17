@@ -1,0 +1,26 @@
+{
+  "baseline": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+  "commit_time_utc": "2026-09-17T19:01:13Z",
+  "run_id": 35262371575,
+  "attempt": 1,
+  "last_returned_status": "in_progress",
+  "conclusion": null,
+  "run_source": "/response/turn630",
+  "jobs_observation": {
+    "succeeded": [
+      "document consistency",
+      "fmt/clippy/build Windows",
+      "dotnet",
+      "fmt/clippy/build Ubuntu",
+      "Ubuntu tests part 1",
+      "Ubuntu tests part 2"
+    ],
+    "in_progress": [
+      {
+        "name": "Windows full Rust tests",
+        "job_id": 105342373954
+      }
+    ]
+  },
+  "qualification": "最后工具返回快照，不推断未返回的最终结论，不借用父提交 CI。审查环境没有重新运行仓库 CI。"
+}
