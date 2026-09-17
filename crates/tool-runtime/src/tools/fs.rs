@@ -10,6 +10,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::fs;
 
+use super::page::{
+    DeliveredSpan, FINAL_BODY_CHARS, finalize_within_budget, render_numbered_spans,
+    rendered_prefix_chars,
+};
 use super::{
     LineEnding, Tool, content_digest, coverage_footer, hidden_path_output, is_hidden_name,
     is_not_found_error, missing_parent_output, missing_path_output, model_json_string,
@@ -22,6 +26,10 @@ const MAX_READ_BYTES: u64 = MAX_MUTATION_BYTES as u64;
 const MAX_WRITE_BYTES: usize = MAX_MUTATION_BYTES;
 const MAX_READ_LINES: usize = 400;
 const MAX_LIST_ENTRIES: usize = 2_000;
+/// The page size `fs.read` continues with past the requested window (the
+/// same size its own `end_line` default yields for the default start):
+/// a file-level continuation walks this many lines at a time.
+const FS_READ_PAGE_LINES: usize = 200;
 
 pub struct FsListTool {
     workspace: Workspace,
@@ -406,7 +414,10 @@ impl Tool for FsReadTool {
                 }
             }),
             risk: ToolRisk::ReadOnly,
-            output_budget: None,
+            // G2: the declared budget IS the page budget — the broker
+            // clamps model_content to exactly the number the render loop
+            // pages under, from one definition.
+            output_budget: Some(FINAL_BODY_CHARS),
             roles: vec![ToolSemanticRole::ReadResource],
         }
     }
@@ -476,61 +487,205 @@ impl Tool for FsReadTool {
         let line_ending = LineEnding::detect(&text);
         let requested_start = args.start_line.saturating_sub(1);
         let requested_end = args.end_line;
-        let mut line_count = 0usize;
-        let mut selected = String::new();
-        use std::fmt::Write as _;
-        for (index, line) in text.lines().enumerate() {
-            line_count = index + 1;
-            if index < requested_start || index >= requested_end {
-                continue;
-            }
-            if !selected.is_empty() {
-                selected.push('\n');
-            }
-            write!(&mut selected, "{:>6} | {}", index + 1, line)
-                .expect("writing to a String cannot fail");
-        }
-        let start = requested_start.min(line_count);
-        let end = requested_end.min(line_count);
-        let returned_start = (!selected.is_empty()).then_some((requested_start + 1) as u64);
-        let returned_end = (!selected.is_empty()).then_some(end as u64);
-        let covers_file = match line_count {
-            0 => true,
-            _ => !selected.is_empty() && requested_start == 0 && end == line_count,
-        };
+        let line_count = text.lines().count();
+        let window_end_visible = requested_end.min(line_count);
 
         let relative = display_relative(&self.workspace, &display_path);
         let quoted_relative = model_json_string(&relative);
         let revision = content_digest(text.as_bytes());
-        // Metadata drives trusted Runtime freshness, but model protocol tool
-        // messages carry only `model_content`. Put the edit-critical facts
-        // in a compact header so the model need not infer a digest from
-        // TaskProgress or load a shell to inspect mixed physical newlines.
-        let mut model_content = format!(
-            "file={quoted_relative} revision={revision} line_ending={}",
-            line_ending.as_str()
+        let mixed = line_ending == LineEnding::Mixed;
+        let eol_label = " eol_tokens(C=CRLF,L=LF,N=none)=";
+        let digits_of = |mut value: usize| -> usize {
+            let mut width = 1;
+            while value >= 10 {
+                value /= 10;
+                width += 1;
+            }
+            width
+        };
+
+        // G2: page under the FINAL model-content budget. The header and
+        // footer reservations are computed with the SAME builders that
+        // render the final page (worst-case numbers, real path), so the
+        // reservation cannot drift from the real costs and the final body
+        // reaches the model verbatim — the broker's head+tail preview
+        // never has to cut an fs.read page.
+        let mut header_chars = "file=".len()
+            + quoted_relative.chars().count()
+            + " revision=".len()
+            + revision.chars().count()
+            + " line_ending=".len()
+            + line_ending.as_str().chars().count();
+        if mixed {
+            // At most one token per window line.
+            header_chars += eol_label.len() + requested_end.saturating_sub(requested_start);
+        }
+        header_chars += " lines=".len()
+            + digits_of(requested_start + 1)
+            + 1
+            + digits_of(window_end_visible)
+            + 1
+            + digits_of(line_count);
+        let worst_footer = coverage_footer(vec![
+            format!(
+                "requested lines {}-{}; showing lines {}-{} at the page budget",
+                requested_start + 1,
+                window_end_visible,
+                requested_start + 1,
+                window_end_visible
+            ),
+            format!("line {line_count} exceeds the page budget and is not shown"),
+            format!(
+                "continue with fs.read path={relative} start_line={window_end_visible} end_line={}",
+                requested_end.max(line_count)
+            ),
+        ])
+        .map(|footer| footer.chars().count() + 1)
+        .unwrap_or(0);
+        let content_budget = FINAL_BODY_CHARS.saturating_sub(header_chars + worst_footer);
+
+        // G3: capture stops at the FIRST unshowable position. Whole lines
+        // are the unit here, so a line either fits the remaining page
+        // budget or closes the page; a line longer than the WHOLE budget
+        // can never be shown by fs.read at all and is skipped only with an
+        // explicit declaration in the body. Source line identity is the
+        // true file line number throughout — no renumbering.
+        let mut spans: Vec<DeliveredSpan> = Vec::new();
+        let mut used_chars = 0usize;
+        let mut stopped_at: Option<usize> = None;
+        let mut stop_is_oversized = false;
+        for (index, line) in text.lines().enumerate() {
+            let number = index + 1;
+            if index < requested_start {
+                continue;
+            }
+            if number > requested_end {
+                break;
+            }
+            let chars = line.chars().count();
+            if chars > content_budget {
+                stopped_at = Some(number);
+                stop_is_oversized = true;
+                break;
+            }
+            let envelope = rendered_prefix_chars(number) + 1;
+            if used_chars + envelope + chars > content_budget {
+                stopped_at = Some(number);
+                break;
+            }
+            used_chars += envelope + chars;
+            spans.push(DeliveredSpan {
+                line: number,
+                shown_to: line.len(),
+                complete: true,
+                text: line.to_string(),
+            });
+        }
+        // The delivered-position authority: the continuation names the
+        // first undelivered line fs.read CAN still deliver, and it is a
+        // FILE-walk cursor — a fully delivered window of a longer file
+        // still continues past the window (the walk must be able to reach
+        // the real end; "no more" only at true EOF). A budget stop resumes
+        // on the stopped line; an oversized line is declared undeliverable
+        // and the cursor moves past it — never silently.
+        let delivered_last_line = spans.last().map(|span| span.line);
+        let has_more =
+            stopped_at.is_some() || delivered_last_line.is_some_and(|last| last < line_count);
+        let continuation = {
+            let next = match stopped_at {
+                Some(stop) if stop_is_oversized => Some(stop + 1),
+                Some(stop) => Some(stop),
+                None => delivered_last_line.map(|last| last + 1),
+            };
+            next.filter(|&next| next <= line_count).map(|next| {
+                // Inside the requested window, finish that window
+                // first; past it, continue with the tool's own
+                // default page size (200 lines), bounded by the file.
+                let end = if next <= window_end_visible {
+                    requested_end
+                } else {
+                    (next + FS_READ_PAGE_LINES - 1).min(line_count)
+                };
+                (next, end)
+            })
+        };
+
+        // The finalized page: the shared loop measures the FINAL envelope
+        // (header claim + numbered spans + footer) and drops trailing
+        // spans on an overrun; every claim below is derived from the kept
+        // spans only.
+        let page = finalize_within_budget(
+            spans,
+            |spans: &[DeliveredSpan]| -> (String, Option<String>) {
+                let first = spans.first().map(|span| span.line);
+                let last = spans.last().map(|span| span.line);
+                let mut content = format!(
+                    "file={quoted_relative} revision={revision} line_ending={}",
+                    line_ending.as_str()
+                );
+                if mixed && let (Some(first), Some(last)) = (first, last) {
+                    let tokens = mixed_eol_tokens(&text, first - 1, last);
+                    content.push_str(eol_label);
+                    content.push_str(&tokens);
+                }
+                match (first, last) {
+                    (Some(first), Some(last)) => {
+                        content.push_str(&format!(" lines={first}-{last}/{line_count}"));
+                    }
+                    _ if line_count == 0 => {
+                        content.push_str(" lines=0-0/0");
+                    }
+                    _ => {}
+                }
+                if !spans.is_empty() {
+                    content.push('\n');
+                    content.push_str(&render_numbered_spans(spans));
+                }
+                let mut clauses: Vec<String> = Vec::new();
+                if stop_is_oversized {
+                    if let Some(stop) = stopped_at {
+                        clauses.push(format!(
+                            "line {stop} exceeds the page budget and is not shown"
+                        ));
+                    }
+                } else if let (Some(_stop), Some(first), Some(last)) = (stopped_at, first, last) {
+                    clauses.push(format!(
+                        "requested lines {}-{}; showing lines {first}-{last} at the page budget",
+                        requested_start + 1,
+                        window_end_visible
+                    ));
+                }
+                if let Some((next, end)) = continuation {
+                    clauses.push(format!(
+                        "continue with fs.read path={relative} start_line={next} end_line={end}"
+                    ));
+                }
+                (content, coverage_footer(clauses))
+            },
         );
-        if line_ending == LineEnding::Mixed {
-            let tokens = mixed_eol_tokens(&text, requested_start, requested_end);
-            model_content.push_str(" eol_tokens(C=CRLF,L=LF,N=none)=");
-            model_content.push_str(&tokens);
-        }
-        if let (Some(start_line), Some(end_line)) = (returned_start, returned_end) {
-            model_content.push_str(&format!(" lines={start_line}-{end_line}/{line_count}"));
-        } else if line_count == 0 {
-            model_content.push_str(" lines=0-0/0");
-        }
-        if !selected.is_empty() {
-            model_content.push('\n');
-            model_content.push_str(&selected);
-        }
+
+        let start = requested_start.min(line_count);
+        let end = window_end_visible;
+        let returned_start = page.spans.first().map(|span| span.line as u64);
+        let returned_end = page.spans.last().map(|span| span.line as u64);
+        let covers_file = match line_count {
+            0 => true,
+            // Whole-file coverage only when the file was delivered
+            // contiguously from its first line to its last.
+            _ => returned_start == Some(1) && returned_end == Some(line_count as u64),
+        };
 
         let mut output = ToolOutput {
             call_id: call_id.into(),
             tool_name: "fs.read".into(),
             ok: true,
-            summary: format!("read lines {}-{} of {}", start + 1, end, relative),
-            model_content,
+            summary: format!(
+                "read lines {}-{} of {}",
+                returned_start.unwrap_or(start as u64 + 1),
+                returned_end.unwrap_or(end as u64),
+                relative
+            ),
+            model_content: page.body,
             artifact_ref: None,
             metadata: json!({
                 "path": relative,
@@ -541,9 +696,13 @@ impl Tool for FsReadTool {
                 // bytes, changes with any edit — the patch tool's
                 // `base_revision` precondition is checked against this.
                 "revision": revision,
+                // G2: the window metadata names the DELIVERED range —
+                // the model-visible proof — never the requested range.
                 "start_line": returned_start,
                 "end_line": returned_end,
                 "covers_file": covers_file,
+                "has_more": has_more,
+                "next_start_line": continuation.map(|(next, _)| next as u64),
             }),
         };
         output.set_native_execution_facts(
@@ -1660,6 +1819,373 @@ mod tests {
         assert!(
             !output.model_content.contains("Cargo.toml")
                 || output.model_content.contains("Do not invent")
+        );
+    }
+
+    // -- G2/G3 fs.read regressions (tenth batch follow-up) -------------------
+    //
+    // fs.read must page under the FINAL model-content budget (the same cap
+    // the trusted broker and the runtime last-line guard enforce), so its
+    // `lines=S-E/N` claim and its continuation describe only source content
+    // actually present in the final delivered text. The probes below walk
+    // the REAL tool→broker path and follow ONLY the continuations the
+    // model-visible body offers.
+
+    /// Run one fs.read call through the REAL trusted output broker, exactly
+    /// as the kernel does (the executed tool's declared output budget).
+    async fn read_fs_through_broker(
+        tool: &FsReadTool,
+        broker: &agent_workspace::WorkspaceOutputBroker,
+        run_id: RunId,
+        args: Value,
+    ) -> ToolOutput {
+        let outcome = tool
+            .execute(run_id, "c", args, None, CancellationToken::new())
+            .await
+            .expect("fs.read must execute");
+        let ToolOutcome::Value(output) = outcome else {
+            panic!("fs.read returns a plain value");
+        };
+        use agent_contracts::OutputBroker as _;
+        broker
+            .bound(
+                run_id,
+                Some(agent_contracts::MAX_TOOL_MODEL_CONTENT_CHARS),
+                output,
+            )
+            .await
+    }
+
+    /// Parse the header claim `lines=S-E/TOTAL` of an fs.read body.
+    fn fs_claimed_lines(body: &str) -> Option<(usize, usize, usize)> {
+        let at = body.find("lines=")? + "lines=".len();
+        let segment: String = body[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '/')
+            .collect();
+        let mut parts = segment.split('/');
+        let mut range = parts.next()?.split('-');
+        let start = range.next()?.parse().ok()?;
+        let end = range.next()?.parse().ok()?;
+        let total = parts.next()?.parse().ok()?;
+        Some((start, end, total))
+    }
+
+    /// Parse a delivered page body into its rendered (source line, text)
+    /// entries: the `{:>6} | ` numbered lines, excluding the file header
+    /// and the coverage footer.
+    fn fs_rendered_entries(body: &str) -> Vec<(usize, String)> {
+        body.lines()
+            .filter_map(|line| {
+                if line.starts_with("file=") || line.starts_with('[') {
+                    return None;
+                }
+                let (number, text) = line.split_once(" | ")?;
+                Some((number.trim().parse::<usize>().ok()?, text.to_string()))
+            })
+            .collect()
+    }
+
+    /// Extract the continuation arguments EXACTLY as the model-visible body
+    /// states them: `continue with fs.read path=... start_line=... end_line=...`.
+    fn fs_continuation_args(content: &str) -> Value {
+        let marker = "continue with fs.read ";
+        let at = content
+            .find(marker)
+            .unwrap_or_else(|| panic!("the page must offer a continuation in its body: {content}"));
+        let clause = content[at + marker.len()..]
+            .split(['\n', ';'])
+            .next()
+            .unwrap_or_default();
+        let mut path = None;
+        let mut start_line = None;
+        let mut end_line = None;
+        for token in clause.split_whitespace() {
+            if let Some(value) = token.strip_prefix("path=") {
+                path = Some(value.to_string());
+            } else if let Some(value) = token.strip_prefix("start_line=") {
+                start_line = value.parse::<usize>().ok();
+            } else if let Some(value) = token.strip_prefix("end_line=") {
+                end_line = value.parse::<usize>().ok();
+            }
+        }
+        serde_json::json!({
+            "path": path.expect("the continuation must name the path"),
+            "start_line": start_line.expect("the continuation must name start_line"),
+            "end_line": end_line.expect("the continuation must name end_line"),
+        })
+    }
+
+    fn fs_page_body_checks(output: &ToolOutput) {
+        assert!(
+            output.model_content.chars().count() <= agent_contracts::MAX_TOOL_MODEL_CONTENT_CHARS,
+            "the FINAL model-visible body must stay within the model-content budget: {} chars",
+            output.model_content.chars().count()
+        );
+        assert!(
+            !output.model_content.contains("output broker truncated")
+                && !output.model_content.contains("runtime truncated"),
+            "a page under the final budget must reach the model verbatim — no head+tail clip: {}",
+            output.summary
+        );
+    }
+
+    /// G2 fs.read probe (KV-sequence shape): 600 lines of exactly 150
+    /// content chars; unique block IDs at lines 100/300/500 (page middles
+    /// of 200-line requests). Following ONLY the returned continuations
+    /// through the real broker must deliver every line verbatim exactly
+    /// once — no gaps, no overlaps — with every page inside the final
+    /// budget and untrimmed.
+    #[tokio::test]
+    async fn fs_read_walk_delivers_every_line_via_returned_continuations() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let total = 600usize;
+        let line_ids: Vec<String> = (1..=total)
+            .map(|line| format!("FS2-L{line:04}-{line:x}7f{line:03}"))
+            .collect();
+        let mut body = String::new();
+        for line in 1..=total {
+            let mut text = line_ids[line - 1].clone();
+            while text.chars().count() < 150 {
+                text.push('x');
+            }
+            body.push_str(&text);
+            body.push('\n');
+        }
+        std::fs::write(dir.path().join("big.log"), &body).unwrap();
+        let tool = FsReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let mut args = json!({"path": "big.log"});
+        let mut delivered: std::collections::BTreeMap<usize, String> =
+            std::collections::BTreeMap::new();
+        let mut pages = 0usize;
+        loop {
+            let output = read_fs_through_broker(&tool, &broker, run_id, args.clone()).await;
+            fs_page_body_checks(&output);
+            pages += 1;
+            assert!(pages < 20, "the walk must converge: {pages} pages");
+            for (number, text) in fs_rendered_entries(&output.model_content) {
+                let slot = delivered.entry(number).or_default();
+                assert!(
+                    slot.is_empty(),
+                    "line {number} delivered twice — no overlaps allowed"
+                );
+                *slot = text;
+            }
+            let has_more = output.metadata["has_more"].as_bool().unwrap();
+            if !has_more {
+                break;
+            }
+            args = fs_continuation_args(&output.model_content);
+        }
+        assert_eq!(
+            delivered.keys().copied().collect::<Vec<_>>(),
+            (1..=total).collect::<Vec<_>>(),
+            "the delivered source intervals must cover lines 1..={total} exactly"
+        );
+        for (number, text) in &delivered {
+            let mut expected = line_ids[number - 1].clone();
+            while expected.chars().count() < 150 {
+                expected.push('x');
+            }
+            assert_eq!(text, &expected, "line {number} must be delivered verbatim");
+        }
+        // Mid-page markers (the review's lines 100/300 positions and the
+        // KV walk's 500): delivered exactly once each.
+        for marker_line in [100usize, 300, 500] {
+            assert!(delivered[&marker_line].contains(&line_ids[marker_line - 1]));
+        }
+    }
+
+    /// G2 fs.read claim honesty: the `lines=S-E/N` header claim and the
+    /// metadata window describe EXACTLY the rendered source lines of the
+    /// final delivered body — never the requested-but-undelivered range —
+    /// and the continuation points at the first undelivered line.
+    #[tokio::test]
+    async fn fs_read_claim_and_metadata_describe_the_delivered_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut body = String::new();
+        for line in 1..=600usize {
+            let marker = if line == 100 { "FS-CLAIM-MID-L100" } else { "" };
+            let mut text = format!("row-{line:04}{marker}");
+            while text.chars().count() < 150 {
+                text.push('.');
+            }
+            body.push_str(&text);
+            body.push('\n');
+        }
+        std::fs::write(dir.path().join("claims.log"), &body).unwrap();
+        let tool = FsReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let output = read_fs_through_broker(
+            &tool,
+            &broker,
+            run_id,
+            json!({"path": "claims.log", "start_line": 1, "end_line": 200}),
+        )
+        .await;
+        fs_page_body_checks(&output);
+
+        let entries = fs_rendered_entries(&output.model_content);
+        assert!(!entries.is_empty(), "the page must deliver lines");
+        let first = entries[0].0;
+        let last = entries[entries.len() - 1].0;
+        let claimed = fs_claimed_lines(&output.model_content)
+            .expect("the header must carry the lines= claim");
+        assert_eq!(
+            claimed,
+            (first, last, 600),
+            "the claim must describe exactly the delivered range: {}",
+            output.model_content
+        );
+        assert_eq!(output.metadata["start_line"], first as u64);
+        assert_eq!(output.metadata["end_line"], last as u64);
+        assert_eq!(output.metadata["line_count"], 600);
+        assert_eq!(output.metadata["covers_file"], false);
+        assert_eq!(output.metadata["has_more"], true);
+        assert_eq!(output.metadata["next_start_line"], last as u64 + 1);
+        // The next window's first line exists and was not silently shown.
+        assert!(last < 200);
+        // A mid-window marker inside the delivered range rides in the body.
+        if last >= 100 {
+            assert!(output.model_content.contains("FS-CLAIM-MID-L100"));
+        }
+        assert!(
+            output
+                .model_content
+                .contains(&format!("start_line={}", last + 1)),
+            "the body must carry the continuation: {}",
+            output.model_content
+        );
+    }
+
+    /// G3-adjacent fs.read probe: multibyte lines are budgeted by rendered
+    /// CHARS (the broker trims by chars), whole lines are never cut, code
+    /// points never split, and source line identity survives the walk.
+    #[tokio::test]
+    async fn fs_read_multibyte_pages_by_chars_without_cutting_code_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let total = 300usize;
+        let mut body = String::new();
+        for line in 1..=total {
+            let marker = if line == 150 { "FS3-界-MARKER" } else { "" };
+            let mut text = format!("row-{line:04}{marker}");
+            while text.chars().count() < 400 {
+                text.push('界');
+            }
+            body.push_str(&text);
+            body.push('\n');
+        }
+        std::fs::write(dir.path().join("multibyte.log"), &body).unwrap();
+        let tool = FsReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let mut args = json!({"path": "multibyte.log"});
+        let mut delivered: Vec<(usize, String)> = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let output = read_fs_through_broker(&tool, &broker, run_id, args.clone()).await;
+            fs_page_body_checks(&output);
+            assert!(
+                !output.model_content.contains('\u{FFFD}'),
+                "no page may cut a code point in half: {}",
+                output.summary
+            );
+            pages += 1;
+            assert!(pages < 40, "the walk must converge: {pages} pages");
+            delivered.extend(fs_rendered_entries(&output.model_content));
+            if !output.metadata["has_more"].as_bool().unwrap() {
+                break;
+            }
+            args = fs_continuation_args(&output.model_content);
+        }
+        let numbers: Vec<usize> = delivered.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            numbers,
+            (1..=total).collect::<Vec<_>>(),
+            "source line identity is preserved, no renumbering, no gaps"
+        );
+        for (number, text) in &delivered {
+            let mut expected = format!("row-{number:04}");
+            if *number == 150 {
+                expected.push_str("FS3-界-MARKER");
+            }
+            while expected.chars().count() < 400 {
+                expected.push('界');
+            }
+            assert_eq!(text, &expected, "line {number} verbatim");
+        }
+    }
+
+    /// A single line longer than the whole page budget cannot be shown by
+    /// fs.read at all. It must be DECLARED (never silently skipped, never
+    /// partially presented as if complete), the page must stay bounded,
+    /// and the following short line must remain reachable under its true
+    /// source number.
+    #[tokio::test]
+    async fn fs_read_oversized_line_is_declared_not_silently_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut body = "a".repeat(40_000);
+        body.push('\n');
+        body.push_str("FS4-short-second-line\n");
+        std::fs::write(dir.path().join("oversized.log"), &body).unwrap();
+        let tool = FsReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let first = read_fs_through_broker(
+            &tool,
+            &broker,
+            run_id,
+            json!({"path": "oversized.log", "start_line": 1, "end_line": 2}),
+        )
+        .await;
+        fs_page_body_checks(&first);
+        assert_eq!(
+            first.metadata["has_more"], true,
+            "line 1 is unshown: the page must not claim completion"
+        );
+        assert!(
+            !first.model_content.contains("FS4-short-second-line"),
+            "no line after the first unshowable position may be captured: {}",
+            first.model_content
+        );
+        assert!(
+            first.model_content.contains("exceeds the page budget"),
+            "the oversized line must be declared in the body: {}",
+            first.model_content
+        );
+
+        // Follow the returned continuation verbatim: the short line under
+        // its TRUE source number, and an honest end of the walk.
+        let second = read_fs_through_broker(
+            &tool,
+            &broker,
+            run_id,
+            fs_continuation_args(&first.model_content),
+        )
+        .await;
+        fs_page_body_checks(&second);
+        let entries = fs_rendered_entries(&second.model_content);
+        assert_eq!(
+            entries,
+            vec![(2usize, "FS4-short-second-line".to_string())],
+            "source line identity preserved: {}",
+            second.model_content
+        );
+        assert!(
+            !second.model_content.contains("output broker truncated"),
+            "the follow-up page reaches the model verbatim: {}",
+            second.model_content
         );
     }
 }

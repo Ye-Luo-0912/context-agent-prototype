@@ -4,6 +4,7 @@ mod context;
 mod edit;
 mod fs;
 mod git;
+mod page;
 mod patch;
 mod process;
 mod search;
