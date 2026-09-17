@@ -208,13 +208,15 @@ fn quoted_line(request: &ModelRequest, which: &str) -> String {
 struct JourneyModel {
     step: AtomicUsize,
     parks: std::sync::Mutex<Vec<watch::Receiver<bool>>>,
+    trace: Arc<JourneyTrace>,
 }
 
 impl JourneyModel {
-    fn new(start: usize, parks: Vec<watch::Receiver<bool>>) -> Arc<Self> {
+    fn new(start: usize, parks: Vec<watch::Receiver<bool>>, trace: Arc<JourneyTrace>) -> Arc<Self> {
         Arc::new(Self {
             step: AtomicUsize::new(start),
             parks: std::sync::Mutex::new(parks),
+            trace,
         })
     }
 
@@ -238,41 +240,67 @@ impl ModelTransport for JourneyModel {
     async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
         let step = self.step.fetch_add(1, Ordering::SeqCst);
         eprintln!("[t7 journey model] scripted round {step}");
-        match step {
-            0 => Ok(write_output("part_a.md", PART_A, 0)),
+        self.trace.record(format!("model: round {step} requested"));
+        let output = match step {
+            0 => write_output("part_a.md", PART_A, 0),
             1 => {
+                self.trace
+                    .record("model: round 1 parked (the steer hold begins)".into());
                 let rx = self.take_park("the part A hold");
                 wait_released(rx).await;
-                Ok(text_output(FINAL_A))
+                self.trace
+                    .record("model: round 1 released (the steer hold ended)".into());
+                text_output(FINAL_A)
             }
-            2 => Ok(read_output("part_a.md", 2)),
+            2 => read_output("part_a.md", 2),
             3 => {
                 let line = quoted_line(&request, "PART_A");
-                Ok(write_output("part_b.md", &format!("Q: {line}"), 3))
+                write_output("part_b.md", &format!("Q: {line}"), 3)
             }
-            4 => Ok(text_output(FINAL_B)),
+            4 => text_output(FINAL_B),
             5 => {
+                self.trace
+                    .record("model: round 5 parked (the cancel hold begins)".into());
                 let rx = self.take_park("the cancel hold");
                 tokio::select! {
-                    _ = wait_released(rx) => {}
-                    _ = request.cancel.cancelled() => {}
+                    _ = wait_released(rx) => {
+                        self.trace.record("model: round 5 released".into());
+                    }
+                    _ = request.cancel.cancelled() => {
+                        self.trace
+                            .record("model: round 5 settled via the cancel token".into());
+                    }
                 }
-                Ok(text_output(FINAL_HELD))
+                text_output(FINAL_HELD)
             }
-            6 => Ok(read_output("part_b.md", 6)),
+            6 => read_output("part_b.md", 6),
             7 => {
                 let line = quoted_line(&request, "PART_B");
-                Ok(write_output(
-                    "summary.md",
-                    &format!("summary of: {line}"),
-                    7,
-                ))
+                write_output("summary.md", &format!("summary of: {line}"), 7)
             }
-            8 => Ok(text_output(FINAL_SUMMARY)),
-            other => Err(AgentError::InvalidRequest(format!(
-                "t7 journey model reached an unexpected scripted round {other}"
-            ))),
+            8 => text_output(FINAL_SUMMARY),
+            other => {
+                return Err(AgentError::InvalidRequest(format!(
+                    "t7 journey model reached an unexpected scripted round {other}"
+                )));
+            }
+        };
+        for call in &output.tool_calls {
+            let path = call
+                .arguments
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            self.trace.record(format!(
+                "model: round {step} emits {} call={} path={path}",
+                call.name, call.id
+            ));
         }
+        if output.tool_calls.is_empty() {
+            self.trace
+                .record(format!("model: round {step} returns a plain final"));
+        }
+        Ok(output)
     }
 }
 
@@ -619,6 +647,178 @@ fn uuid_like() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Execution-chain probe. Every stage of the journey (scripted model rounds,
+// wire approvals, runtime operation/tool events) records one bounded fact
+// into the shared trace; the success path prints nothing. When a wait fails,
+// the failure message carries the accumulated chain, so a CI failure names
+// the stage that broke (model round emitted? approval seen and released?
+// operation accepted / tool finished? durable receipt? disk state) instead
+// of only "the file never appeared".
+// ---------------------------------------------------------------------------
+
+struct JourneyTrace {
+    started: std::time::Instant,
+    entries: std::sync::Mutex<Vec<String>>,
+}
+
+impl JourneyTrace {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: std::time::Instant::now(),
+            entries: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn record(&self, fact: String) {
+        let stamp = format!("{:>7.3}s", self.started.elapsed().as_secs_f64());
+        self.entries
+            .lock()
+            .expect("journey trace mutex")
+            .push(format!("{stamp}  {fact}"));
+    }
+
+    fn report(&self) -> String {
+        let entries = self.entries.lock().expect("journey trace mutex");
+        if entries.is_empty() {
+            return "execution-chain trace: (no stage observations recorded)".into();
+        }
+        let mut report = format!("execution-chain trace, {} observations:", entries.len());
+        for entry in entries.iter() {
+            report.push('\n');
+            report.push_str("  ");
+            report.push_str(entry);
+        }
+        report
+    }
+}
+
+/// Bounded text for a diagnostic line: identity evidence, never full bodies.
+fn truncate_for_trace(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let mut cut: String = text.chars().take(max_chars).collect();
+        cut.push_str("...");
+        cut
+    }
+}
+
+fn operation_state_label(state: &agent_contracts::OperationState) -> &'static str {
+    match state {
+        agent_contracts::OperationState::Accepted => "accepted",
+        agent_contracts::OperationState::Executing { .. } => "executing",
+        agent_contracts::OperationState::Prepared { .. } => "prepared",
+        agent_contracts::OperationState::CommitStarted { .. } => "commit-started",
+        agent_contracts::OperationState::Terminal { .. } => "terminal",
+    }
+}
+
+/// The RuntimeEvent facts the diagnosis needs: model rounds, Core operation
+/// acceptance, tool start/finish (with the effect path the tool stamped),
+/// turn boundaries and typed failures. Everything else is ignored to keep
+/// the trace a chain, not a dump.
+fn event_fact(event: &RuntimeEvent) -> Option<String> {
+    match event {
+        RuntimeEvent::FocusChanged { task_id, goal } => Some(format!(
+            "runtime: focus -> task {task_id} goal={:?}",
+            truncate_for_trace(goal, 48)
+        )),
+        RuntimeEvent::ModelStarted {
+            turn_id,
+            model_round,
+            ..
+        } => Some(format!(
+            "runtime: model round {model_round} started turn={turn_id}"
+        )),
+        RuntimeEvent::AssistantMessage { content } => Some(format!(
+            "runtime: assistant final {:?}",
+            truncate_for_trace(content, 64)
+        )),
+        RuntimeEvent::OperationAccepted { snapshot } => {
+            let identity = &snapshot.identity;
+            Some(format!(
+                "runtime: operation accepted tool={} call={} op={} state={}",
+                identity.tool_name,
+                identity.call_id,
+                identity.operation_id,
+                operation_state_label(&snapshot.state),
+            ))
+        }
+        RuntimeEvent::ToolStarted { call } => Some(format!(
+            "runtime: tool started {} call={}",
+            call.name, call.id
+        )),
+        RuntimeEvent::ToolFinished { output, .. } => {
+            let path = output
+                .file_path()
+                .map(|path| format!(" path={path}"))
+                .unwrap_or_default();
+            Some(format!(
+                "runtime: tool finished {} ok={} call={}{path}",
+                output.tool_name, output.ok, output.call_id
+            ))
+        }
+        RuntimeEvent::Warning { message } => Some(format!(
+            "runtime: warning {:?}",
+            truncate_for_trace(message, 96)
+        )),
+        RuntimeEvent::Error { message } => Some(format!(
+            "runtime: error {:?}",
+            truncate_for_trace(message, 96)
+        )),
+        RuntimeEvent::Failure {
+            class,
+            retryable,
+            message,
+        } => Some(format!(
+            "runtime: failure class={class:?} retryable={retryable} {:?}",
+            truncate_for_trace(message, 96)
+        )),
+        RuntimeEvent::TurnFailed {
+            turn_id,
+            task_id,
+            class,
+            retryable,
+        } => Some(format!(
+            "runtime: turn failed turn={turn_id} task={task_id:?} class={class:?} retryable={retryable}"
+        )),
+        RuntimeEvent::TurnCancelled { turn_id, .. } => {
+            Some(format!("runtime: turn cancelled turn={turn_id}"))
+        }
+        RuntimeEvent::TaskCompleted { task_id, .. } => {
+            Some(format!("runtime: task completed task={task_id}"))
+        }
+        RuntimeEvent::RuntimeRestored { .. } => Some("runtime: restored".into()),
+        _ => None,
+    }
+}
+
+/// Best-effort background recorder over a broadcast subscription. A lagged
+/// or closed subscriber is itself a recorded fact, never a test failure.
+fn spawn_event_recorder(
+    mut events: broadcast::Receiver<agent_contracts::RuntimeEventEnvelope>,
+    trace: Arc<JourneyTrace>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(envelope) => {
+                    if let Some(fact) = event_fact(&envelope.event) {
+                        trace.record(fact);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    trace.record(format!(
+                        "runtime event recorder lagged; {skipped} envelopes skipped"
+                    ));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Journey helpers.
 // ---------------------------------------------------------------------------
 
@@ -637,18 +837,23 @@ fn readiness_of(snapshot: &WorkSnapshotResponse) -> WorkContinueReason {
 /// Approves whatever is pending over the wire, then waits until the runtime
 /// is idle. This is the GUI's real loop: the turn parks inside the
 /// interactive approval gate until `approval/respond` delivers the decision.
+/// Every answered approval is recorded into the trace (request id + outcome)
+/// so a later wait failure can show whether the effect's approval was seen
+/// and released at all.
 async fn drive_turn_to_idle<S: Read + Write>(
     stream: &mut S,
     what: &str,
+    trace: &JourneyTrace,
 ) -> anyhow::Result<WorkSnapshotResponse> {
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut answered = 0usize;
     loop {
         let snapshot = expect_value(exchange::<_, _, WorkSnapshotResponse>(
             stream,
             &snapshot_request(),
         )?);
         if let Some(pending) = snapshot.pending_approvals.first() {
-            let answered = expect_value(exchange::<_, _, ApprovalRespondResponse>(
+            let answered_wire = expect_value(exchange::<_, _, ApprovalRespondResponse>(
                 stream,
                 &request(
                     "approval",
@@ -659,15 +864,24 @@ async fn drive_turn_to_idle<S: Read + Write>(
                     },
                 ),
             )?);
-            assert_eq!(answered.outcome, ApprovalRespondOutcome::Delivered);
+            assert_eq!(answered_wire.outcome, ApprovalRespondOutcome::Delivered);
+            answered += 1;
+            trace.record(format!(
+                "wire: approval #{answered} request_id={} answered Allow -> {:?} (while {what})",
+                pending.request_id, answered_wire.outcome
+            ));
             continue;
         }
         if readiness_of(&snapshot) != WorkContinueReason::TurnRunning {
+            trace.record(format!(
+                "wire: {what} idle after {answered} approval(s) answered"
+            ));
             return Ok(snapshot);
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the runtime never left the running state while waiting for {what}"
+            "the runtime never left the running state while waiting for {what}\n{}",
+            trace.report()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -682,41 +896,158 @@ async fn drive_turn_to_idle<S: Read + Write>(
 /// expired 30s here; attempt 2 and local runs are single-digit seconds),
 /// so the budget matches `drive_turn_to_idle` instead of the local steady
 /// state. A real effect regression still fails this wait — just later.
+/// On expiry the error carries the whole observed execution chain (see
+/// `JourneyTrace`) plus the disk state and the durable effect receipts, so
+/// "file missing", "wrong content" and "chain broke at stage X" are
+/// distinguishable in the CI log.
 async fn wait_file_content(
+    root: &std::path::Path,
     path: &std::path::Path,
     expected: &str,
     what: &str,
+    trace: &JourneyTrace,
 ) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(120);
+    let mut polls = 0usize;
+    let mut first_mismatch: Option<String> = None;
+    let mut first_error: Option<String> = None;
     loop {
-        if std::fs::read_to_string(path)
-            .map(|content| content == expected)
-            .unwrap_or(false)
-        {
-            return Ok(());
+        polls += 1;
+        match std::fs::read_to_string(path) {
+            Ok(content) if content == expected => {
+                trace.record(format!(
+                    "effect: {what} observed on disk after {polls} polls"
+                ));
+                return Ok(());
+            }
+            Ok(content) => {
+                if first_mismatch.is_none() {
+                    trace.record(format!(
+                        "effect: {what} EXISTS on disk but content mismatched (len={})",
+                        content.len()
+                    ));
+                    first_mismatch = Some(truncate_for_trace(&content, 160));
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    trace.record(format!("effect: {what} not readable yet ({error})"));
+                    first_error = Some(error.to_string());
+                }
+            }
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the committed effect never landed for {what}"
+            "the committed effect never landed for {what} after {polls} polls in {:.3}s\n{}",
+            started.elapsed().as_secs_f64(),
+            wait_failure_evidence(
+                root,
+                path,
+                expected,
+                what,
+                first_mismatch.as_deref(),
+                first_error.as_deref(),
+                trace
+            )
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
+/// Disk state and durable effect receipts gathered when the wait expires.
+/// Every read is bounded and fail-soft: this is diagnostic context for the
+/// failure message, never an extra assertion. The evidence read races the
+/// deadline by construction, so a file that landed just after expiry is
+/// reported as such instead of being mistaken for a landing.
+fn wait_failure_evidence(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    expected: &str,
+    what: &str,
+    first_mismatch: Option<&str>,
+    first_error: Option<&str>,
+    trace: &JourneyTrace,
+) -> String {
+    let mut lines = vec![format!("failure evidence while waiting for {what}:")];
+    if let Some(mismatch) = first_mismatch {
+        lines.push(format!(
+            "  during polling: file EXISTED with mismatched content, first actual={mismatch:?}"
+        ));
+    }
+    if let Some(error) = first_error {
+        lines.push(format!(
+            "  during polling: file was MISSING/unreadable, first error={error:?}"
+        ));
+    }
+    match std::fs::metadata(path) {
+        Ok(metadata) => lines.push(format!(
+            "  disk: {} EXISTS, len={} bytes",
+            path.display(),
+            metadata.len()
+        )),
+        Err(error) => lines.push(format!("  disk: {} MISSING ({error})", path.display())),
+    }
+    match std::fs::read_to_string(path) {
+        Ok(actual) if actual == expected => {
+            lines.push(
+                "  content: equals expected at evidence time (landed between the deadline \
+                 and this read — pure slowness, not a missing effect)"
+                    .into(),
+            );
+        }
+        Ok(actual) => lines.push(format!(
+            "  content: MISMATCH len={} actual={:?} expected={:?}",
+            actual.len(),
+            truncate_for_trace(&actual, 160),
+            truncate_for_trace(expected, 160)
+        )),
+        Err(error) => lines.push(format!("  content: unreadable ({error})")),
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    lines.push(format!(
+        "  durable receipts: change rows naming {file_name:?}: {}",
+        change_rows(root, file_name)
+    ));
+    lines.push(format!(
+        "  durable receipts: effect reservation rows naming {file_name:?}: {}",
+        std::fs::read_to_string(
+            root.join(".focus-agent")
+                .join("authority")
+                .join("broker-reservations.jsonl"),
+        )
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(file_name))
+        .count()
+    ));
+    lines.push(trace.report());
+    lines.join("\n")
+}
+
 /// Waits until the turn is RUNNING with nothing pending approval — twice in
 /// a row — which means the scripted model holds the turn open in its parked
 /// round. From this point the turn cannot end by itself, so a mid-turn
-/// steer (Queued) and a mid-turn cancel are deterministic.
-async fn wait_turn_parked<S: Read + Write>(stream: &mut S) -> anyhow::Result<()> {
+/// steer (Queued) and a mid-turn cancel are deterministic. Answered
+/// approvals are recorded into the trace; this is where the part_a write's
+/// approval is released, so its request id and outcome land in the chain.
+async fn wait_turn_parked<S: Read + Write>(
+    stream: &mut S,
+    trace: &JourneyTrace,
+) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut quiet = 0usize;
+    let mut answered = 0usize;
     loop {
         let snapshot = expect_value(exchange::<_, _, WorkSnapshotResponse>(
             stream,
             &snapshot_request(),
         )?);
         if let Some(pending) = snapshot.pending_approvals.first() {
-            let answered = expect_value(exchange::<_, _, ApprovalRespondResponse>(
+            let answered_wire = expect_value(exchange::<_, _, ApprovalRespondResponse>(
                 stream,
                 &request(
                     "approval",
@@ -727,11 +1058,19 @@ async fn wait_turn_parked<S: Read + Write>(stream: &mut S) -> anyhow::Result<()>
                     },
                 ),
             )?);
-            assert_eq!(answered.outcome, ApprovalRespondOutcome::Delivered);
+            assert_eq!(answered_wire.outcome, ApprovalRespondOutcome::Delivered);
+            answered += 1;
             quiet = 0;
+            trace.record(format!(
+                "wire: approval #{answered} request_id={} answered Allow -> {:?} (parking wait)",
+                pending.request_id, answered_wire.outcome
+            ));
         } else if readiness_of(&snapshot) == WorkContinueReason::TurnRunning {
             quiet += 1;
             if quiet >= 2 {
+                trace.record(format!(
+                    "wire: turn parked (2 quiet snapshots) after {answered} approval(s) answered"
+                ));
                 return Ok(());
             }
         } else {
@@ -739,7 +1078,8 @@ async fn wait_turn_parked<S: Read + Write>(stream: &mut S) -> anyhow::Result<()>
         }
         anyhow::ensure!(
             std::time::Instant::now() < deadline,
-            "the turn never reached its parked round"
+            "the turn never reached its parked round\n{}",
+            trace.report()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -783,6 +1123,10 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().to_path_buf();
 
+    // The execution-chain probe: silent while the journey is green, printed
+    // in full by whichever wait fails first.
+    let trace = JourneyTrace::new();
+
     // ============================ SESSION 1 ============================
     // The parks: gate 0 holds turn 1 for the mid-turn steer; gate 1 holds
     // the continued turn for the mid-turn cancel.
@@ -794,9 +1138,10 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
     let artifact_name;
     let run_id_1;
     {
-        let model = JourneyModel::new(0, vec![steer_hold, cancel_hold]);
+        let model = JourneyModel::new(0, vec![steer_hold, cancel_hold], Arc::clone(&trace));
         let fixture = journey_workspace(&root, model).await?;
         let mut events = fixture.composed.subscribe();
+        let _recorder = spawn_event_recorder(fixture.composed.subscribe(), Arc::clone(&trace));
         let handle: RuntimeHandle = fixture.composed.handle().clone();
         fixture.composed.instance.start().await?;
         run_id_1 = handle.run_id();
@@ -819,6 +1164,7 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         assert_eq!(submitted.disposition, WorkSubmitDisposition::Accepted);
         task_id = submitted.task_id;
         eprintln!("t7[session-1]: submitted -> task {task_id}");
+        trace.record(format!("wire: submit accepted task={task_id}"));
 
         // An idempotent retry of the same submission returns the SAME task —
         // the journey's identity does not fork.
@@ -839,11 +1185,13 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         // 2. The turn runs with REAL tools. Round 0 emits fs.write part_a.md;
         //    the write parks in the interactive approval gate until this client
         //    answers on the wire; then the model reaches its parked round.
-        wait_turn_parked(&mut stream).await?;
+        wait_turn_parked(&mut stream, &trace).await?;
         wait_file_content(
+            &root,
             &root.join("part_a.md"),
             PART_A,
             "part_a.md must be a real workspace artifact before the correction",
+            &trace,
         )
         .await?;
         assert!(!root.join("part_b.md").exists());
@@ -870,6 +1218,7 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         );
         assert_eq!(steered.task_id, Some(task_id));
         eprintln!("t7[session-1]: steer queued into the held turn");
+        trace.record("wire: steer queued into the held turn's correction slot".into());
 
         steer_release
             .send(true)
@@ -877,7 +1226,7 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         // The held turn ends with its final; the queued correction is drained
         // into turn 2, which READS part_a.md for real and writes part_b.md with
         // the corrected `Q: ` prefix.
-        let after_steer = drive_turn_to_idle(&mut stream, "the corrected turn").await?;
+        let after_steer = drive_turn_to_idle(&mut stream, "the corrected turn", &trace).await?;
         assert_eq!(
             after_steer.tasks.len(),
             1,
@@ -906,7 +1255,7 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         )?);
         assert_eq!(continued.disposition, WorkContinueDisposition::Continued);
         assert_eq!(continued.task_id, Some(task_id));
-        wait_turn_parked(&mut stream).await?;
+        wait_turn_parked(&mut stream, &trace).await?;
 
         let cancelled = expect_value(exchange::<_, _, WorkCancelResponse>(
             &mut stream,
@@ -936,7 +1285,8 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         // The parked model usually settles through the cancellation token
         // before this release fires; a gone receiver is that happy race.
         let _ = cancel_release.send(true);
-        let after_cancel = drive_turn_to_idle(&mut stream, "the cancel settle").await?;
+        trace.record("wire: cancel acked with the durable Cancelled barrier".into());
+        let after_cancel = drive_turn_to_idle(&mut stream, "the cancel settle", &trace).await?;
         assert_eq!(
             readiness_of(&after_cancel),
             WorkContinueReason::Ready,
@@ -977,6 +1327,9 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         );
         eprintln!("t7[session-1]: checkpoint {} saved", captured.artifact);
         artifact_name = captured.artifact.clone();
+        trace.record(format!(
+            "wire: checkpoint saved artifact={artifact_name} under run {run_id_1}"
+        ));
 
         drop(stream);
         fixture.composed.shutdown().await?;
@@ -991,9 +1344,10 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
     // 6. COLD RECOVERY: a new composition + a new host over the SAME
     //    workspace. The scripted model continues at round 6 (the remaining
     //    work), like the established restore harnesses.
-    let model = JourneyModel::new(6, Vec::new());
+    let model = JourneyModel::new(6, Vec::new(), Arc::clone(&trace));
     let fixture = journey_workspace(&root, model).await?;
     let mut events = fixture.composed.subscribe();
+    let _recorder = spawn_event_recorder(fixture.composed.subscribe(), Arc::clone(&trace));
     let handle: RuntimeHandle = fixture.composed.handle().clone();
     fixture.composed.instance.start().await?;
     let run_id_2 = handle.run_id();
@@ -1035,6 +1389,9 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
         "no evidence degradation on this restore: {:?}",
         restored.evidence_degraded
     );
+    trace.record(format!(
+        "wire: restore committed artifact={artifact_name} linked to run {run_id_1}"
+    ));
     wait_event(
         &mut events,
         |event| matches!(event, RuntimeEvent::RuntimeRestored { .. }),
@@ -1082,7 +1439,7 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
     )?);
     assert_eq!(resumed.disposition, WorkContinueDisposition::Continued);
     assert_eq!(resumed.task_id, Some(task_id));
-    drive_turn_to_idle(&mut stream, "the post-restore continuation").await?;
+    drive_turn_to_idle(&mut stream, "the post-restore continuation", &trace).await?;
     let summary = std::fs::read_to_string(root.join("summary.md"))?;
     assert_eq!(
         summary,
@@ -1188,6 +1545,8 @@ async fn same_task_journey(endpoint: LocalEndpoint) -> anyhow::Result<()> {
 async fn transient_failure_after_restore(endpoint: LocalEndpoint) -> anyhow::Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path().to_path_buf();
+    // Same probe as the main journey: silent unless a wait fails.
+    let trace = JourneyTrace::new();
 
     // ---- Session 1: stage part_a.md, save, exit. ----
     let task_id;
@@ -1215,7 +1574,7 @@ async fn transient_failure_after_restore(endpoint: LocalEndpoint) -> anyhow::Res
         )?);
         assert_eq!(submitted.disposition, WorkSubmitDisposition::Accepted);
         task_id = submitted.task_id;
-        drive_turn_to_idle(&mut stream, "the staging turn").await?;
+        drive_turn_to_idle(&mut stream, "the staging turn", &trace).await?;
         assert_eq!(
             std::fs::read_to_string(root.join("part_a.md"))?,
             FAILURE_PART_A
@@ -1290,7 +1649,7 @@ async fn transient_failure_after_restore(endpoint: LocalEndpoint) -> anyhow::Res
         ),
     )?);
     assert_eq!(resumed.disposition, WorkContinueDisposition::Continued);
-    drive_turn_to_idle(&mut stream, "the failing attempt").await?;
+    drive_turn_to_idle(&mut stream, "the failing attempt", &trace).await?;
     assert!(
         !root.join("archive").exists() && !root.join("archive/summary.md").exists(),
         "the refused write must not have created anything"
@@ -1329,7 +1688,7 @@ async fn transient_failure_after_restore(endpoint: LocalEndpoint) -> anyhow::Res
         ),
     )?);
     assert_eq!(retried.disposition, WorkContinueDisposition::Continued);
-    drive_turn_to_idle(&mut stream, "the retry").await?;
+    drive_turn_to_idle(&mut stream, "the retry", &trace).await?;
     assert_eq!(
         std::fs::read_to_string(root.join("archive").join("summary.md"))?,
         FAILURE_PART_A,
