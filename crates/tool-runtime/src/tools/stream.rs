@@ -34,6 +34,17 @@ enum StreamSource {
     Stderr,
 }
 
+impl StreamSource {
+    /// Independent decode slot per stream: a fragment of one stream never
+    /// completes a character for the other.
+    fn decode_slot(self) -> usize {
+        match self {
+            Self::Stdout => 0,
+            Self::Stderr => 1,
+        }
+    }
+}
+
 pub(crate) struct OutputChunk {
     bytes: Vec<u8>,
     /// This fragment ends the current logical line (newline or pipe EOF).
@@ -42,6 +53,9 @@ pub(crate) struct OutputChunk {
     newline: bool,
     /// This fragment follows an earlier fragment of the same overlong line.
     continued: bool,
+    /// Empty end-of-stream marker from the pump: lets the capture flush
+    /// each stream's retained UTF-8 decode suffix with lossy semantics.
+    eof: bool,
 }
 
 pub(crate) enum StreamChunk {
@@ -57,9 +71,10 @@ impl StreamChunk {
         }
     }
 
-    fn into_output(self) -> OutputChunk {
+    fn into_parts(self) -> (StreamSource, OutputChunk) {
         match self {
-            Self::Stdout(output) | Self::Stderr(output) => output,
+            Self::Stdout(output) => (StreamSource::Stdout, output),
+            Self::Stderr(output) => (StreamSource::Stderr, output),
         }
     }
 }
@@ -115,7 +130,7 @@ where
             if byte == b'\n' {
                 let bytes =
                     std::mem::replace(&mut pending, Vec::with_capacity(MAX_STREAM_ITEM_BYTES));
-                if !send_output(&tx, source, bytes, true, true, continued).await {
+                if !send_output(&tx, source, bytes, true, true, continued, false).await {
                     return;
                 }
                 continued = false;
@@ -127,7 +142,7 @@ where
             if pending.len() == MAX_STREAM_ITEM_BYTES {
                 let bytes =
                     std::mem::replace(&mut pending, Vec::with_capacity(MAX_STREAM_ITEM_BYTES));
-                if !send_output(&tx, source, bytes, false, false, continued).await {
+                if !send_output(&tx, source, bytes, false, false, continued, false).await {
                     return;
                 }
                 continued = true;
@@ -137,8 +152,12 @@ where
     }
 
     if !pending.is_empty() {
-        let _receiver_open = send_output(&tx, source, pending, true, false, continued).await;
+        let _receiver_open = send_output(&tx, source, pending, true, false, continued, false).await;
     }
+    // End-of-stream marker for THIS stream: the capture flushes its
+    // retained UTF-8 decode suffix with lossy semantics. The marker
+    // carries no bytes and is dropped silently if the receiver is gone.
+    let _ = send_output(&tx, source, Vec::new(), false, false, false, true).await;
 }
 
 async fn send_output(
@@ -148,6 +167,7 @@ async fn send_output(
     line_end: bool,
     newline: bool,
     continued: bool,
+    eof: bool,
 ) -> bool {
     debug_assert!(bytes.len() <= MAX_STREAM_ITEM_BYTES);
     tx.send(StreamChunk::from_output(
@@ -157,10 +177,106 @@ async fn send_output(
             line_end,
             newline,
             continued,
+            eof,
         },
     ))
     .await
     .is_ok()
+}
+
+/// An at-most-3-byte unfinished UTF-8 sequence retained between fragments
+/// of ONE stream. Decode state is per stream, so a fragment of one stream
+/// can never complete the other's character.
+#[derive(Default)]
+struct Utf8Tail {
+    bytes: [u8; 3],
+    len: usize,
+}
+
+impl Utf8Tail {
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn retain(&mut self, rest: &[u8]) {
+        debug_assert!(rest.len() <= 3, "an unfinished sequence is at most 3 bytes");
+        self.bytes[..rest.len()].copy_from_slice(rest);
+        self.len = rest.len();
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+/// Decode `bytes` (after this stream's retained suffix) up to the last
+/// complete character boundary, per `std::str::from_utf8` semantics:
+/// complete sequences pass through verbatim, an invalid sequence renders
+/// one U+FFFD and is consumed, and an unfinished suffix (1-3 bytes at the
+/// end) is retained for the next fragment of the same stream.
+fn decode_utf8_incremental(tail: &mut Utf8Tail, bytes: &[u8]) -> String {
+    let mut text = String::new();
+    if tail.is_empty() {
+        decode_utf8_into(&mut text, tail, bytes);
+    } else {
+        let mut merged = Vec::with_capacity(tail.len + bytes.len());
+        merged.extend_from_slice(tail.as_slice());
+        merged.extend_from_slice(bytes);
+        decode_utf8_into(&mut text, tail, &merged);
+    }
+    text
+}
+
+fn decode_utf8_into(text: &mut String, tail: &mut Utf8Tail, rest: &[u8]) {
+    let mut rest = rest;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                text.push_str(valid);
+                tail.clear();
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                // from_utf8 guarantees [..valid_up_to] is valid UTF-8.
+                text.push_str(std::str::from_utf8(&rest[..valid_up_to]).unwrap_or_default());
+                match error.error_len() {
+                    Some(consumed) => {
+                        // A genuinely invalid sequence: one replacement,
+                        // then keep decoding behind it.
+                        text.push('\u{FFFD}');
+                        rest = &rest[valid_up_to + consumed..];
+                        if rest.is_empty() {
+                            tail.clear();
+                            break;
+                        }
+                    }
+                    None => {
+                        // Incomplete sequence at the end: hold it for the
+                        // next fragment of this stream.
+                        tail.retain(&rest[valid_up_to..]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A retained suffix that can never complete (end of stream, or the line
+/// boundary it belonged to) ends as `String::from_utf8_lossy` would: an
+/// unfinished sequence is exactly one U+FFFD.
+fn flush_utf8_tail(tail: &mut Utf8Tail) -> String {
+    if tail.is_empty() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(tail.as_slice()).into_owned();
+    tail.clear();
+    text
 }
 
 /// Bounded model tail plus checked raw-output/artifact accounting.
@@ -171,6 +287,10 @@ pub(crate) struct StreamCapture {
     total_bytes: usize,
     artifact_bytes: usize,
     artifact_truncated: bool,
+    /// Per-stream incremental UTF-8 decode state: each stream holds at
+    /// most a 3-byte unfinished sequence between fragments, and the two
+    /// streams never share state.
+    decode: [Utf8Tail; 2],
 }
 
 impl StreamCapture {
@@ -182,6 +302,7 @@ impl StreamCapture {
             total_bytes: 0,
             artifact_bytes: 0,
             artifact_truncated: false,
+            decode: [Utf8Tail::default(), Utf8Tail::default()],
         }
     }
 
@@ -196,8 +317,30 @@ impl StreamCapture {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let output = item.into_output();
+        let (source, output) = item.into_parts();
         debug_assert!(output.bytes.len() <= MAX_STREAM_ITEM_BYTES);
+
+        // The pump's empty end-of-stream marker: flush THIS stream's
+        // retained decode suffix with lossy semantics. The raw bytes were
+        // already captured with their original fragments, so the marker
+        // adds no bytes and writes nothing; a flushed replacement text is
+        // counted together with its tail entry so the omission arithmetic
+        // stays exact.
+        if output.eof {
+            debug_assert!(
+                output.bytes.is_empty(),
+                "the end-of-stream marker carries no bytes"
+            );
+            let flushed = flush_utf8_tail(&mut self.decode[source.decode_slot()]);
+            if !flushed.is_empty() {
+                self.total_chunks = self.total_chunks.saturating_add(1);
+                if self.tail.len() >= BUFFER_LINES {
+                    self.tail.pop_front();
+                }
+                self.tail.push_back(flushed);
+            }
+            return Ok(false);
+        }
 
         let raw_bytes = output
             .bytes
@@ -230,7 +373,18 @@ impl StreamCapture {
             self.artifact_truncated = true;
         }
 
-        let mut display = String::from_utf8_lossy(&output.bytes).into_owned();
+        // Model-facing text decodes across fragments per stream: complete
+        // characters out now, an at-most-3-byte unfinished suffix held
+        // for the next fragment of the SAME stream.
+        let slot = source.decode_slot();
+        let mut display = decode_utf8_incremental(&mut self.decode[slot], &output.bytes);
+        if output.newline {
+            // A line boundary can never complete a partial sequence — the
+            // bytes after it belong to the next line — so a trailing
+            // partial sequence of a newline-terminated fragment is
+            // finished here, not carried across the break.
+            display.push_str(&flush_utf8_tail(&mut self.decode[slot]));
+        }
         if output.newline && display.ends_with('\r') {
             display.pop();
         }
@@ -319,7 +473,7 @@ mod tests {
 
         let mut rebuilt = Vec::new();
         while let Some(item) = rx.recv().await {
-            let output = item.into_output();
+            let (_source, output) = item.into_parts();
             assert!(output.bytes.len() <= MAX_STREAM_ITEM_BYTES);
             rebuilt.extend_from_slice(&output.bytes);
             if output.newline {
@@ -347,6 +501,7 @@ mod tests {
                         line_end: false,
                         newline: false,
                         continued: true,
+                        eof: false,
                     }),
                     &mut artifact,
                 )
@@ -362,5 +517,248 @@ mod tests {
             tokio::fs::metadata(path).await.unwrap().len(),
             MAX_ARTIFACT_BYTES as u64
         );
+    }
+
+    // -- H5 regressions (eleventh batch): incremental UTF-8 decoding ----------
+    //
+    // The pump splits long lines at raw-byte boundaries that need not fall
+    // on character boundaries. The model-facing tail must decode across
+    // fragments per stream (each stream keeps its own at most-3-byte
+    // unfinished suffix), flush the suffix at end-of-stream with lossy
+    // semantics, and leave the raw artifact byte-for-byte identical.
+
+    /// Drive the REAL pump for one stream and the REAL capture: every
+    /// chunk the pump emits is recorded into a temp-file artifact.
+    /// Returns the capture and the artifact bytes.
+    async fn pump_and_capture(input: &[u8], stderr: bool) -> (StreamCapture, Vec<u8>) {
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::channel(32);
+        if stderr {
+            spawn_stderr_reader(reader, tx.clone());
+        } else {
+            spawn_stdout_reader(reader, tx.clone());
+        }
+        drop(tx);
+        let input_owned = input.to_vec();
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(&input_owned).await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stream.log");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut artifact = BufWriter::new(file);
+        let mut capture = StreamCapture::new();
+        while let Some(chunk) = rx.recv().await {
+            capture.record(chunk, &mut artifact).await.unwrap();
+        }
+        artifact.flush().await.unwrap();
+        writer_task.await.unwrap();
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        (capture, bytes)
+    }
+
+    /// H5: a multi-byte character split at the 4000-byte fragment
+    /// boundary — 2/3/4-byte chars starting at every offset 3997..=4001 —
+    /// must reach the model tail as the original character, never as
+    /// U+FFFD, while the raw artifact stays byte-for-byte identical.
+    #[tokio::test]
+    async fn multibyte_chars_split_at_the_item_boundary_reach_the_model_tail_intact() {
+        for start in 3997_usize..=4001 {
+            for (label, ch) in [("2-byte", "é"), ("3-byte", "界"), ("4-byte", "\u{1F600}")] {
+                let mut line = String::new();
+                line.push_str(&"a".repeat(start));
+                line.push_str(ch);
+                line.push_str(&"z".repeat(64));
+                line.push('\n');
+                let input = line.as_bytes();
+                let (capture, artifact) = pump_and_capture(input, false).await;
+                let tail = capture.model_tail();
+                assert_eq!(
+                    tail.matches('\u{FFFD}').count(),
+                    0,
+                    "{label} char split at {start} must not be corrupted: {tail:?}"
+                );
+                assert!(
+                    tail.contains(ch),
+                    "{label} char split at {start} must reach the model tail intact: {tail:?}"
+                );
+                assert_eq!(
+                    artifact, input,
+                    "the raw artifact must be byte-for-byte identical"
+                );
+                assert_eq!(capture.total_bytes(), input.len());
+            }
+        }
+    }
+
+    /// H5: an unfinished multi-byte suffix at an unterminated end of
+    /// stream is flushed exactly once, with from_utf8_lossy semantics
+    /// (one U+FFFD for the partial sequence).
+    #[tokio::test]
+    async fn no_newline_eof_flushes_the_retained_suffix_lossily() {
+        let mut input = b"hello".to_vec();
+        input.extend_from_slice(&"界".as_bytes()[..2]);
+        let (capture, artifact) = pump_and_capture(&input, false).await;
+        let tail = capture.model_tail();
+        assert!(
+            tail.starts_with("hello"),
+            "the complete prefix must be unaffected: {tail:?}"
+        );
+        assert_eq!(
+            tail.matches('\u{FFFD}').count(),
+            1,
+            "the partial sequence becomes exactly one U+FFFD at EOF: {tail:?}"
+        );
+        assert_eq!(artifact, input, "raw artifact bytes must be identical");
+        assert_eq!(capture.total_bytes(), input.len());
+    }
+
+    /// H5: stdout and stderr decode suffixes are independent. Each
+    /// stream's first 4000-byte fragment ends mid-character; the OTHER
+    /// stream's completing fragment is recorded in between. The pending
+    /// bytes of one stream must never complete a character from the
+    /// other's bytes.
+    #[tokio::test]
+    async fn stdout_and_stderr_decode_suffixes_stay_independent() {
+        let stdout_input = format!("{}中\n", "a".repeat(3999));
+        let stderr_input = format!("{}界\n", "e".repeat(3999));
+        let (mut so_writer, so_reader) = tokio::io::duplex(64 * 1024);
+        let (mut se_writer, se_reader) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::channel(32);
+        spawn_stdout_reader(so_reader, tx.clone());
+        spawn_stderr_reader(se_reader, tx.clone());
+        drop(tx);
+
+        // Feed the first 4000 bytes of each stream (each ends mid-char),
+        // then stderr's remainder, then stdout's: a stderr fragment is
+        // recorded while stdout's suffix is still pending.
+        so_writer
+            .write_all(&stdout_input.as_bytes()[..4000])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        se_writer
+            .write_all(&stderr_input.as_bytes()[..4000])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        se_writer
+            .write_all(&stderr_input.as_bytes()[4000..])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        so_writer
+            .write_all(&stdout_input.as_bytes()[4000..])
+            .await
+            .unwrap();
+        drop(so_writer);
+        drop(se_writer);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interleaved.log");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut artifact = BufWriter::new(file);
+        let mut capture = StreamCapture::new();
+        let mut stdout_recon = Vec::new();
+        let mut stderr_recon = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            match &chunk {
+                StreamChunk::Stdout(output) => {
+                    stdout_recon.extend_from_slice(&output.bytes);
+                    if output.newline {
+                        stdout_recon.push(b'\n');
+                    }
+                }
+                StreamChunk::Stderr(output) => {
+                    stderr_recon.extend_from_slice(&output.bytes);
+                    if output.newline {
+                        stderr_recon.push(b'\n');
+                    }
+                }
+            }
+            capture.record(chunk, &mut artifact).await.unwrap();
+        }
+        artifact.flush().await.unwrap();
+
+        assert_eq!(
+            stdout_recon,
+            stdout_input.as_bytes(),
+            "stdout fragments must rebuild the original bytes"
+        );
+        assert_eq!(
+            stderr_recon,
+            stderr_input.as_bytes(),
+            "stderr fragments must rebuild the original bytes"
+        );
+        let tail = capture.model_tail();
+        assert_eq!(
+            tail.matches('\u{FFFD}').count(),
+            0,
+            "no stream may corrupt the other's characters: {tail:?}"
+        );
+        assert!(
+            tail.contains('中') && tail.contains('界'),
+            "both streams' characters must reach the model tail intact: {tail:?}"
+        );
+        assert_eq!(
+            capture.total_bytes(),
+            stdout_input.len() + stderr_input.len()
+        );
+    }
+
+    /// H5: genuinely invalid UTF-8 replaces exactly the invalid sequences
+    /// — [0xff, 0xfe] becomes exactly two U+FFFD — whether or not the
+    /// stream ends in a newline, and the artifact keeps the raw bytes.
+    #[tokio::test]
+    async fn invalid_utf8_fragments_replace_exactly_the_invalid_sequences() {
+        let (capture, artifact) = pump_and_capture(&[0xff, 0xfe, b'\n'], false).await;
+        let tail = capture.model_tail();
+        assert_eq!(
+            tail.matches('\u{FFFD}').count(),
+            2,
+            "each invalid byte is one replacement: {tail:?}"
+        );
+        assert_eq!(artifact, &[0xff, 0xfe, b'\n']);
+
+        let (capture, artifact) = pump_and_capture(&[0xff, 0xfe], false).await;
+        assert_eq!(
+            capture.model_tail().matches('\u{FFFD}').count(),
+            2,
+            "the unterminated case replaces exactly as well"
+        );
+        assert_eq!(artifact, &[0xff, 0xfe]);
+    }
+
+    /// H5: ~9 KB of legal mixed-width output crosses two fragment
+    /// boundaries at arbitrary character positions and stays
+    /// replacement-free end to end, including an unterminated tail whose
+    /// last character is multi-byte. The leading 界 shifts the 10-byte
+    /// piece cycle so the 4000/8000 boundaries land INSIDE the 4-byte
+    /// character rather than between pieces.
+    #[tokio::test]
+    async fn legal_multibyte_streams_stay_replacement_free_end_to_end() {
+        let mut line = String::new();
+        line.push('界');
+        let pieces = ["a", "é", "界", "\u{1F600}"];
+        while line.len() < 9 * 1024 {
+            for piece in pieces {
+                line.push_str(piece);
+            }
+        }
+        line.push('\n');
+        // Unterminated tail: the final 界 completes only at the EOF flush.
+        let mut input = line.as_bytes().to_vec();
+        input.extend_from_slice("界-tail".as_bytes());
+
+        let (capture, artifact) = pump_and_capture(&input, false).await;
+        let tail = capture.model_tail();
+        assert_eq!(
+            tail.matches('\u{FFFD}').count(),
+            0,
+            "legal input must produce zero replacements anywhere: {tail:?}"
+        );
+        assert!(tail.contains("界-tail"));
+        assert_eq!(artifact, input, "raw artifact bytes must be identical");
+        assert_eq!(capture.total_bytes(), input.len());
     }
 }
