@@ -946,6 +946,18 @@ impl ProcessRunTool {
         #[cfg(unix)]
         command.process_group(0);
 
+        // Windows host-death containment starts before the first
+        // instruction: the child is created suspended so no descendant can
+        // be born between spawn and the job assignment below. A member
+        // born before `AssignProcessToJobObject` never joins the job and
+        // would survive the host's death while the kernel kills the
+        // assigned leader (CI run 35156892711: leader Exited, member still
+        // Running with its original identity, host stderr clean). Resume
+        // happens only after the assignment, and a child that cannot be
+        // resumed is killed and refused instead of left suspended.
+        #[cfg(windows)]
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+
         #[cfg(windows)]
         let host_death_job = host_death_job::HostDeathJob::create();
 
@@ -1059,6 +1071,35 @@ impl ProcessRunTool {
         };
         #[cfg(windows)]
         let _host_death_job = host_death_job;
+        // Resume is part of the containment contract (see the suspended
+        // creation above): the tree only runs once it is inside the
+        // host-death job. A child whose initial thread cannot be confirmed
+        // resumed is killed and refused — never left suspended until the
+        // timeout, and never resumed ahead of the assignment.
+        #[cfg(windows)]
+        if !host_death_job::resume_suspended_process(child.id().unwrap_or(0)) {
+            let stuck = child.id().unwrap_or(0);
+            kill_process_tree(stuck);
+            let _ = child.start_kill();
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .map_err(|_| {
+                    AgentError::RecoveryRequired(format!(
+                        "the suspended child (pid {stuck}) could not be resumed or killed; \
+                         its exit was not confirmed"
+                    ))
+                })?
+                .map_err(|wait_error| {
+                    AgentError::RecoveryRequired(format!(
+                        "the suspended child (pid {stuck}) could not be resumed; \
+                         the kill was not observed: {wait_error}"
+                    ))
+                })?;
+            return Err(AgentError::Tool(format!(
+                "host-death containment could not resume the suspended child (pid {stuck}); \
+                 refused to run it outside the containment contract"
+            )));
+        }
         // The host-owned proof lane is a synchronous short transaction: the
         // composition root has no Core identity to persist, and cancel or
         // timeout kill the whole tree before the run returns. Crash recovery
@@ -1399,6 +1440,91 @@ pub(crate) mod host_death_job {
             }
         }
     }
+
+    /// Resume the initial thread of a process created with
+    /// `CREATE_SUSPENDED`. The suspended child has not executed any
+    /// code, so its only thread is the kernel's initial one; a fresh
+    /// snapshot can briefly race the thread-table walk, hence the
+    /// bounded retries. `false` means no resume was confirmed: the
+    /// caller must kill the child and refuse the run instead of
+    /// leaving it suspended.
+    pub(super) fn resume_suspended_process(pid: u32) -> bool {
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+
+        // windows-sys 0.59 gates the ToolHelp thread walk behind a
+        // feature this crate does not enable. These three entry points
+        // have been stable kernel32 exports since XP; declaring them
+        // locally keeps the resume capability without adding a
+        // dependency feature for one call.
+        const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
+
+        #[repr(C)]
+        struct ThreadEntry32 {
+            dw_size: u32,
+            cnt_usage: u32,
+            thread_id: u32,
+            owner_process_id: u32,
+            base_priority: i32,
+            delta_priority: i32,
+            flags: u32,
+        }
+
+        unsafe extern "system" {
+            fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> HANDLE;
+            fn Thread32First(snapshot: HANDLE, entry: *mut ThreadEntry32) -> i32;
+            fn Thread32Next(snapshot: HANDLE, entry: *mut ThreadEntry32) -> i32;
+        }
+
+        for _ in 0..3 {
+            let resumed = unsafe {
+                let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+                    false
+                } else {
+                    let mut entry = ThreadEntry32 {
+                        dw_size: std::mem::size_of::<ThreadEntry32>() as u32,
+                        cnt_usage: 0,
+                        thread_id: 0,
+                        owner_process_id: 0,
+                        base_priority: 0,
+                        delta_priority: 0,
+                        flags: 0,
+                    };
+                    let mut resumed = false;
+                    if Thread32First(snapshot, &mut entry) != 0 {
+                        loop {
+                            if entry.owner_process_id == pid {
+                                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.thread_id);
+                                if !thread.is_null() {
+                                    // A fresh suspended process has
+                                    // exactly one thread; a successful
+                                    // resume returns the previous
+                                    // suspend count (1), never
+                                    // (u32::MAX, the failure marker).
+                                    if ResumeThread(thread) != u32::MAX {
+                                        resumed = true;
+                                    }
+                                    let _ = CloseHandle(thread);
+                                }
+                            }
+                            if Thread32Next(snapshot, &mut entry) == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = CloseHandle(snapshot);
+                    resumed
+                }
+            };
+            if resumed {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1448,6 +1574,43 @@ mod tests {
 
     fn ctx(run_id: RunId, arguments: &Value) -> agent_contracts::OperationEffectContext {
         crate::tools::test_process_effect_context(run_id, "c", "process.run", arguments)
+    }
+
+    /// Windows containment contract: a child created suspended cannot run
+    /// (and cannot spawn descendants) until `resume_suspended_process`
+    /// confirms the resume — this is what pins the host-death job
+    /// assignment ahead of any descendant birth.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_suspended_child_runs_only_after_the_confirmed_resume() {
+        use std::time::Instant;
+
+        let mut command = Command::new("cmd");
+        command
+            .args(["/D", "/S", "/C", "exit /b 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+        // A suspended process cannot exit: its code has not run.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a suspended child must not have executed"
+        );
+        assert!(
+            host_death_job::resume_suspended_process(pid),
+            "the initial thread of a fresh suspended process must resume"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the resumed child must exit promptly"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[test]
