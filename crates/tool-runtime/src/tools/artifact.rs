@@ -29,6 +29,19 @@ const MAX_READ_LINES: usize = 400;
 /// budget reserves this per line so the FINAL rendered content stays
 /// within [`MAX_READ_BYTES`].
 const RENDER_PREFIX_CHARS: usize = 8;
+/// The per-call capture budget for the rendered window text (the numbering
+/// overhead is reserved up front).
+const CAPTURE_CAP: usize = MAX_READ_BYTES - MAX_READ_LINES * RENDER_PREFIX_CHARS;
+
+/// UTF-8 char-boundary test on raw bytes: a position is a boundary when the
+/// byte there does not continue a multi-byte sequence (continuation bytes
+/// are `0b10xxxxxx`). `str::is_char_boundary` is not available on `&[u8]`,
+/// and the F2 cursor works in raw artifact bytes.
+fn is_char_boundary(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || index == bytes.len()
+        || (bytes[index] & 0xC0) != 0x80
+}
 /// Per-call scan budget (W06). Producers cap captured logs at 8 MiB, so
 /// every legally produced artifact is fully reachable; the scan streams —
 /// it never materializes the file. A file beyond this budget is readable
@@ -58,6 +71,13 @@ struct ArtifactReadArgs {
     /// keeps its exact old semantics.
     #[serde(default)]
     end_line: Option<usize>,
+    /// F2: raw byte offset INSIDE `start_line` where the rendered window
+    /// begins. A line longer than the capture cap is cut mid-line, and the
+    /// coverage footer continues with `start_line` + `line_byte_offset` —
+    /// the same typed cursor on both sides, bound to the artifact identity
+    /// carried by `reference`. Only positions actually shown advance it.
+    #[serde(default)]
+    line_byte_offset: Option<usize>,
 }
 
 fn default_start_line() -> usize {
@@ -81,7 +101,8 @@ impl Tool for ArtifactReadTool {
                 "properties": {
                     "reference": {"type": "string", "description": "artifact:// reference from a previous tool result"},
                     "start_line": {"type": "integer", "minimum": 1},
-                    "end_line": {"type": "integer", "minimum": 1, "description": "defaults to a bounded page starting at start_line"}
+                    "end_line": {"type": "integer", "minimum": 1, "description": "defaults to a bounded page starting at start_line"},
+                    "line_byte_offset": {"type": "integer", "minimum": 0, "description": "raw byte offset inside start_line where the window begins (for lines longer than one page)"}
                 }
             }),
             risk: ToolRisk::ReadOnly,
@@ -145,14 +166,19 @@ impl Tool for ArtifactReadTool {
         // Reserve the per-line numbering overhead so the final rendered
         // content stays within MAX_READ_BYTES (W06 复核：声明预算约束的是
         // 实际返回字符串).
-        let capture_cap = MAX_READ_BYTES - MAX_READ_LINES * RENDER_PREFIX_CHARS;
         let mut captured = String::new();
         let mut captured_bytes = 0usize;
         let mut captured_truncated = false;
+        // F2: an in-line byte cursor. `Some((line, offset))` means the first
+        // unshown position is INSIDE `line`: `offset` raw bytes of it have
+        // been shown, the rest has not. Only actually shown positions
+        // advance it, so a resumption never skips and never re-shows.
+        let mut mid_line_cursor: Option<(usize, usize)> = None;
         let mut line_bytes = Vec::new();
         let mut scanned_bytes = 0u64;
         let mut counted_lines = 0usize;
         let mut last_captured_line = 0usize;
+        let start_offset = args.line_byte_offset.unwrap_or(0);
         loop {
             line_bytes.clear();
             let read = reader
@@ -164,36 +190,97 @@ impl Tool for ArtifactReadTool {
             }
             scanned_bytes += read as u64;
             counted_lines += 1;
-            if counted_lines >= start_line && counted_lines <= end_line {
-                // The capture budget applies to the RENDERED text: raw
-                // bytes can expand under lossy UTF-8 rendering (one
-                // invalid byte becomes a three-byte replacement char), so
-                // budgeting raw bytes could still overrun the cap.
-                let rendered = String::from_utf8_lossy(&line_bytes);
-                let room = capture_cap.saturating_sub(captured_bytes);
-                if room == 0 {
-                    // Capture budget exhausted: the remaining window lines
-                    // exist but are not shown. `last_captured_line` stays
-                    // behind so the paging cursor points at them.
-                } else if rendered.len() <= room {
-                    captured_bytes += rendered.len();
-                    captured.push_str(&rendered);
-                    last_captured_line = counted_lines;
-                } else {
-                    // W06 复核反例：截断必须消费预算、必须以行边界收尾，
-                    // 否则截断尾与下一行拼接、预算声明失真。
-                    let mut take = room;
-                    while take > 0 && !rendered.is_char_boundary(take) {
-                        take -= 1;
-                    }
-                    captured.push_str(&rendered[..take]);
-                    if !captured.ends_with('\n') {
-                        captured.push('\n');
-                    }
-                    captured_bytes += take;
-                    captured_truncated = true;
-                    last_captured_line = counted_lines;
+            if counted_lines < start_line || counted_lines > end_line {
+                continue;
+            }
+            // Once a mid-line cursor exists, later window lines stay
+            // unshown: the continuation must re-serve them in order — never
+            // skip past the partial line, never show them twice.
+            if mid_line_cursor.is_some() {
+                continue;
+            }
+            // Line terminators are structure, not content: once every
+            // content byte of a line is shown, only a cut EOL may remain,
+            // and that is not an unshown region.
+            let eol_len = if line_bytes.ends_with(b"\r\n") {
+                2
+            } else if line_bytes.ends_with(b"\n") {
+                1
+            } else {
+                0
+            };
+            let content_len = line_bytes.len() - eol_len;
+            let skip = if counted_lines == start_line {
+                start_offset
+            } else {
+                0
+            };
+            if skip > 0 {
+                if skip >= content_len {
+                    return Err(AgentError::InvalidRequest(format!(
+                        "line_byte_offset {skip} is at or past the end of line {start_line} ({content_len} content bytes)"
+                    )));
                 }
+                if !is_char_boundary(&line_bytes, skip) {
+                    return Err(AgentError::InvalidRequest(
+                        "line_byte_offset must fall on a UTF-8 character boundary".into(),
+                    ));
+                }
+            }
+            let rest = &line_bytes[skip..];
+            // The capture budget applies to the RENDERED text: raw bytes can
+            // expand under lossy UTF-8 rendering (one invalid byte becomes a
+            // three-byte replacement char), so budgeting raw bytes could
+            // still overrun the cap.
+            let rendered_full = String::from_utf8_lossy(rest);
+            let room = CAPTURE_CAP.saturating_sub(captured_bytes);
+            if room == 0 {
+                // Capture budget exhausted: the remaining window lines
+                // exist but are not shown. `last_captured_line` stays
+                // behind so the paging cursor points at them.
+            } else if rendered_full.len() <= room {
+                captured_bytes += rendered_full.len();
+                captured.push_str(&rendered_full);
+                last_captured_line = counted_lines;
+            } else {
+                // W06 复核反例：截断必须消费预算、必须以行边界收尾。
+                // F2: the cut is a RAW-byte cut on a char boundary and the
+                // continuation cursor is tracked in raw bytes, so the shown
+                // text and the resume position share one coordinate system.
+                // Lossy expansion (invalid bytes) falls back to a third of
+                // the room: one raw byte renders to at most three bytes, so
+                // the fallback can never exceed the cap.
+                let mut take = room.min(rest.len());
+                while take > 0 && !is_char_boundary(rest, take) {
+                    take -= 1;
+                }
+                let mut chunk = &rest[..take];
+                if String::from_utf8_lossy(chunk).len() > room {
+                    let mut fallback = room / 3;
+                    while fallback > 0 && !is_char_boundary(rest, fallback) {
+                        fallback -= 1;
+                    }
+                    chunk = &rest[..fallback];
+                }
+                if chunk.is_empty() {
+                    // Not even one rendered byte fits the remaining room:
+                    // the line stays unshown and the cursor stays behind.
+                    continue;
+                }
+                let rendered = String::from_utf8_lossy(chunk);
+                captured.push_str(&rendered);
+                if !captured.ends_with('\n') {
+                    captured.push('\n');
+                }
+                captured_bytes += rendered.len();
+                last_captured_line = counted_lines;
+                let shown_content = skip + chunk.len();
+                if shown_content < content_len {
+                    captured_truncated = true;
+                    mid_line_cursor = Some((counted_lines, shown_content));
+                }
+                // Otherwise only the line terminator was cut: every content
+                // byte is shown, so there is no unshown region in the line.
             }
         }
         // `take` returns 0 reads both at true EOF and at the scan budget;
@@ -208,27 +295,35 @@ impl Tool for ArtifactReadTool {
             .map(|(offset, line)| format!("{:>6} | {}", start_line + offset, line))
             .collect::<Vec<_>>()
             .join("\n");
-        // The cursor must not hide unshown data: lines captured-then-
-        // dropped from the window (capture cap) and lines beyond the scan
-        // budget both leave pages unreadable only if `has_more` lied.
-        let first_unshown_in_window = (last_captured_line + 1).max(start_line);
+        // The cursor must not hide unshown data: an unshown in-line suffix
+        // (capture cap cut mid-line), lines captured-then-dropped from the
+        // window (capture cap), and lines beyond the scan budget all leave
+        // unshown regions, and `has_more` must own each of them — "end of
+        // artifact" needs the real absence of any unshown region.
+        let first_unshown_in_window = match mid_line_cursor {
+            Some((line, _)) => line,
+            None => (last_captured_line + 1).max(start_line),
+        };
         let in_window_unshown = first_unshown_in_window <= end_line.min(counted_lines);
         let beyond_window = scan_complete && end_line < counted_lines;
         let has_more = !scan_complete || in_window_unshown || beyond_window;
-        let next_start_line = if in_window_unshown {
-            first_unshown_in_window
+        let (next_start_line, next_line_byte_offset) = if in_window_unshown {
+            mid_line_cursor.unwrap_or((first_unshown_in_window, 0))
         } else if has_more {
-            end_line + 1
+            (end_line.saturating_add(1), 0)
         } else {
-            end_line
+            (end_line, 0)
         };
 
         // The body-level coverage statement (F04/CORE-3): the model sees
         // only `model_content`, so a window that is not the whole artifact
         // must name its range, the total, and the continuation or end
-        // marker there. A complete single-page read stays plain.
-        let whole_artifact_in_one_page =
-            start_line == 1 && end_line >= counted_lines && !captured_truncated;
+        // marker there. A complete single-page read stays plain; a resumed
+        // mid-line read is never mistaken for one.
+        let whole_artifact_in_one_page = start_line == 1
+            && end_line >= counted_lines
+            && !captured_truncated
+            && start_offset == 0;
         let mut clauses: Vec<String> = Vec::new();
         if has_more || !scan_complete || !whole_artifact_in_one_page {
             if lines.is_empty() {
@@ -257,10 +352,22 @@ impl Tool for ArtifactReadTool {
                 ));
             }
             if has_more {
-                clauses.push(format!(
-                    "continue with artifact.read reference={} start_line={next_start_line}",
-                    args.reference
-                ));
+                if mid_line_cursor.is_some() {
+                    clauses.push(format!(
+                        "line {next_start_line} is truncated at the capture cap; its unshown suffix continues inside the line"
+                    ));
+                }
+                clauses.push(if next_line_byte_offset > 0 {
+                    format!(
+                        "continue with artifact.read reference={} start_line={next_start_line} line_byte_offset={next_line_byte_offset}",
+                        args.reference
+                    )
+                } else {
+                    format!(
+                        "continue with artifact.read reference={} start_line={next_start_line}",
+                        args.reference
+                    )
+                });
             } else {
                 clauses.push(format!("end of artifact ({counted_lines} lines)"));
             }
@@ -305,6 +412,7 @@ impl Tool for ArtifactReadTool {
                     "returned": lines.len(),
                     "has_more": has_more,
                     "next_start_line": next_start_line,
+                    "next_line_byte_offset": next_line_byte_offset,
                     "window_truncated": captured_truncated,
                 }),
             }
@@ -590,174 +698,6 @@ mod tests {
         assert_eq!(output.metadata["next_start_line"], deep_start + 11);
     }
 
-    /// W06 复核反例：一条 3 MiB 的长首行＋100 行尾部。截断必须消费捕获
-    /// 预算、以行边界收尾（不得把截断尾与 tail-0 拼接成一行）、返回字符
-    /// 串不得超出声明的捕获预算，且游标必须指向第一个未展示的行。
-    #[tokio::test]
-    async fn long_first_line_truncates_at_the_cap_without_merging_lines() {
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = Workspace::open(dir.path()).await.unwrap();
-        let run_id = RunId::new();
-        let mut body = "l".repeat(3 * 1024 * 1024);
-        body.push('\n');
-        for index in 0..100 {
-            body.push_str(&format!("tail-{index}\n"));
-        }
-        let reference = workspace
-            .write_artifact(run_id, "process", "log", body.as_bytes())
-            .await
-            .unwrap();
-        let tool = ArtifactReadTool::new(workspace);
-
-        let output = value(
-            tool.execute(
-                run_id,
-                "c",
-                request(run_id, json!({"reference": reference}))
-                    .call
-                    .arguments,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(output.ok);
-        assert_eq!(output.metadata["total_lines"], 101);
-        assert_eq!(output.metadata["total_lines_complete"], true);
-        assert_eq!(output.metadata["window_truncated"], true);
-        // The window renders as exactly one content line (the truncated
-        // long line), plus the coverage footer — the truncated tail must
-        // not merge with the next line, and the footer must not merge
-        // with either (F04 页脚在正文自己的行上).
-        let mut body_lines = output.model_content.lines();
-        let content_line = body_lines.next().unwrap();
-        assert!(
-            content_line.starts_with("     1 | "),
-            "the truncated long line is one rendered line: {content_line}"
-        );
-        assert_eq!(
-            body_lines.count(),
-            1,
-            "exactly one content line plus one coverage footer remain: {}",
-            output.model_content
-        );
-        assert!(
-            output.model_content.contains("[coverage]"),
-            "the truncated window must carry the coverage footer: {}",
-            output.model_content
-        );
-        assert!(
-            !output.model_content.contains("tail-0"),
-            "the truncated tail must not merge with the next line"
-        );
-        assert!(
-            output.model_content.len() <= MAX_READ_BYTES,
-            "the returned string must stay within the declared capture cap: {}",
-            output.model_content.len()
-        );
-        assert_eq!(output.metadata["has_more"], true);
-        assert_eq!(
-            output.metadata["next_start_line"], 2,
-            "the cursor must point at the first unshown line"
-        );
-
-        // The next page is reachable and shows the tail lines untouched.
-        let page2 = value(
-            tool.execute(
-                run_id,
-                "c",
-                request(
-                    run_id,
-                    json!({"reference": reference, "start_line": 2, "end_line": 200}),
-                )
-                .call
-                .arguments,
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(page2.model_content.contains("tail-0"));
-        assert!(page2.model_content.contains("tail-99"));
-        assert_eq!(page2.metadata["total_lines"], 101);
-        assert_eq!(page2.metadata["window_truncated"], false);
-        assert_eq!(page2.metadata["has_more"], false);
-    }
-
-    /// F04/CORE-3：溢出列表的续读指针必须长在正文里——`model_content`
-    /// 是唯一进 TurnFrame 的字段，metadata 的 has_more/next_start_line
-    /// 到不了模型。完整单页读取保持朴素正文，不加噪音。
-    #[tokio::test]
-    async fn the_body_names_the_window_and_the_next_page() {
-        let (tool, _dir, run_id, reference) = tool_with_artifact().await;
-
-        // A narrow window: the body must name the range, the total and the
-        // continuation pointer.
-        let output = value(
-            tool.execute(
-                run_id,
-                "c",
-                json!({"reference": reference, "start_line": 2, "end_line": 3}),
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(
-            output
-                .model_content
-                .contains("[coverage] showing lines 2-3 of 4 total"),
-            "the body must name the window: {}",
-            output.model_content
-        );
-        assert!(
-            output.model_content.contains(&format!(
-                "continue with artifact.read reference={reference} start_line=4"
-            )),
-            "the body must carry the continuation pointer: {}",
-            output.model_content
-        );
-
-        // The whole artifact in one page: no coverage footer, plain body.
-        let full = value(
-            tool.execute(
-                run_id,
-                "c",
-                json!({"reference": reference}),
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(
-            !full.model_content.contains("[coverage]"),
-            "a complete single-page read stays plain: {}",
-            full.model_content
-        );
-
-        // The final page carries the end marker.
-        let tail = value(
-            tool.execute(
-                run_id,
-                "c",
-                json!({"reference": reference, "start_line": 4, "end_line": 4}),
-                None,
-                CancellationToken::new(),
-            )
-            .await
-            .unwrap(),
-        );
-        assert!(
-            tail.model_content.contains("end of artifact (4 lines)"),
-            "the last page must carry the end marker: {}",
-            tail.model_content
-        );
-    }
-
     // -- F1 regression harness ------------------------------------------------
 
     /// Run one artifact.read call through the REAL trusted output broker,
@@ -962,6 +902,475 @@ mod tests {
         let second = read(serde_json::json!({"reference": reference, "start_line": 5, "end_line": 9})).await;
         assert_eq!(first.metadata["total_lines"], 520);
         assert_eq!(second.metadata["total_lines"], 520);
+    }
+
+    /// W06 复核反例（F2 重写）：一条 3 MiB 的长首行＋100 行尾部。截断必须
+    /// 消费捕获预算、以行边界收尾（不得把截断尾与 tail-0 拼接成一行）、返
+    /// 回字符串不得超出声明的捕获预算；且续读游标必须指向第一个未展示的
+    /// 「位置」——首行内部的字节偏移——而不是直接跳到第二行。
+    #[tokio::test]
+    async fn long_first_line_truncates_at_the_cap_without_merging_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut body = "l".repeat(2 * 1024 * 1024);
+        body.push_str("SUFFIX-SENTINEL");
+        body.push_str(&"l".repeat(1024 * 1024 - 15));
+        body.push('\n');
+        for index in 0..100 {
+            body.push_str(&format!("tail-{index}\n"));
+        }
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", body.as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace);
+
+        let output = value(
+            tool.execute(
+                run_id,
+                "c",
+                request(run_id, json!({"reference": reference}))
+                    .call
+                    .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(output.ok);
+        assert_eq!(output.metadata["total_lines"], 101);
+        assert_eq!(output.metadata["total_lines_complete"], true);
+        assert_eq!(output.metadata["window_truncated"], true);
+        // The window renders as exactly one content line (the truncated
+        // long line), plus the coverage footer — the truncated tail must
+        // not merge with the next line, and the footer must not merge
+        // with either (F04 页脚在正文自己的行上).
+        let mut body_lines = output.model_content.lines();
+        let content_line = body_lines.next().unwrap();
+        assert!(
+            content_line.starts_with("     1 | "),
+            "the truncated long line is one rendered line: {content_line}"
+        );
+        assert_eq!(
+            body_lines.count(),
+            1,
+            "exactly one content line plus one coverage footer remain: {}",
+            output.model_content
+        );
+        assert!(
+            output.model_content.contains("[coverage]"),
+            "the truncated window must carry the coverage footer: {}",
+            output.model_content
+        );
+        assert!(
+            !output.model_content.contains("tail-0"),
+            "the truncated tail must not merge with the next line"
+        );
+        assert!(
+            output.model_content.len() <= MAX_READ_BYTES,
+            "the returned string must stay within the declared capture cap: {}",
+            output.model_content.len()
+        );
+        assert_eq!(output.metadata["has_more"], true);
+        // F2: the cursor points INSIDE line 1 — at its unshown suffix —
+        // not at line 2. Skipping to line 2 would silently drop the rest
+        // of the first line.
+        assert_eq!(
+            output.metadata["next_start_line"], 1,
+            "the cursor must stay on the partially shown line"
+        );
+        let offset = output.metadata["next_line_byte_offset"].as_u64().unwrap() as usize;
+        assert!(
+            offset > 0 && offset < 3 * 1024 * 1024,
+            "the in-line offset must name the shown prefix: {offset}"
+        );
+
+        // Following the returned continuation verbatim shows the rest of
+        // line 1 (with the sentinel) first, then the tail lines untouched.
+        let page2 = value(
+            tool.execute(
+                run_id,
+                "c",
+                json!({"reference": reference, "start_line": 1, "line_byte_offset": offset}),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(
+            page2.model_content.contains("SUFFIX-SENTINEL"),
+            "the unshown suffix must be reachable: {}",
+            page2.model_content
+        );
+        assert!(page2.model_content.contains("tail-0"));
+        assert!(page2.model_content.contains("tail-99"));
+        assert_eq!(page2.metadata["total_lines"], 101);
+        assert_eq!(page2.metadata["window_truncated"], false);
+        assert_eq!(page2.metadata["has_more"], false);
+        assert!(page2.model_content.contains("end of artifact (101 lines)"));
+
+        // An explicit start_line=2 remains legal: a deliberate skip, not a
+        // silently imposed one.
+        let explicit = value(
+            tool.execute(
+                run_id,
+                "c",
+                request(
+                    run_id,
+                    json!({"reference": reference, "start_line": 2, "end_line": 200}),
+                )
+                .call
+                .arguments,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(explicit.model_content.contains("tail-0"));
+        assert!(!explicit.model_content.contains("SUFFIX-SENTINEL"));
+    }
+
+    /// F2 红例：3 MiB 单行工件（仍在 8 MiB 扫描预算内）。sentinel 在被截断
+    /// 行的后半部分——第一页之后。按返回的续读参数一路走（经真实 broker），
+    /// 必须可达 sentinel，且结束必须是真实 EOF：has_more=false、没有未展示
+    /// 区间。
+    #[tokio::test]
+    async fn a_truncated_long_line_is_resumable_to_real_eof_through_the_broker() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut line = "a".repeat(2 * 1024 * 1024);
+        line.push_str("SECOND-HALF-SENTINEL");
+        line.push_str(&"b".repeat(1024 * 1024 - 20));
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let mut args = json!({ "reference": reference });
+        let mut seen_sentinel = false;
+        let mut previous = (0usize, 0usize);
+        let mut pages = 0usize;
+        loop {
+            let output = read_through_broker(&tool, &broker, run_id, args.clone()).await;
+            assert!(output.ok, "{:?}", output.summary);
+            pages += 1;
+            assert!(
+                pages < 6,
+                "a ~3 MiB line at ~2 MiB per page needs a few pages, then a real end"
+            );
+            if output.model_content.contains("SECOND-HALF-SENTINEL") {
+                seen_sentinel = true;
+            }
+            if output.model_content.contains("end of artifact") {
+                assert_eq!(
+                    output.metadata["has_more"], false,
+                    "the end marker must match the metadata"
+                );
+                assert_eq!(
+                    output.metadata["window_truncated"], false,
+                    "EOF means nothing is left unshown"
+                );
+                break;
+            }
+            args = continuation_args(&output.model_content);
+            let start = args["start_line"].as_u64().unwrap() as usize;
+            let offset = args
+                .get("line_byte_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            assert!(
+                (start, offset) > previous,
+                "the in-line cursor must advance monotonically"
+            );
+            assert_eq!(
+                start, 1,
+                "the whole artifact is one line; the cursor stays inside it"
+            );
+            previous = (start, offset);
+        }
+        assert!(
+            seen_sentinel,
+            "the sentinel in the truncated suffix must be reachable via returned continuations"
+        );
+    }
+
+    /// F2：长首行＋短次行。首行截断后，续读必须先展示首行未展示的尾部
+    /// （sentinel 在那里），然后才是第二行；不能跳过。
+    #[tokio::test]
+    async fn the_truncated_first_line_suffix_is_shown_before_the_second_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut line = "a".repeat(2 * 1024 * 1024);
+        line.push_str("SUFFIX-SENTINEL");
+        line.push_str(&"b".repeat(100_000));
+        let body = format!("{line}\ntail-0\n");
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", body.as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let mut args = json!({ "reference": reference });
+        let mut seen_sentinel = false;
+        let mut seen_tail = false;
+        let mut previous = (0usize, 0usize);
+        let mut pages = 0usize;
+        loop {
+            let output = read_through_broker(&tool, &broker, run_id, args.clone()).await;
+            assert!(output.ok);
+            pages += 1;
+            assert!(pages < 6);
+            if output.model_content.contains("SUFFIX-SENTINEL") {
+                seen_sentinel = true;
+            }
+            if output.model_content.contains("tail-0") {
+                seen_tail = true;
+            }
+            if output.model_content.contains("end of artifact") {
+                break;
+            }
+            args = continuation_args(&output.model_content);
+            let start = args["start_line"].as_u64().unwrap() as usize;
+            let offset = args
+                .get("line_byte_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            assert!(
+                (start, offset) > previous,
+                "the cursor must advance monotonically"
+            );
+            previous = (start, offset);
+        }
+        assert!(
+            seen_sentinel && seen_tail,
+            "the first line's unshown suffix must be shown before (not instead of) the second line"
+        );
+    }
+
+    /// F2：CRLF。行终止符是结构不是内容；截断点的字节游标必须与 CRLF 共存，
+    /// 首行耗尽后游标推进到次行，最终真实 EOF。
+    #[tokio::test]
+    async fn a_crlf_long_line_resumes_and_reaches_the_next_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut line = "a".repeat(2 * 1024 * 1024 + 7);
+        line.push_str("CRLF-SUFFIX-SENTINEL\r\n");
+        let body = format!("{line}crlf-tail\r\n");
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", body.as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let mut args = json!({ "reference": reference });
+        let mut seen_sentinel = false;
+        let mut seen_tail = false;
+        let mut previous = (0usize, 0usize);
+        let mut pages = 0usize;
+        loop {
+            let output = read_through_broker(&tool, &broker, run_id, args.clone()).await;
+            assert!(output.ok);
+            pages += 1;
+            assert!(pages < 6);
+            if output.model_content.contains("CRLF-SUFFIX-SENTINEL") {
+                seen_sentinel = true;
+            }
+            if output.model_content.contains("crlf-tail") {
+                seen_tail = true;
+            }
+            if output.model_content.contains("end of artifact") {
+                assert_eq!(output.metadata["total_lines"], 2);
+                assert_eq!(output.metadata["has_more"], false);
+                break;
+            }
+            args = continuation_args(&output.model_content);
+            let start = args["start_line"].as_u64().unwrap() as usize;
+            let offset = args
+                .get("line_byte_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            assert!(
+                (start, offset) > previous,
+                "the cursor must advance monotonically"
+            );
+            previous = (start, offset);
+        }
+        assert!(
+            seen_sentinel && seen_tail,
+            "CRLF line must resume past its truncation point and reach the next line"
+        );
+    }
+
+    /// F2：UTF-8 多字节在截断点附近。切分不得落在码点中间（任何一页都不得
+    /// 出现 U+FFFD），原始字节偏移单调推进，sentinel 可达，结束真实。
+    #[tokio::test]
+    async fn a_multibyte_line_resumes_on_character_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        // "界" is 3 bytes: 700_000 chars = 2_100_000 bytes (just past the
+        // ~2 MiB capture cut), then the sentinel, then ~0.9 MB more.
+        let mut line = "界".repeat(700_000);
+        line.push_str("边界-SENTINEL-边界");
+        line.push_str(&"界".repeat(300_000));
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let mut args = json!({ "reference": reference });
+        let mut seen_sentinel = false;
+        let mut previous = (0usize, 0usize);
+        let mut pages = 0usize;
+        loop {
+            let output = read_through_broker(&tool, &broker, run_id, args.clone()).await;
+            assert!(output.ok);
+            assert!(
+                !output.model_content.contains('\u{FFFD}'),
+                "no page may cut a code point in half: {}",
+                output.summary
+            );
+            pages += 1;
+            assert!(pages < 6);
+            if output.model_content.contains("边界-SENTINEL-边界") {
+                seen_sentinel = true;
+            }
+            if output.model_content.contains("end of artifact") {
+                assert_eq!(output.metadata["window_truncated"], false);
+                break;
+            }
+            args = continuation_args(&output.model_content);
+            let start = args["start_line"].as_u64().unwrap() as usize;
+            let offset = args
+                .get("line_byte_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            assert!((start, offset) > previous, "the raw byte cursor must advance");
+            previous = (start, offset);
+        }
+        assert!(seen_sentinel, "the multibyte sentinel must survive resumption");
+    }
+
+    /// F2：字节上限边界。内容字节恰好等于捕获预算：只有行终止符被切，没有
+    /// 未展示内容——不得发明续读；多一个字节：存在真实未展示后缀——必须有
+    /// 指向行内的游标，且走一步到达真实 EOF。
+    #[tokio::test]
+    async fn the_byte_cap_boundary_does_not_invent_a_continuation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let capture_cap = MAX_READ_BYTES - MAX_READ_LINES * RENDER_PREFIX_CHARS;
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let read = |reference: String, extra: Value| {
+            let tool = &tool;
+            let mut args = extra;
+            args["reference"] = json!(reference);
+            async move {
+                value(
+                    tool.execute(run_id, "c", args, None, CancellationToken::new())
+                        .await
+                        .unwrap(),
+                )
+            }
+        };
+
+        // Exactly the cap: every content byte is shown.
+        let exact: String = "c".repeat(capture_cap);
+        let exact_reference = workspace
+            .write_artifact(run_id, "process", "log", format!("{exact}\n").as_bytes())
+            .await
+            .unwrap();
+        let exact_page = read(exact_reference, json!({})).await;
+        assert_eq!(exact_page.metadata["window_truncated"], false);
+        assert_eq!(exact_page.metadata["has_more"], false);
+        assert!(
+            !exact_page.model_content.contains("[coverage]"),
+            "an exactly-cap complete read stays a plain single page: {}",
+            exact_page.model_content.len()
+        );
+
+        // One content byte more: a real suffix remains.
+        let over: String = "c".repeat(capture_cap + 1);
+        let over_reference = workspace
+            .write_artifact(run_id, "process", "log", format!("{over}\n").as_bytes())
+            .await
+            .unwrap();
+        let first = read(over_reference.clone(), json!({})).await;
+        assert_eq!(first.metadata["window_truncated"], true);
+        assert_eq!(first.metadata["has_more"], true);
+        assert_eq!(first.metadata["next_start_line"], 1);
+        assert_eq!(first.metadata["next_line_byte_offset"], capture_cap);
+
+        let last = read(
+            over_reference,
+            json!({"start_line": 1, "line_byte_offset": capture_cap}),
+        )
+        .await;
+        assert_eq!(last.metadata["has_more"], false);
+        assert_eq!(last.metadata["window_truncated"], false);
+        assert!(last.model_content.contains("end of artifact (1 lines)"));
+    }
+
+    /// F2：无效 UTF-8 的 lossy 渲染会把一个原始字节放大成三个字节。截断
+    /// 必须按渲染后的字节计预算（返回字符串不超声明上限），游标仍按原始
+    /// 字节推进并到达真实 EOF。
+    #[tokio::test]
+    async fn invalid_utf8_expansion_stays_within_the_capture_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let mut body = vec![0xFFu8; 3 * 1024 * 1024];
+        body.push(b'\n');
+        let reference = workspace
+            .write_artifact(run_id, "process", "log", &body)
+            .await
+            .unwrap();
+        let tool = ArtifactReadTool::new(workspace);
+
+        let mut args = json!({ "reference": reference });
+        let mut previous = (0usize, 0usize);
+        let mut pages = 0usize;
+        loop {
+            let output = value(
+                tool.execute(run_id, "c", args.clone(), None, CancellationToken::new())
+                    .await
+                    .unwrap(),
+            );
+            assert!(output.ok);
+            assert!(
+                output.model_content.len() <= MAX_READ_BYTES,
+                "the rendered page must stay within the declared capture cap: {}",
+                output.model_content.len()
+            );
+            pages += 1;
+            assert!(pages < 8);
+            if output.model_content.contains("end of artifact") {
+                assert_eq!(output.metadata["window_truncated"], false);
+                assert_eq!(output.metadata["has_more"], false);
+                break;
+            }
+            args = continuation_args(&output.model_content);
+            let start = args["start_line"].as_u64().unwrap() as usize;
+            let offset = args
+                .get("line_byte_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            assert!((start, offset) > previous, "the raw byte cursor must advance");
+            previous = (start, offset);
+        }
     }
 
     /// 扫描预算截断的工件：正文必须声明总数不完整，不能让模型把
