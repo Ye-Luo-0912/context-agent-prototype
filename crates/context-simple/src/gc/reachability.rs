@@ -203,6 +203,16 @@ fn names_the_same_requirement_in(content: &str, older_text: &str) -> bool {
 
 /// Words that mark retention or negation: a message carrying one of these
 /// contradicts a replacement declaration and never supersedes anything.
+///
+/// CTX-11 (H1): an apostrophe *inside* a token is part of the word, not a
+/// delimiter — "Don't remove X" is one negated clause, and its protection
+/// must not hinge on which apostrophe the writer used. Tokens are matched
+/// with internal apostrophes (straight U+0027 and curly U+2019) deleted, so
+/// `don't` / `don’t` both read as the protected `dont`. The common
+/// contracted negations are protected words; a bare `no` is deliberately
+/// NOT protection ("no, remove X" is a legal retraction), and the explicit
+/// "Remove X" positive control stays unprotected so the whole-entity rule
+/// keeps working.
 fn has_retention_protection(content: &str) -> bool {
     let tokens: Vec<String> = content
         .split_whitespace()
@@ -210,6 +220,7 @@ fn has_retention_protection(content: &str) -> bool {
             token
                 .trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
                 .to_lowercase()
+                .replace(['\'', '’'], "")
         })
         .collect();
     for token in &tokens {
@@ -228,8 +239,22 @@ fn has_retention_protection(content: &str) -> bool {
                 | "remain"
                 | "still"
                 | "never"
-                | "dont"
                 | "not"
+                // Contracted negations (apostrophes deleted above):
+                // "X not …" is already covered by `not` + the two-word
+                // check below; these are the single-word forms.
+                | "dont"
+                | "cant"
+                | "cannot"
+                | "wont"
+                | "doesnt"
+                | "didnt"
+                | "isnt"
+                | "arent"
+                | "wasnt"
+                | "shouldnt"
+                | "couldnt"
+                | "wouldnt"
         ) {
             return true;
         }
@@ -628,6 +653,246 @@ pub(crate) fn queue_error_verifications(
     }
 }
 
+/// CTX-11 (H2): cap of the deferred cold semantic intent ring. Same shape as
+/// `access::PENDING_COLD_CONSUMED_CAP`: a bounded, persisted window of
+/// obligations against still-pending cold cards; the oldest row drops on
+/// overflow and the drop is counted, never hidden.
+pub(crate) const PENDING_COLD_SEMANTIC_INTENT_CAP: usize = 64;
+
+/// CTX-11 (H2): bounded copy of the superseding message content carried by a
+/// deferred Supersede intent. The installed entry is matched against this
+/// copy with [`names_the_same_requirement_in`], so the bound must leave the
+/// requirement words intact; 4000 chars is far beyond any real decision
+/// message (the engine itself clips item bodies tighter).
+const COLD_INTENT_CONTENT_MAX_CHARS: usize = 4000;
+
+/// CTX-11 (H2): one deferred semantic intent whose target body currently
+/// sits only as an unloaded cold card (`State::pending_external_cards`).
+/// Identity rules mirror the loaded-position scans exactly — the deferred
+/// path is the same proof applied later, never a second judgment:
+///
+/// - [`PendingColdSemanticIntent::Supersede`] mirrors
+///   [`queue_decision_supersessions`]: Decision kind (or core Decision
+///   tag), same task context (`None` for session-level, compared like the
+///   loaded scan compares it), exact entity match, and
+///   [`names_the_same_requirement_in`] over the stored summary.
+/// - [`PendingColdSemanticIntent::Verify`] mirrors
+///   [`queue_error_verifications`]: Error kind, same task, same immutable
+///   [`agent_contracts::VerificationProbe`] — re-checked against
+///   [`has_matching_verification_evidence`] at application time.
+///
+/// Persisted with `State`; a checkpoint/restore round trip neither drops
+/// the intent nor revives a finalized target.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PendingColdSemanticIntent {
+    Supersede {
+        by_id: ContextItemId,
+        task_id: Option<agent_contracts::TaskId>,
+        /// Exact `extract_entities` signature of the superseding message.
+        entities: Vec<String>,
+        /// Bounded copy of the superseding message, matched against the
+        /// installed entry's stored summary.
+        content: String,
+        reason: String,
+    },
+    Verify {
+        by_id: ContextItemId,
+        task_id: agent_contracts::TaskId,
+        probe: agent_contracts::VerificationProbe,
+        reason: String,
+    },
+}
+
+/// CTX-11 (H2): record a deferred supersession against still-pending cold
+/// cards. Recorded at the same ingest point as
+/// [`queue_decision_supersessions`] and under its exact gate (decision
+/// classification, non-empty entity signature, explicit replacement cue) so
+/// the deferred path can never widen what counts as a withdrawal; nothing
+/// is recorded when no cold card is pending, and retention-protected
+/// messages are rejected by the same [`has_retention_protection`] gate at
+/// application time.
+pub(crate) fn record_cold_supersession_intent(
+    state: &mut State,
+    content: &str,
+    by_id: ContextItemId,
+    task_id: Option<agent_contracts::TaskId>,
+) {
+    if state.pending_external_cards.is_empty() {
+        return;
+    }
+    let entities = extract_entities(content);
+    if entities.is_empty() || !has_replacement_cue(content) {
+        return;
+    }
+    let snippet: String = content.chars().take(60).collect();
+    push_cold_intent(
+        state,
+        PendingColdSemanticIntent::Supersede {
+            by_id,
+            task_id,
+            entities,
+            content: content
+                .chars()
+                .take(COLD_INTENT_CONTENT_MAX_CHARS)
+                .collect(),
+            reason: format!(
+                "superseded by decision at turn {}: '{snippet}' (recorded while the body waited on a pending cold card)",
+                state.turn
+            ),
+        },
+    );
+}
+
+/// CTX-11 (H2): record a deferred verification against still-pending cold
+/// cards. Mirrors the [`queue_error_verifications`] call site: only a
+/// successful trusted probe (`task_id` + `probe` both present — a success
+/// without a recipe identity proves nothing) with pending cold cards
+/// records an intent.
+pub(crate) fn record_cold_verification_intent(
+    state: &mut State,
+    by_id: ContextItemId,
+    task_id: agent_contracts::TaskId,
+    probe: agent_contracts::VerificationProbe,
+    reason: String,
+) {
+    if state.pending_external_cards.is_empty() {
+        return;
+    }
+    push_cold_intent(
+        state,
+        PendingColdSemanticIntent::Verify {
+            by_id,
+            task_id,
+            probe,
+            reason,
+        },
+    );
+}
+
+fn push_cold_intent(state: &mut State, intent: PendingColdSemanticIntent) {
+    state.pending_cold_semantic_intents.push(intent);
+    if state.pending_cold_semantic_intents.len() > PENDING_COLD_SEMANTIC_INTENT_CAP {
+        state.pending_cold_semantic_intents.remove(0);
+        state.cold_semantic_intents_dropped = state.cold_semantic_intents_dropped.saturating_add(1);
+    }
+}
+
+/// CTX-11 (H2): apply deferred intents to the entries a cold-card install
+/// just made resident. Called beside
+/// `access::land_pending_cold_consumptions` at every install point (batch
+/// drain, per-id service, restore rehydration) so the semantic lifecycle
+/// stays independent of where the body currently sits — the same rule the
+/// loaded-position scans already guarantee.
+///
+/// An intent whose identity matches an installed entry is consumed: applied
+/// when the entry is live (the transition lands in
+/// `state.pending_ingest_transitions`, surfaced by the next maintenance
+/// report), a no-op when it is already terminal (idempotent — the card
+/// preserved the finalized state). An intent that matches nothing stays
+/// queued for a later install; a failed, cancelled or oversized install
+/// never reaches this function and leaves the ring untouched.
+pub(crate) fn apply_cold_semantic_intents_on_install(
+    state: &mut State,
+    installed: &[&agent_contracts::ExternalizedContext],
+) {
+    if installed.is_empty() || state.pending_cold_semantic_intents.is_empty() {
+        return;
+    }
+    let intents = std::mem::take(&mut state.pending_cold_semantic_intents);
+    let mut retained: Vec<PendingColdSemanticIntent> = Vec::with_capacity(intents.len());
+    for intent in intents {
+        let mut consumed = false;
+        for entry in installed {
+            if apply_cold_intent_to_entry(state, &intent, entry) {
+                consumed = true;
+            }
+        }
+        if !consumed {
+            retained.push(intent);
+        }
+    }
+    state.pending_cold_semantic_intents = retained;
+}
+
+/// Apply one intent to one installed entry. Returns whether the intent's
+/// identity matched (and was therefore consumed) — regardless of whether
+/// the entry was live or already terminal.
+fn apply_cold_intent_to_entry(
+    state: &mut State,
+    intent: &PendingColdSemanticIntent,
+    entry: &agent_contracts::ExternalizedContext,
+) -> bool {
+    let turn = state.turn;
+    match intent {
+        PendingColdSemanticIntent::Supersede {
+            by_id,
+            task_id,
+            entities,
+            content,
+            reason,
+        } => {
+            // Exact mirrors of the `queue_decision_supersessions` external
+            // branch: same kind rule, same task comparison (None for
+            // session-level equals None), exact entity identity and the
+            // same summary-level requirement proof.
+            let matches = entry.item_id != *by_id
+                && (entry.kind == ContextKind::Decision
+                    || entry
+                        .tags
+                        .iter()
+                        .any(|tag| tag.is_core(CoreLabel::Decision)))
+                && entry.task_id == *task_id
+                && entities_match_exact(entities, &entry.entities)
+                && names_the_same_requirement_in(content, &entry.context_ref.summary);
+            if !matches {
+                return false;
+            }
+            if !entry.semantic.is_dead()
+                && let Some(transition) = apply_terminal_semantic(
+                    state,
+                    entry.item_id,
+                    SemanticState::Superseded { by: Some(*by_id) },
+                    reason,
+                    turn,
+                )
+            {
+                state.pending_ingest_transitions.push(transition);
+            }
+            true
+        }
+        PendingColdSemanticIntent::Verify {
+            by_id,
+            task_id,
+            probe,
+            reason,
+        } => {
+            let matches = entry.item_id != *by_id
+                && entry.kind == ContextKind::Error
+                && entry.task_id == Some(*task_id)
+                && entry.verify_recipe.as_ref() == Some(probe);
+            if !matches {
+                return false;
+            }
+            // Same evidence re-check `drain_verifications` applies to its
+            // persisted queue: the target must still be live and the `by`
+            // observation must still prove the same task and probe.
+            if !entry.semantic.is_dead()
+                && has_matching_verification_evidence(state, entry.item_id, *by_id)
+                && let Some(transition) = apply_terminal_semantic(
+                    state,
+                    entry.item_id,
+                    SemanticState::VerifiedFixed { by: Some(*by_id) },
+                    reason,
+                    turn,
+                )
+            {
+                state.pending_ingest_transitions.push(transition);
+            }
+            true
+        }
+    }
+}
+
 /// 同一文件路径的更新 **文件正文**（`fs.read` / unsourced replay header）
 /// 只有在能证明覆盖时才覆盖旧正文：内容修订不同（明确的过期边界），或
 /// 同一修订下新正文完整包含旧正文（新窗口覆盖旧窗口/全文重读）。同版本
@@ -981,4 +1246,76 @@ fn apply_terminal_semantic(
         return Some(transition);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_retention_protection, names_the_same_requirement_in};
+
+    /// CTX-11 (H1): a contracted negation keeps its retention protection
+    /// whether the apostrophe is straight (U+0027) or curly (U+2019). The
+    /// apostrophe is internal punctuation of one token, so deleting it must
+    /// turn `don't` / `don’t` into the protected `dont`.
+    #[test]
+    fn contracted_negations_with_apostrophes_keep_retention_protection() {
+        assert!(has_retention_protection("Don't remove AuthService.rs"));
+        assert!(has_retention_protection("don't remove authservice.rs"));
+        assert!(has_retention_protection("Don’t remove AuthService.rs"));
+        assert!(has_retention_protection("don’t remove authservice.rs"));
+        assert!(has_retention_protection("Don't drop the TOML decision."));
+    }
+
+    /// CTX-11 (H1): the common contracted negations are protected words, so
+    /// "it won't build", "that doesn't apply" and friends can never finalize
+    /// an older decision.
+    #[test]
+    fn common_contracted_negations_are_protected() {
+        for word in [
+            "dont", "cant", "cannot", "wont", "doesnt", "didnt", "isnt", "arent", "wasnt",
+            "shouldnt", "couldnt", "wouldnt",
+        ] {
+            assert!(
+                has_retention_protection(word),
+                "`{word}` must carry retention protection"
+            );
+            assert!(
+                has_retention_protection(&format!("it {word} work, remove the note")),
+                "`it {word} work` must protect even next to a removal cue"
+            );
+        }
+    }
+
+    /// Established protections and the controls that must stay unprotected:
+    /// "Do not" / "Never" / "Keep" protect; a bare explicit "Remove" is the
+    /// positive control for the whole-entity rule; and a bare "no" is not
+    /// protection because "no, remove X" is a legal retraction.
+    #[test]
+    fn established_protections_and_removal_controls_are_unchanged() {
+        assert!(has_retention_protection("Do not remove AuthService.rs"));
+        assert!(has_retention_protection("Never remove AuthService.rs"));
+        assert!(has_retention_protection("Keep the AuthService.rs timeout"));
+        assert!(has_retention_protection("the timeout still applies"));
+        assert!(!has_retention_protection("Remove AuthService.rs"));
+        assert!(!has_retention_protection("no, remove the TOML decision"));
+    }
+
+    /// CTX-11 (H1) end to end at the predicate level: the contracted
+    /// negation blocks the whole-entity withdrawal proof for the named
+    /// entity, while the explicit "Remove" positive control still proves it.
+    #[test]
+    fn contracted_negation_blocks_whole_entity_withdrawal_but_explicit_remove_still_proves() {
+        let older = "use AuthService.rs with a 5-second timeout";
+        assert!(!names_the_same_requirement_in(
+            "Don't remove AuthService.rs",
+            older
+        ));
+        assert!(!names_the_same_requirement_in(
+            "Don’t remove AuthService.rs",
+            older
+        ));
+        assert!(names_the_same_requirement_in(
+            "Remove AuthService.rs",
+            older
+        ));
+    }
 }

@@ -788,6 +788,22 @@ pub(crate) struct State {
     /// `access::PendingColdConsumed` for the honesty rules of the landing.
     #[serde(default)]
     pub(crate) pending_cold_consumed: Vec<crate::access::PendingColdConsumed>,
+    /// CTX-11 (H2): deferred semantic intents against still-pending cold
+    /// cards. A proven replacement or a trusted probe success recorded while
+    /// the target body sits only as a `(id, card hash)` row is applied when
+    /// that card installs (batch drain, per-id service, or restore
+    /// rehydration), so a loaded position and an unloaded cold card get the
+    /// same semantic outcome. Persisted and bounded
+    /// (`reachability::PENDING_COLD_SEMANTIC_INTENT_CAP`, oldest dropped);
+    /// see `reachability::PendingColdSemanticIntent`.
+    #[serde(default)]
+    pub(crate) pending_cold_semantic_intents:
+        Vec<crate::gc::reachability::PendingColdSemanticIntent>,
+    /// CTX-11 (H2): how many intents the bounded ring already dropped
+    /// (oldest first). An overflow is an honest bounded-window fact, not a
+    /// silently forgotten obligation.
+    #[serde(default)]
+    pub(crate) cold_semantic_intents_dropped: u64,
     /// Segment-local reactivation instrumentation. Skipped in checkpoints
     /// and zeroed on restore; run-global aggregation is event-side.
     #[serde(skip)]
@@ -1667,6 +1683,14 @@ impl SimpleContextEngine {
                 .map(|(entry, hash)| (entry.item_id, hash.clone()))
                 .collect();
             crate::access::land_pending_cold_consumptions(&mut state, &installed);
+            // CTX-11 (H2): deferred semantic intents recorded while these
+            // bodies were unloaded cold cards apply now that they are
+            // resident — loaded and cold positions reach the same terminal
+            // outcomes. Entries were merged above, so the application can
+            // find them.
+            let installed_entries: Vec<&agent_contracts::ExternalizedContext> =
+                claimed.iter().map(|(entry, _)| entry).collect();
+            reachability::apply_cold_semantic_intents_on_install(&mut state, &installed_entries);
         }
         state.external_cards_missing = state.external_cards_missing.saturating_add(missing);
         state.external_card_io_failures =
@@ -2174,6 +2198,10 @@ impl SimpleContextEngine {
                     &mut state,
                     &[(item_id, hash.clone())],
                 );
+                // CTX-11 (H2): the entry was merged above, so deferred
+                // semantic intents recorded against its cold card apply now
+                // (the entry keeps the metadata the card carried).
+                reachability::apply_cold_semantic_intents_on_install(&mut state, &[&entry]);
                 // S3: per-id installs settle through the one residency
                 // entry (protecting the just-served id so the caller's read
                 // still finds it). With carded history this slides the hot
@@ -2729,6 +2757,16 @@ impl ContextEngine for SimpleContextEngine {
                             item_id,
                             task_id,
                         );
+                        // CTX-11 (H2): a proven replacement also reaches old
+                        // decisions whose body currently sits only as an
+                        // unloaded cold card — recorded now, applied when the
+                        // card installs. Same gate as the scan above; nothing
+                        // is recorded without pending cards.
+                        if !state.pending_external_cards.is_empty() {
+                            reachability::record_cold_supersession_intent(
+                                &mut state, &content, item_id, task_id,
+                            );
+                        }
                     }
                 }
                 ContextIngress::AssistantMessage { content } => {
@@ -2865,6 +2903,24 @@ impl ContextEngine for SimpleContextEngine {
                             item.task_id,
                             verify_recipe.as_ref(),
                         );
+                        // CTX-11 (H2): a matching trusted success also reaches
+                        // errors whose body currently sits only as an unloaded
+                        // cold card. Same identity gate as the scan above —
+                        // only a success carrying task + probe records.
+                        if !state.pending_external_cards.is_empty()
+                            && let (Some(task_id), Some(probe)) =
+                                (item.task_id, verify_recipe.as_ref())
+                        {
+                            reachability::record_cold_verification_intent(
+                                &mut state,
+                                observation_id,
+                                task_id,
+                                probe.clone(),
+                                format!(
+                                    "error verified fixed by the same task and probe (round {round}; recorded while the body waited on a pending cold card)"
+                                ),
+                            );
+                        }
                     }
                     if ok {
                         // File bodies only (`fs.read`); stamped-path shell
@@ -4018,6 +4074,16 @@ impl ContextEngine for SimpleContextEngine {
         // again (`replace_all` cleared the directory, hence after it).
         for (entry, hash) in &rehydrated {
             next.external.record_card(entry.item_id, hash.clone());
+        }
+        // CTX-11 (H2): restore's rehydrated batch is an install of cold
+        // cards too. Deferred intents restored with the checkpoint apply
+        // here, so a stale card cannot resurrect a Live decision a removal
+        // recorded while the body was still unloaded — the same rule the
+        // drain and per-id installs follow.
+        if !rehydrated.is_empty() {
+            let installed: Vec<&agent_contracts::ExternalizedContext> =
+                rehydrated.iter().map(|(entry, _)| entry).collect();
+            reachability::apply_cold_semantic_intents_on_install(&mut next, &installed);
         }
         next.pending_external_cards = deferred_cards;
         if !spilled.is_empty() {

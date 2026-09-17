@@ -1719,6 +1719,60 @@ async fn negated_or_retaining_wording_never_supersedes() {
     );
 }
 
+/// CTX-11 (H1): a contracted negation ("Don't remove X", straight or curly
+/// apostrophe) is retention wording just like "do not remove X". Before the
+/// fix the internal apostrophe kept the token from matching the protected
+/// `dont`, so the whole-entity `remove` cue finalized the very decision the
+/// message says to keep.
+#[tokio::test]
+async fn a_contracted_negation_does_not_supersede_the_decision_it_names() {
+    for message in [
+        "Don't remove AuthService.rs",
+        "Don\u{2019}t remove AuthService.rs",
+    ] {
+        let engine = SimpleContextEngine::new(SimpleContextConfig::default());
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: "use AuthService.rs with a 5-second timeout".into(),
+            })
+            .await
+            .unwrap();
+        engine
+            .ingest(ContextIngress::UserMessage {
+                content: message.into(),
+            })
+            .await
+            .unwrap();
+        let report = engine
+            .maintain(ContextMaintenanceTrigger::UserInput)
+            .await
+            .unwrap();
+        assert!(
+            report
+                .transitions
+                .iter()
+                .all(|t| !t.reason.contains("superseded by decision")),
+            "`{message}` must not supersede: {:?}",
+            report
+                .transitions
+                .iter()
+                .map(|t| &t.reason)
+                .collect::<Vec<_>>()
+        );
+        let state = engine.state.lock().await;
+        let old = state
+            .items
+            .iter()
+            .find(|item| item.content.contains("5-second timeout"))
+            .expect("the retained decision stays addressable");
+        assert!(
+            old.semantic.is_live(),
+            "`{message}` is retention wording, not a withdrawal: got {:?}",
+            old.semantic
+        );
+    }
+}
+
 /// CTX-2：中文追加条件不触发替代——并存（中文撤销支持不在本片范围，
 /// 如实记录为限制）。
 #[tokio::test]

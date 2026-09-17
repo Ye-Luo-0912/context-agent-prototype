@@ -4,6 +4,7 @@ mod b2_hydration_completeness;
 mod batch_required_plan;
 mod cold_bounds;
 mod cold_owner_and_required;
+mod cold_semantic_intents;
 mod consumption_truth;
 mod directive;
 mod distill;
