@@ -18,6 +18,13 @@ fn spill_config(dir: &tempfile::TempDir, inline_target: usize) -> SimpleContextC
     SimpleContextConfig {
         external_checkpoint_inline_target: inline_target,
         external_checkpoint_card_batch: 64,
+        // capture 的卡片写入有墙钟预算（超时条目留在 inline、下次 capture
+        // 续写——该语义由 an_exhausted_capture_io_budget_stays_inline_and_
+        // converges_on_later_captures 确定性覆盖）。满载 CI runner 上每次
+        // 卡片写入＝探测读＋fsync＋rename，20 次可越过默认 2s（run
+        // 35158964457：spilled 15/20、19/20、12/14；先例 run 34999486097:
+        // 38/40），墙钟噪声不是本模块钉住的对象，这里把它钉宽。
+        external_checkpoint_io_budget_ms: 60_000,
         gc_buffer_capacity: 0,
         context_store_dir: Some(dir.path().to_path_buf()),
         ..SimpleContextConfig::default()
@@ -563,6 +570,91 @@ async fn a_capture_serialization_budget_bounds_one_pass_and_converges() {
 
     let converged = engine.checkpoint().await.unwrap();
     assert_eq!(inline_len(&converged), 10);
+    engine.restore(converged).await.unwrap();
+    let state = engine.state.lock().await;
+    assert_eq!(state.external.len(), 30);
+    assert_eq!(state.external_cards_missing, 0);
+}
+
+/// capture 的墙钟 IO 预算（`external_checkpoint_io_budget_ms`）耗尽的确定性
+/// 反例：预算为 0 时首个 capture 只写豁免检查的第一张卡，其余计划卡片本次
+/// 留在 inline——checkpoint 不撒谎（清单只点名真实落盘的卡片，留下的条目
+/// 带全量元数据内联，宁大不坏），恢复一个不少；后续 capture 每次续写一张，
+/// 最终收敛到整个超额尾。run 35158964457 的满载失败就是这条路径的真实墙钟
+/// 版本（默认 2s 内只写下 15/19/12 张），这里用预算注入把它钉成确定性事实。
+#[tokio::test]
+async fn an_exhausted_capture_io_budget_stays_inline_and_converges_on_later_captures() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = SimpleContextEngine::new(SimpleContextConfig {
+        external_checkpoint_io_budget_ms: 0,
+        ..spill_config(&dir, 10)
+    });
+    open_focus(&engine, "exhaust the capture io budget").await;
+    let ids = externalize_n(&engine, 30).await;
+
+    // 首张卡豁免预算检查（保证进度），其后每次迭代都已越线：恰好 1 张，
+    // 其余留在 inline——checkpoint 变大，但内容完整。
+    let first = engine.checkpoint().await.unwrap();
+    assert_eq!(
+        manifest_ids(&first).len(),
+        1,
+        "the spent budget stops after the exempt first write"
+    );
+    assert_eq!(
+        inline_len(&first),
+        29,
+        "the entries the budget left behind stay inline, not lost"
+    );
+
+    // 部分分片的 checkpoint 照样完整恢复：清单点名的是真卡片，其余内联。
+    let fresh = SimpleContextEngine::new(spill_config(&dir, 10));
+    fresh.restore(first).await.unwrap();
+    {
+        let state = fresh.state.lock().await;
+        assert_eq!(state.external.len(), 30);
+        for id in &ids {
+            assert!(
+                state.external.get(*id).is_some(),
+                "{id} survives a partial-spill checkpoint"
+            );
+        }
+        assert_eq!(state.external_cards_missing, 0);
+    }
+
+    // 续写收敛：每次 capture 把已落盘卡片免费记入清单，再在预算内续写一张
+    // （预算 0 → 首张豁免），直到整个超额尾都进清单。
+    let mut converged = None;
+    for pass in 1..=25usize {
+        let value = engine.checkpoint().await.unwrap();
+        let spilled = manifest_ids(&value).len();
+        assert_eq!(
+            spilled,
+            pass + 1,
+            "each capture continues the tail by exactly one card: pass {pass}"
+        );
+        if spilled == 20 {
+            converged = Some(value);
+            break;
+        }
+    }
+    let converged = converged.expect("the tail converges within the pass bound");
+    assert_eq!(
+        inline_len(&converged),
+        10,
+        "the target holds once converged"
+    );
+    assert_eq!(
+        card_files(dir.path()).len(),
+        20,
+        "one card per spilled entry"
+    );
+    let spilled_set: std::collections::HashSet<_> = manifest_ids(&converged).into_iter().collect();
+    let expected: std::collections::HashSet<_> = ids[..20].iter().copied().collect();
+    assert_eq!(
+        spilled_set, expected,
+        "the oldest 20 entries are the spilled set"
+    );
+
     engine.restore(converged).await.unwrap();
     let state = engine.state.lock().await;
     assert_eq!(state.external.len(), 30);
