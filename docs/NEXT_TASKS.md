@@ -277,7 +277,7 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 
 ### C1 — checkpoint 分片墙钟预算满载抖动（CI 阻塞续查，context-simple）——已关闭（2026-09-17，`8996ffeb`）
 落地回执：[C1_CHECKPOINT_SPILL_RECEIPT](reviews/2026-09-16-review-71f8a586/C1_CHECKPOINT_SPILL_RECEIPT.md)。CI run `35158964457`（基线 `7631dd72`，C0 被挡住后露出）Windows 分片三测失败：`external_spilled` 计数短缺（15/20、19/20、12/14），Linux 同 run 全绿、本机 0.26s 全绿。根因：checkpoint capture 卡片写入循环的 `external_checkpoint_io_budget_ms`（默认 2s，`engine.rs:1462` 任一迭代越线即停）在满载 runner（该二进制 401s，慢约 40 倍）中途耗尽，剩余计划卡片本次静默留 inline——**屏障完整性从不依赖 spill**：截短后剩余条目以全量元数据内联进 checkpoint 值（F2 成文契约），恢复完整无损、跨 capture 收敛；两个 shortfall 不同排除写入被吞与测试互踩。修复沿 cold_bounds 先例（run `3499986097` spilled 38/40 → 钉宽）：给漏钉的两个 fixture（`spill_config`、`carded_history`）钉 `external_checkpoint_io_budget_ms: 60_000`，生产代码零改动；并补此前缺失的确定性回归 `an_exhausted_capture_io_budget_stays_inline_and_converges_on_later_captures`（预算注入 0 三测同签名转红；生产臂注入 `&& false` 变异转红→恢复）。`cargo test -p context-simple` ×3 442/0；生产默认 2s 预算保留（真实满载盘语义不变）；CI 终验 run `35169239599` Windows 分片 ✓（19m27s 满载）。
-## 第十批（`c8a62355` 续审）——已全部关闭（2026-09-18，本地集成回归全绿；CI 终验待 run 记录）
+## 第十批（`c8a62355` 续审）——已全部关闭（2026-09-18，本地集成回归全绿；CI 终验 run `35278745998` attempt 2 全绿，见 CURRENT.md）
 
 审查基线 `c8a62355`（报告：[REVIEW.md](reviews/2026-09-18-review-c8a62355/REVIEW.md)，任务规格：[NEXT_ACTIONS.md](reviews/2026-09-18-review-c8a62355/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-18-review-c8a62355/COVERAGE.md)，机制探针：[MECHANISM_RESULTS.json](reviews/2026-09-18-review-c8a62355/MECHANISM_RESULTS.json)）。主线：**逻辑 owner 不随驻留位置变化；continuation 不越过尚未交付给模型的源位置；journal 写者身份不随 WAL 代际变化；必需隔离在目标代码运行前建立。** 四条不变量各只有一个生产维护入口；上轮 F1/F2 动态 `end_line`、行内偏移与 C0 挂起创建修复保留不重做。审查环境无 Rust 工具链，红例由实施补；实施环境为 Windows＋cargo 1.97.1，Unix 专属分支按平台语义单独记账、不冒充已执行。
 
