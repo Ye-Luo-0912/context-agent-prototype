@@ -677,12 +677,17 @@ async fn drive_turn_to_idle<S: Read + Write>(
 /// `Delivered` before the effect commit is observed, so the two quiet
 /// snapshots `wait_turn_parked` needs can both land inside that gap on a
 /// loaded runner; poll for the durable artifact instead of racing it.
+/// The wall-clock budget is fixture-only headroom: a loaded CI Windows
+/// runner can run an order of magnitude slower (run 35278745998 attempt 1
+/// expired 30s here; attempt 2 and local runs are single-digit seconds),
+/// so the budget matches `drive_turn_to_idle` instead of the local steady
+/// state. A real effect regression still fails this wait — just later.
 async fn wait_file_content(
     path: &std::path::Path,
     expected: &str,
     what: &str,
 ) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
         if std::fs::read_to_string(path)
             .map(|content| content == expected)
