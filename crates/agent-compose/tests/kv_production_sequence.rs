@@ -5,16 +5,16 @@
 //! ```text
 //! real reads -> new evidence in -> focus/steer change -> file version change
 //!   -> tool load/withdraw -> checkpoint/restore (real teardown+recompose)
+//!   -> multi-page log walk via the tool's returned continuation (dynamic
+//!      round count: the read tool pages under the final model budget)
 //!   -> failed call's usage settlement
 //! ```
 //!
 //! Every step's final HTTP request is captured by the local loopback server
 //! and compared with its predecessor: routing key, tool table and schema
-//! stability, the stable-prefix boundary (first-difference position against
-//! the B0/B1 breakpoint landmarks with the change reason asserted by
-//! content), effective body integrity (required bodies really present —
-//! never trimmed away for cache stability), and the known/unknown usage
-//! state of the ledger row.
+//! stability, the stable-prefix boundary, effective body integrity
+//! (required bodies really present — never trimmed away for cache
+//! stability), and the known/unknown usage state of the ledger row.
 //!
 //! Disk truth is asserted where commentary is not enough: the scripted
 //! `fs.write` of `evidence.txt` must land byte-exact on the workspace and
@@ -24,9 +24,36 @@
 //! stay untouched; this test extends the journey, it does not replace
 //! them.
 //!
-//! Honesty boundary: LOCAL_WIRE only. Endpoint acceptance, real server-side
-//! cache hits and net task cost are NOT_RUN here (no paid endpoint is
-//! contacted; the server is a 127.0.0.1 random-port capture).
+//! Tenth batch (C 续) adds three verification classes on top of the
+//! ninth-batch assertions, which stay intact:
+//!
+//! 1. FULL STABLE PREFIX — every round's ENTIRE `input[0..=B]` (B0 against
+//!    the trajectory baseline on every round; the declared B1 region within
+//!    a turn) and the participating tools/schema blocks are compared
+//!    item-for-item, with the first divergent item index named on failure.
+//!    The ninth-batch checks compared `input[B0]` plus sampled adjacent
+//!    first-differences; items before the breakpoint were a blind spot.
+//! 2. REAL DELIVERY EVIDENCE — a pre-seeded multi-page log is walked by the
+//!    scripted model EXACTLY along the tool's OWN returned continuation
+//!    (the product rule under test: use the returned clause verbatim, walk
+//!    to true EOF). The read tool pages under the FINAL model-content
+//!    budget, so each page's delivered body must contain its whole claimed
+//!    range verbatim — no truncation marker, no head+tail clip — and every
+//!    block ID must be delivered exactly once, on the page claiming to
+//!    cover its line, with its true source line number. The union of the
+//!    delivered claims must cover the file with no gaps and no overlaps.
+//! 3. FULL COST LEDGER — every ledger row records the provider cache
+//!    read/write/miss buckets with an EXPLICIT unknown marker when the
+//!    provider did not report them, the real attempt count, the call lane
+//!    (main vs maintenance), and the ledger totals must equal the sum of
+//!    the per-row values (a cumulative usage snapshot cannot be counted
+//!    twice).
+//!
+//! Honesty boundary: LOCAL_WIRE only. The scripted usage numbers prove
+//! TRANSPORT and SETTLEMENT only — they say nothing about real cache hit
+//! rates or price savings. Endpoint acceptance, real server-side cache
+//! hits and net task cost are NOT_RUN here (no paid endpoint is contacted;
+//! the server is a 127.0.0.1 random-port capture).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,7 +61,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_compose::{ComposeConfig, MaintenanceBudget, compose};
-use agent_contracts::{PromptCacheRouting, RuntimeEvent, UsageIdentity};
+use agent_contracts::{ModelCallRole, PromptCacheRouting, RuntimeEvent, UsageIdentity};
 use agent_core::PolicyApprovalGate;
 use agent_workspace::Workspace;
 use provider_openai::{
@@ -47,14 +74,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 // The scripted model: a persistent capture server answers each POST with the
 // next scripted decision (tool call, plain completion, or a billed terminal
 // failure). `input_tokens` is unique per round so every ledger row can be
-// matched to exactly one wire request.
+// matched to exactly one wire request. The big-log walk segment is
+// DYNAMIC: once the fixed pre-segment is consumed, the next decision is
+// derived from the tool's returned continuation clause in the request the
+// server just captured — the product rule under test, applied by the
+// script itself.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Script {
     /// One tool call; the round completes with usage.
     Call {
-        call_id: &'static str,
+        call_id: String,
         name: &'static str,
         arguments: Value,
         input_tokens: u64,
@@ -90,10 +121,103 @@ impl Script {
 }
 
 #[derive(Default)]
+struct WalkDrive {
+    /// How many continuation pages the walk segment has issued.
+    continuations_served: usize,
+    /// Next unique `input_tokens` value for walk-generated rounds.
+    next_token: u64,
+    /// Whether the walk's completion round was already served.
+    completed: bool,
+}
+
 struct ServerState {
     bodies: Mutex<Vec<String>>,
-    scripts: Mutex<VecDeque<Script>>,
+    /// Fixed decisions before the dynamic walk (turns 1-6 plus the walk's
+    /// scripted opener request).
+    pre_scripts: Mutex<VecDeque<Script>>,
+    /// Fixed decisions after the walk (the billed terminal failure).
+    post_scripts: Mutex<VecDeque<Script>>,
+    /// The dynamic big-log walk state.
+    walk: Mutex<WalkDrive>,
+    /// Every decision actually served, in order — the ledger's ground
+    /// truth (the walk segment is generated, not predeclared).
+    served: Mutex<Vec<Script>>,
     unexpected_rounds: AtomicUsize,
+}
+
+/// The tool's returned continuation clause for the big-log walk, parsed
+/// from a delivered fs.read body (`[coverage] ...; continue with fs.read
+/// path=logs/big.log start_line=N end_line=M`). `None` = the tool offered
+/// no continuation (true EOF for a full walk, or a contract break the
+/// caller must classify).
+fn walk_continuation_clause(body_text: &str) -> Option<(u64, u64)> {
+    const CLAUSE_HEAD: &str = "continue with fs.read path=logs/big.log start_line=";
+    const END_MARK: &str = " end_line=";
+    let at = body_text.find(CLAUSE_HEAD)? + CLAUSE_HEAD.len();
+    let rest = &body_text[at..];
+    let start: u64 = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    let end_at = rest.find(END_MARK)? + END_MARK.len();
+    let end: u64 = rest[end_at..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    Some((start, end))
+}
+
+/// The next decision for a captured request once the fixed pre-segment is
+/// consumed: follow the tool's returned continuation until true EOF, then
+/// serve the walk's completion once. `None` = no decidable scripted round
+/// (the caller counts the round as unexpected).
+fn next_walk_script(state: &ServerState, wire: &Value) -> Option<Script> {
+    let claims = delivered_big_log_pages(wire);
+    let mut drive = state.walk.lock().unwrap();
+    if drive.completed {
+        return None;
+    }
+    match claims.last() {
+        // No big-log result to continue from: undecidable.
+        None => None,
+        // True EOF: the last delivered claim reaches the file's final line.
+        Some((_, end, _)) if *end >= BIG_LOG_LINES as u64 => {
+            let token = drive.next_token;
+            drive.next_token += 1;
+            drive.completed = true;
+            Some(Script::Text {
+                delta: "t6b complete",
+                input_tokens: token,
+            })
+        }
+        // More remains: the page MUST carry its continuation clause; the
+        // next decision is that clause verbatim.
+        Some((_, _, text)) => match walk_continuation_clause(text) {
+            Some((start, end)) => {
+                let token = drive.next_token;
+                drive.next_token += 1;
+                drive.continuations_served += 1;
+                Some(Script::Call {
+                    call_id: format!("biglog-cont-{}", drive.continuations_served),
+                    name: "fs.read",
+                    arguments: json!({
+                        "path": BIG_LOG_PATH,
+                        "start_line": start,
+                        "end_line": end,
+                    }),
+                    input_tokens: token,
+                })
+            }
+            // A non-EOF page without a continuation clause breaks the
+            // product rule; serving nothing makes the round unexpected and
+            // the coverage assertions below name the defect.
+            None => None,
+        },
+    }
 }
 
 async fn spawn_sequence_server(state: Arc<ServerState>) -> u16 {
@@ -110,10 +234,26 @@ async fn spawn_sequence_server(state: Arc<ServerState>) -> u16 {
                     Some(body) => body,
                     None => return,
                 };
+                let wire: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
                 {
                     state.bodies.lock().unwrap().push(body);
                 }
-                let script = state.scripts.lock().unwrap().pop_front();
+                let script = match state.pre_scripts.lock().unwrap().pop_front() {
+                    Some(script) => Some(script),
+                    None => {
+                        // The fixed post-segment (the billed failure) may
+                        // only run AFTER the walk completed; an undecidable
+                        // mid-walk round is an unexpected round, never the
+                        // post segment.
+                        let walk_completed = state.walk.lock().unwrap().completed;
+                        if walk_completed {
+                            next_walk_script(&state, &wire)
+                                .or_else(|| state.post_scripts.lock().unwrap().pop_front())
+                        } else {
+                            next_walk_script(&state, &wire)
+                        }
+                    }
+                };
                 let script = match script {
                     Some(script) => script,
                     None => {
@@ -128,6 +268,7 @@ async fn spawn_sequence_server(state: Arc<ServerState>) -> u16 {
                         }
                     }
                 };
+                state.served.lock().unwrap().push(script.clone());
                 let (input_tokens, output_tokens) = script.usage();
                 let sse_body = match script {
                     Script::Call {
@@ -328,12 +469,44 @@ fn responses_provider(base_url: String) -> Arc<dyn agent_contracts::ModelTranspo
 // Event helpers.
 // ---------------------------------------------------------------------------
 
-/// The ledger facts of one main-lane model round.
+/// One provider-reported token counter, or the EXPLICIT unknown marker for
+/// a counter the provider did not report. An unreported counter is never
+/// an invented zero and is never summed as one (COST-6 discipline,
+/// mirrored test-side): the local scripted transport proves transport and
+/// settlement only, so its absent cache buckets must stay visibly absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CostCounter {
+    Known(u64),
+    Unknown,
+}
+
+/// The ledger facts of one main-lane model round. The ninth batch recorded
+/// input/output/identity; the tenth batch (C 续) extends every row with the
+/// provider cache read/write/miss buckets, the real attempt count, the
+/// call lane, and whether a typed usage report arrived at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LedgerRow {
     input_tokens: u64,
     output_tokens: u64,
     identity: UsageIdentity,
+    /// Provider-reported prompt-cache READ tokens for this round
+    /// (`input_tokens_details.cached_tokens`), when reported.
+    cached_input_tokens: CostCounter,
+    /// Provider-reported cache WRITE tokens (explicit write counter only).
+    cache_write_input_tokens: CostCounter,
+    /// Provider-reported cache MISS tokens (read-side observation).
+    cache_miss_input_tokens: CostCounter,
+    /// The legacy event-level flattened cache-read counter (0 when the
+    /// provider did not report one) — cross-checked against the typed
+    /// bucket so a flatten bug cannot hide an unreported bucket.
+    event_cached_input_tokens: u64,
+    /// Real transport attempts that produced this round.
+    attempts: u32,
+    retries: u32,
+    /// Which call lane produced this row (main vs maintenance).
+    role: ModelCallRole,
+    /// Whether the typed per-field `ModelUsage` report arrived at all.
+    typed_usage_reported: bool,
 }
 
 /// Collects every `ModelUsed` row of one runtime session on its OWN
@@ -351,14 +524,43 @@ fn spawn_ledger_collector(
                     if let RuntimeEvent::ModelUsed {
                         input_tokens,
                         output_tokens,
+                        cached_input_tokens,
+                        attempts,
+                        retries,
                         usage_identity,
+                        role,
+                        usage,
                         ..
                     } = envelope.event
                     {
+                        let typed = usage.as_ref();
+                        let typed_counter = |field: &Option<u64>| {
+                            field
+                                .map(CostCounter::Known)
+                                .unwrap_or(CostCounter::Unknown)
+                        };
                         rows.lock().unwrap().push(LedgerRow {
                             input_tokens,
                             output_tokens,
                             identity: usage_identity,
+                            cached_input_tokens: typed_counter(
+                                &typed.map(|usage| usage.cached_input_tokens).unwrap_or(None),
+                            ),
+                            cache_write_input_tokens: typed_counter(
+                                &typed
+                                    .map(|usage| usage.cache_write_input_tokens)
+                                    .unwrap_or(None),
+                            ),
+                            cache_miss_input_tokens: typed_counter(
+                                &typed
+                                    .map(|usage| usage.cache_miss_input_tokens)
+                                    .unwrap_or(None),
+                            ),
+                            event_cached_input_tokens: cached_input_tokens,
+                            attempts,
+                            retries,
+                            role,
+                            typed_usage_reported: usage.is_some(),
                         });
                     }
                 }
@@ -482,6 +684,80 @@ fn assert_sentinels(haystack: &str, present: &[&str], round: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// Tenth-batch helpers: FULL prefix comparison and delivered-body extraction.
+// ---------------------------------------------------------------------------
+
+/// First index inside `input[0..=end]` at which two requests differ, or
+/// `None` when the whole compared prefix is item-for-item identical. The
+/// failure paths below must name THIS index — "somewhere in the prefix
+/// differs" is not an actionable stable-boundary fact.
+fn first_prefix_divergence(previous: &Value, current: &Value, end: usize) -> Option<usize> {
+    previous["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(current["input"].as_array().unwrap())
+        .take(end + 1)
+        .position(|(left, right)| left != right)
+}
+
+/// A bounded single-line preview of one input item for failure output.
+fn item_preview(item: &Value) -> String {
+    let text = item_text(item).replace(['\n', '\r'], "\\n");
+    text.chars().take(110).collect::<String>()
+}
+
+/// The participating tool table as one name-keyed canonical block, so two
+/// rounds offering the SAME tool set can be compared as a whole
+/// (order-independent; each named schema is compared byte-for-byte).
+fn canonical_tools(wire: &Value) -> std::collections::BTreeMap<String, Value> {
+    wire["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| (tool["name"].as_str().unwrap().to_string(), tool.clone()))
+        .collect()
+}
+
+/// The wire input items of a captured request.
+fn wire_input_items(wire: &Value) -> &[Value] {
+    wire["input"].as_array().unwrap()
+}
+
+/// The delivered text of a `function_call_output` item (`output` is the
+/// plain string, or `input_text` blocks when a breakpoint was placed on
+/// it).
+fn function_call_output_text(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("function_call_output") {
+        return None;
+    }
+    Some(match &item["output"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|block| block["text"].as_str().unwrap_or(""))
+            .collect::<String>(),
+        other => other.to_string(),
+    })
+}
+
+/// The `lines=S-E/TOTAL` coverage claim of an fs.read result body, when
+/// parseable.
+fn parse_claimed_lines(text: &str) -> Option<(u64, u64, u64)> {
+    let at = text.find("lines=")? + "lines=".len();
+    let segment: String = text[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '/')
+        .collect();
+    let mut parts = segment.split('/');
+    let mut range = parts.next()?.split('-');
+    let start = range.next()?.parse().ok()?;
+    let end = range.next()?.parse().ok()?;
+    let total = parts.next()?.parse().ok()?;
+    Some((start, end, total))
+}
+
+// ---------------------------------------------------------------------------
 // The trajectory.
 // ---------------------------------------------------------------------------
 
@@ -492,18 +768,143 @@ const ALPHA_REV2: &str = "ALPHA-REV2-SENTINEL rewritten inventory row\n";
 const BETA_BODY: &str = "BETA-NEW-EVIDENCE-SENTINEL later retrieval row\n";
 const EVIDENCE_V1: &str = "EVIDENCE-V1-ARCHIVE-BYTES";
 
+// ---------------------------------------------------------------------------
+// The pre-seeded multi-page log for the REAL delivery evidence (tenth
+// batch, class 2). 600 lines of exactly 150 content chars. The scripted
+// model opens with one 200-line window request and then follows the
+// tool's returned continuation clauses verbatim; the read tool pages
+// under the FINAL model-content budget (~98 lines per page for this line
+// width), so the walk takes ~9 pages of DYNAMIC round count and every
+// delivered page must be verbatim-complete.
+// ---------------------------------------------------------------------------
+
+const BIG_LOG_PATH: &str = "logs/big.log";
+const BIG_LOG_LINES: usize = 600;
+/// The scripted opener's window (the model's free first request); pages
+/// two and beyond are the tool's own returned continuation clauses.
+const BIG_LOG_OPENER_WINDOW: (u64, u64) = (1, 200);
+const BIG_LOG_LINE_CHARS: usize = 150;
+
+/// Unique block IDs at the review G2 counterexample positions.
+const BIG_LOG_MID_MARKER_LINES: [(usize, &str); 3] = [
+    (100, "KVSEQ-BIG-MID-P1-L100-9A71C3"),
+    (300, "KVSEQ-BIG-MID-P2-L300-3C68E0"),
+    (500, "KVSEQ-BIG-MID-P3-L500-E0B492"),
+];
+
+/// Head/tail controls: present whenever the page's head/tail regions are
+/// delivered at all.
+const BIG_LOG_CONTROL_MARKER_LINES: [(usize, &str); 2] = [
+    (10, "KVSEQ-BIG-HEAD-CTRL-L10-4D2F11"),
+    (590, "KVSEQ-BIG-TAIL-CTRL-L590-77AD06"),
+];
+
+/// One log line: exactly `BIG_LOG_LINE_CHARS` content chars, with the
+/// block ID embedded at its marker line.
+fn big_log_line(line: usize) -> String {
+    let marker = BIG_LOG_MID_MARKER_LINES
+        .iter()
+        .chain(BIG_LOG_CONTROL_MARKER_LINES.iter())
+        .find(|(marker_line, _)| *marker_line == line)
+        .map(|(_, id)| *id);
+    let mut base = match marker {
+        Some(id) => format!("row-{line:04} {id} payload"),
+        None => format!("row-{line:04} routine biglog filler payload"),
+    };
+    while base.chars().count() < BIG_LOG_LINE_CHARS {
+        base.push('.');
+    }
+    base
+}
+
+/// Pre-seeds the workspace log and asserts the DISK truth the delivery
+/// walk is judged against: every block ID really is in the file, at its
+/// line, at the declared uniform line width.
+fn seed_big_log(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("logs")).unwrap();
+    let mut body = String::new();
+    for line in 1..=BIG_LOG_LINES {
+        body.push_str(&big_log_line(line));
+        body.push('\n');
+    }
+    std::fs::write(root.join(BIG_LOG_PATH), body).unwrap();
+
+    let disk = std::fs::read_to_string(root.join(BIG_LOG_PATH)).unwrap();
+    let disk_lines: Vec<&str> = disk.lines().collect();
+    assert_eq!(disk_lines.len(), BIG_LOG_LINES, "the seeded log line count");
+    assert!(
+        disk_lines
+            .iter()
+            .all(|line| line.chars().count() == BIG_LOG_LINE_CHARS),
+        "the seeded log lines must be uniformly {BIG_LOG_LINE_CHARS} chars"
+    );
+    for (line, id) in BIG_LOG_MID_MARKER_LINES
+        .iter()
+        .chain(BIG_LOG_CONTROL_MARKER_LINES.iter())
+    {
+        assert!(
+            disk_lines[line - 1].contains(id),
+            "disk truth: block ID {id} must sit on line {line} of the seeded log"
+        );
+    }
+}
+
+/// The (start, end) page windows requested for the big log across one
+/// captured request's `function_call` items.
+fn requested_big_log_pages(wire: &Value) -> Vec<(u64, u64)> {
+    wire_input_items(wire)
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item["name"].as_str() == Some("fs_read")
+        })
+        .filter_map(|item| serde_json::from_str::<Value>(item["arguments"].as_str()?).ok())
+        .filter(|arguments| arguments["path"].as_str() == Some(BIG_LOG_PATH))
+        .map(|arguments| {
+            (
+                arguments["start_line"].as_u64().unwrap_or(1),
+                arguments["end_line"].as_u64().unwrap_or(1),
+            )
+        })
+        .collect()
+}
+
+/// The big-log page bodies DELIVERED in one captured request, as
+/// (claimed start, claimed end, delivered text).
+fn delivered_big_log_pages(wire: &Value) -> Vec<(u64, u64, String)> {
+    wire_input_items(wire)
+        .iter()
+        .filter_map(function_call_output_text)
+        .filter(|text| text.contains(&format!("file=\"{BIG_LOG_PATH}\"")))
+        .filter_map(|text| parse_claimed_lines(&text).map(|(start, end, _)| (start, end, text)))
+        .collect()
+}
+
+/// The scripted trajectory's FIXED turn starts as 1-based round numbers:
+/// T1:R1-3, T2:R4-5, T3:R6, T4:R7-9, T5:R10-12, T6:R13-14, T6b:R15..(the
+/// dynamic walk's completion round), T7:R-last. A turn commit may
+/// legitimately re-render the declared evidence item; mid-turn rounds may
+/// not (the full-prefix checks key off this).
+fn turn_start_rounds(total_rounds: usize) -> Vec<usize> {
+    vec![1, 4, 6, 7, 10, 13, 15, total_rounds]
+}
+
 #[tokio::test]
 async fn production_trajectory_of_one_task_over_the_local_capture_server() {
-    let scripts = vec![
+    // The FIXED pre-segment: turns 1-6 plus the walk's scripted opener.
+    // The walk's continuation rounds are GENERATED by the server from the
+    // tool's returned clauses (`next_walk_script`), so the round count is
+    // dynamic — exactly what the product rule under test produces.
+    let pre_scripts = vec![
         // Turn 1 ("T1"): real read, real write, complete.
         Script::Call {
-            call_id: "r1-read-alpha",
+            call_id: "r1-read-alpha".into(),
             name: "fs.read",
             arguments: json!({"path": "notes/alpha.txt"}),
             input_tokens: 1001,
         },
         Script::Call {
-            call_id: "r2-write-evidence",
+            call_id: "r2-write-evidence".into(),
             name: "fs.write",
             arguments: json!({"path": "evidence.txt", "content": EVIDENCE_V1}),
             input_tokens: 1002,
@@ -514,7 +915,7 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
         },
         // Turn 2 ("T2"): new evidence enters.
         Script::Call {
-            call_id: "r4-read-beta",
+            call_id: "r4-read-beta".into(),
             name: "fs.read",
             arguments: json!({"path": "notes/beta.txt"}),
             input_tokens: 1004,
@@ -531,13 +932,13 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
         },
         // Turn 4 ("T4"): the file changes version — rewrite then re-read.
         Script::Call {
-            call_id: "r7-write-alpha",
+            call_id: "r7-write-alpha".into(),
             name: "fs.write",
             arguments: json!({"path": "notes/alpha.txt", "content": ALPHA_REV2}),
             input_tokens: 1007,
         },
         Script::Call {
-            call_id: "r8-read-alpha",
+            call_id: "r8-read-alpha".into(),
             name: "fs.read",
             arguments: json!({"path": "notes/alpha.txt"}),
             input_tokens: 1008,
@@ -549,13 +950,13 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
         // Turn 5 ("T5"): tool surface exercised through the model's own
         // catalog control — load a catalog-cold tool, then withdraw it.
         Script::Call {
-            call_id: "r10-load-mkdir",
+            call_id: "r10-load-mkdir".into(),
             name: "capability.manage",
             arguments: json!({"op": "load", "name": "fs.mkdir"}),
             input_tokens: 1010,
         },
         Script::Call {
-            call_id: "r11-unload-mkdir",
+            call_id: "r11-unload-mkdir".into(),
             name: "capability.manage",
             arguments: json!({"op": "unload", "name": "fs.mkdir"}),
             input_tokens: 1011,
@@ -567,7 +968,7 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
         // Turn 6: AFTER the checkpoint/restore — read the artifact the
         // earlier write produced; its bytes must re-enter the wire body.
         Script::Call {
-            call_id: "r13-read-evidence",
+            call_id: "r13-read-evidence".into(),
             name: "fs.read",
             arguments: json!({"path": "evidence.txt"}),
             input_tokens: 1013,
@@ -576,20 +977,42 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
             delta: "t6 complete",
             input_tokens: 1014,
         },
-        // Turn 7 ("T7"): a billed terminal failure — the known usage must
-        // settle exactly once and the trajectory must end without any
-        // unscripted extra round.
-        Script::Fail {
-            code: "invalid_request_error",
-            message: "scripted terminal failure",
-            input_tokens: 1015,
-            output_tokens: 44,
+        // Turn 6b ("T6b", tenth batch): the walk's scripted OPENER — the
+        // model's free first request. Every following page must equal the
+        // tool's returned continuation clause, verbatim.
+        Script::Call {
+            call_id: "r15-read-biglog-opener".into(),
+            name: "fs.read",
+            arguments: json!({
+                "path": BIG_LOG_PATH,
+                "start_line": BIG_LOG_OPENER_WINDOW.0,
+                "end_line": BIG_LOG_OPENER_WINDOW.1,
+            }),
+            input_tokens: 1016,
         },
     ];
+    // The FIXED post-segment: after the walk completes, a billed terminal
+    // failure — the known usage must settle exactly once and the
+    // trajectory must end without any unscripted extra round.
+    let post_scripts = vec![Script::Fail {
+        code: "invalid_request_error",
+        message: "scripted terminal failure",
+        input_tokens: 1015,
+        output_tokens: 44,
+    }];
 
     let state = Arc::new(ServerState {
         bodies: Mutex::new(Vec::new()),
-        scripts: Mutex::new(VecDeque::from(scripts.clone())),
+        pre_scripts: Mutex::new(VecDeque::from(pre_scripts.clone())),
+        post_scripts: Mutex::new(VecDeque::from(post_scripts.clone())),
+        walk: Mutex::new(WalkDrive {
+            continuations_served: 0,
+            // Continuation pages and the walk completion draw from here;
+            // unique per round by construction.
+            next_token: 1017,
+            completed: false,
+        }),
+        served: Mutex::new(Vec::new()),
         unexpected_rounds: AtomicUsize::new(0),
     });
     let port = spawn_sequence_server(Arc::clone(&state)).await;
@@ -600,6 +1023,9 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
     std::fs::create_dir(root.join("notes")).unwrap();
     std::fs::write(root.join("notes/alpha.txt"), ALPHA_REV1).unwrap();
     std::fs::write(root.join("notes/beta.txt"), BETA_BODY).unwrap();
+    // Tenth batch, class 2: pre-seed the multi-page log (disk truth is
+    // asserted inside).
+    seed_big_log(&root);
 
     let routing = PromptCacheRouting {
         isolation: "kv-sequence-isolation".into(),
@@ -735,6 +1161,15 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
     );
     wait_turn_completed(&mut events).await;
 
+    // Turn 6b: the multi-page log walk through the REAL tool — the scripted
+    // model reads page by page, each page request following the previous
+    // read's returned continuation (asserted from the wire at the end).
+    handle
+        .user_message("T6b walk the big log page by page with the returned continuation".into())
+        .await
+        .unwrap();
+    wait_turn_completed(&mut events).await;
+
     // Turn 7: billed terminal failure.
     handle
         .user_message("T7 this call will fail".into())
@@ -754,14 +1189,17 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
     let _ = tokio::time::timeout(Duration::from_secs(30), collector).await;
 
     // ------------------------------------------------------------------
-    // Every scripted round reached the wire exactly once; nothing extra.
+    // Every scripted-or-generated round reached the wire exactly once;
+    // nothing extra.
     // ------------------------------------------------------------------
     let bodies = state.bodies.lock().unwrap().clone();
+    let served = state.served.lock().unwrap().clone();
     assert_eq!(
         bodies.len(),
-        scripts.len(),
-        "exactly the scripted rounds may reach the wire (got {}; unexpected extra rounds: {})",
+        served.len(),
+        "one served decision per captured round (got {} bodies, {} served; unexpected extra rounds: {})",
         bodies.len(),
+        served.len(),
         state.unexpected_rounds.load(Ordering::SeqCst)
     );
     assert_eq!(state.unexpected_rounds.load(Ordering::SeqCst), 0);
@@ -1023,10 +1461,105 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
     // here they come back through a real read into a real request.
     assert_sentinels(&body_of(13), &[EVIDENCE_V1], 14);
 
-    // ---- Dimension 4: the ledger — one known row per scripted round,
-    // settled exactly once, never invented. ----
+    // ---- Dimension 3b (tenth batch, class 1): the ENTIRE stable prefix,
+    // not just the breakpoint item. The ninth-batch checks compared
+    // `input[B0]` (plus sampled adjacent first-differences); the items
+    // before the breakpoint were a blind spot. Three comparisons:
+    // (a) every round's whole input[0..=B0] against the trajectory
+    //     baseline, item for item;
+    // (b) every adjacent pair's whole DECLARED COMMON prefix — within a
+    //     turn it must be item-for-item identical (the declared evidence
+    //     region may not move while the turn runs);
+    // (c) at a turn start the pair may diverge ONLY at the declared
+    //     evidence item itself, and the re-rendered item must keep the
+    //     declared structure. Every failure names the first divergent
+    //     item index. The participating tools/schema blocks are compared
+    //     as one canonical whole whenever the same tool set is offered. ----
+    for round in 1..wires.len() {
+        if let Some(index) = first_prefix_divergence(&wires[0], &wires[round], b0_index) {
+            panic!(
+                "round {}: the FULL stable prefix input[0..=B0] diverges from the trajectory \
+                 baseline at item {index} (the old check compared only input[B0]):\n  baseline: {}\n  round:    {}",
+                round + 1,
+                item_preview(&wires[0]["input"][index]),
+                item_preview(&wires[round]["input"][index]),
+            );
+        }
+    }
+    let turn_starts = turn_start_rounds(wires.len());
+    for previous in 0..wires.len() - 1 {
+        let current = previous + 1;
+        let common_end = breakpoints[previous]
+            .iter()
+            .filter(|index| breakpoints[current].contains(index))
+            .copied()
+            .max()
+            .expect("every round declares at least B0");
+        let divergence = first_prefix_divergence(&wires[previous], &wires[current], common_end);
+        let current_is_turn_start = turn_starts.contains(&(current + 1));
+        let evidence_index = b0_index + 1;
+        let allowed = match divergence {
+            None => true,
+            // Mid-turn rounds: nothing inside the declared common prefix
+            // may change at all.
+            Some(_) if !current_is_turn_start => false,
+            // A turn start may re-render the declared evidence item, and
+            // only that item — the declared structure must survive.
+            Some(index) if index == evidence_index => {
+                let text = item_text(&wires[current]["input"][evidence_index]);
+                text.starts_with("SELECTED WORKING CONTEXT")
+            }
+            Some(_) => false,
+        };
+        assert!(
+            allowed,
+            "rounds {}->{}: the declared stable prefix input[0..={}] diverged at item {:?} \
+             (first divergent index; {} — baseline item: {}, changed item: {})",
+            previous + 1,
+            current + 1,
+            common_end,
+            divergence,
+            if current_is_turn_start {
+                "at a turn start only the declared evidence item may change"
+            } else {
+                "mid-turn: nothing in the declared prefix may change"
+            },
+            divergence
+                .map(|index| item_preview(&wires[previous]["input"][index]))
+                .unwrap_or_default(),
+            divergence
+                .map(|index| item_preview(&wires[current]["input"][index]))
+                .unwrap_or_default(),
+        );
+        // The participating tools compare as one canonical block whenever
+        // the same tool set is offered on both rounds (a per-name schema
+        // drift, a reordered-but-equal table, or a name-set-stable rewrite
+        // all fail here with the tool named).
+        let previous_tools = canonical_tools(&wires[previous]);
+        let current_tools = canonical_tools(&wires[current]);
+        if previous_tools.keys().eq(current_tools.keys()) {
+            for (name, schema) in &current_tools {
+                assert_eq!(
+                    previous_tools.get(name),
+                    Some(schema),
+                    "rounds {}->{}: the participating tools block changed for {name} while the tool set stayed the same",
+                    previous + 1,
+                    current + 1
+                );
+            }
+        }
+    }
+
+    // ---- Dimension 4 (tenth batch, class 3): the FULL cost ledger — one
+    // known row per SERVED decision, settled exactly once, never invented,
+    // now recording per row the provider cache read/write/miss buckets
+    // (with EXPLICIT unknown markers for unreported counters), the real
+    // attempt count and the call lane. The scripted usage numbers prove
+    // TRANSPORT and SETTLEMENT only — no assertion here says anything
+    // about real cache hit rates or price savings, and
+    // ENDPOINT_ACCEPTED / SERVER_HIT / NET_TASK_COST stay NOT_RUN. ----
     let rows = ledger.lock().unwrap().clone();
-    let expected_rows: Vec<LedgerRow> = scripts
+    let expected_rows: Vec<LedgerRow> = served
         .iter()
         .map(|script| {
             let (input_tokens, output_tokens) = script.usage();
@@ -1034,12 +1567,126 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
                 input_tokens,
                 output_tokens,
                 identity: UsageIdentity::Observed,
+                // The scripted SSE server reports input/output only: every
+                // cache bucket stays UNKNOWN — an unreported counter is
+                // never an invented zero, and these rows must never be
+                // read as real cache behavior.
+                cached_input_tokens: CostCounter::Unknown,
+                cache_write_input_tokens: CostCounter::Unknown,
+                cache_miss_input_tokens: CostCounter::Unknown,
+                event_cached_input_tokens: 0,
+                // Exactly one real transport attempt per round: the capture
+                // server saw exactly one body per served round and
+                // nothing extra (asserted above).
+                attempts: 1,
+                retries: 0,
+                // Every round of this trajectory is a main-lane round;
+                // this composition attaches no compactor, so no
+                // maintenance call may ever appear.
+                role: ModelCallRole::Main,
+                typed_usage_reported: true,
             }
         })
         .collect();
     assert_eq!(
         rows, expected_rows,
-        "every scripted round settles exactly its own reported counters, in order, once"
+        "every served round settles exactly its own reported counters, in order, once — \
+         now including the cache buckets, real attempt counts and call lane"
+    );
+    // The fixed segments really ran as scripted, in their places: the pre
+    // segment (turns 1-6 + the walk opener) first, the billed failure last,
+    // with only the generated walk segment between.
+    assert_eq!(
+        &served[..pre_scripts.len()],
+        &pre_scripts[..],
+        "the fixed pre-segment (turns 1-6 + the walk opener) must be served first, verbatim"
+    );
+    assert_eq!(
+        served.last(),
+        post_scripts.first(),
+        "the billed terminal failure must be the trajectory's final served decision"
+    );
+    // The dynamic walk segment: continuation calls up to the completion.
+    let walk_segment = &served[pre_scripts.len()..served.len() - 1];
+    let completion_ok = matches!(
+        walk_segment.last(),
+        Some(Script::Text {
+            delta: "t6b complete",
+            ..
+        })
+    );
+    assert!(
+        completion_ok,
+        "the generated walk segment must end with the walk completion"
+    );
+    assert!(
+        walk_segment[..walk_segment.len() - 1]
+            .iter()
+            .all(|script| matches!(
+                script,
+                Script::Call {
+                    name: "fs.read",
+                    ..
+                }
+            )),
+        "every generated walk round except the completion must be an fs.read continuation call"
+    );
+    // Totals: the ledger totals are exactly the sum of the per-row values,
+    // and the per-row values are exactly the served wire usage.
+    let rows_input_total: u64 = rows.iter().map(|row| row.input_tokens).sum();
+    let rows_output_total: u64 = rows.iter().map(|row| row.output_tokens).sum();
+    let served_input_total: u64 = served.iter().map(|script| script.usage().0).sum();
+    let served_output_total: u64 = served.iter().map(|script| script.usage().1).sum();
+    assert_eq!(
+        rows_input_total, served_input_total,
+        "the ledger input total must equal the sum of the per-row values ({rows_input_total} != {served_input_total})"
+    );
+    assert_eq!(
+        rows_output_total, served_output_total,
+        "the ledger output total must equal the sum of the per-row values ({rows_output_total} != {served_output_total})"
+    );
+    // No cumulative usage snapshot counted twice: every settled row keeps
+    // its own unique input-token identity (a re-emitted cumulative
+    // snapshot would duplicate one).
+    let unique_tokens: std::collections::BTreeSet<u64> =
+        rows.iter().map(|row| row.input_tokens).collect();
+    assert_eq!(
+        unique_tokens.len(),
+        rows.len(),
+        "one settled row per wire round with a unique token identity: a cumulative usage \
+         snapshot must not be counted twice"
+    );
+    // Unknown accounting: EVERY cache bucket is Unknown on EVERY row — the
+    // known-cache totals are empty FACTS, not zeros, and the ledger says
+    // so explicitly rather than summing absent counters as zero.
+    let fully_unknown_cache_rows = rows
+        .iter()
+        .filter(|row| {
+            matches!(row.cached_input_tokens, CostCounter::Unknown)
+                && matches!(row.cache_write_input_tokens, CostCounter::Unknown)
+                && matches!(row.cache_miss_input_tokens, CostCounter::Unknown)
+        })
+        .count();
+    assert_eq!(
+        fully_unknown_cache_rows,
+        rows.len(),
+        "the scripted transport reports no cache buckets: every row must carry the explicit \
+         unknown marker for cache read/write/miss (never an invented zero)"
+    );
+    // Call-lane accounting: the main lane produced every row and the
+    // maintenance lane produced none.
+    assert!(
+        rows.iter().all(|row| row.role == ModelCallRole::Main),
+        "every ledger row must be a main-lane round; a maintenance call on this composition \
+         (no compactor attached) would be an unscripted model call"
+    );
+    let maintenance_rows = rows
+        .iter()
+        .filter(|row| row.role == ModelCallRole::Maintenance)
+        .count();
+    assert_eq!(
+        maintenance_rows, 0,
+        "no maintenance-lane row may exist in this trajectory"
     );
 
     // Diagnostics for the receipt: where B1 was declared and where the
@@ -1058,6 +1705,197 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
             tool_names(wire).join(","),
             wire["input"].as_array().unwrap().len(),
             b1_snippet,
+        );
+    }
+
+    // ---- Dimension 5 (tenth batch, class 2): REAL delivery evidence.
+    // The scripted model walks the pre-seeded big log EXACTLY along the
+    // tool's returned continuation clauses (the product rule under test:
+    // "use the returned clause verbatim, walk to true EOF"), and every
+    // page's FINAL delivered tool-result content must contain its whole
+    // claimed range verbatim: no truncation marker, no head+tail clip,
+    // every block ID on its page with its true source line number, and a
+    // claims union that covers 1..=600 with no gaps and no overlaps. ----
+
+    // (a) The walk shape, read off the wire: the rounds whose wire INPUT
+    // first carries each page request (a call decided in round N enters
+    // the input of round N+1, together with its result item). Within the
+    // turn the earlier pages' call items ride along in the later
+    // requests, so each distinct page window is recorded at its FIRST
+    // wire appearance — that ordering IS the walk.
+    let mut walk_pages: Vec<(usize, u64, u64)> = Vec::new();
+    for (index, wire) in wires.iter().enumerate() {
+        for (start, end) in requested_big_log_pages(wire) {
+            if !walk_pages
+                .iter()
+                .any(|(_, seen_start, seen_end)| *seen_start == start && *seen_end == end)
+            {
+                walk_pages.push((index + 1, start, end));
+            }
+        }
+    }
+    assert!(
+        walk_pages.len() > 1,
+        "the big-log walk must span several continuation pages, got {:?}",
+        walk_pages
+    );
+    // (b) The opener is the scripted window; EVERY later page must equal
+    // a previously returned continuation clause, verbatim (the tool
+    // finishes the requested window first, so requested windows may
+    // re-name the window tail — the DELIVERY union below is what must be
+    // contiguous).
+    assert_eq!(
+        (walk_pages[0].1, walk_pages[0].2),
+        BIG_LOG_OPENER_WINDOW,
+        "the walk must open with the scripted window request"
+    );
+    for pair in walk_pages.windows(2) {
+        let (round, start, end) = pair[1];
+        let clause =
+            format!("continue with fs.read path={BIG_LOG_PATH} start_line={start} end_line={end}");
+        let clause_round = wires
+            .iter()
+            .position(|wire| {
+                delivered_big_log_pages(wire)
+                    .iter()
+                    .any(|(_, _, text)| text.contains(&clause))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "round {round}: the walk page lines {start}-{end} must EQUAL a previously \
+                     returned continuation clause ({clause:?}) — the model must follow the \
+                     tool's own continuation, not invent windows"
+                )
+            });
+        assert!(
+            clause_round + 1 < round,
+            "round {round}: the continuation clause for lines {start}-{end} must have been \
+             returned STRICTLY BEFORE the request that issued it (clause seen in round {})",
+            clause_round + 1
+        );
+    }
+    // (c) The DELIVERED claims (the tool's honest delivered ranges, e.g.
+    // the opener window 1-200 delivers claim lines=1-98/600), deduped at
+    // first appearance, must chain contiguously from line 1 to true EOF
+    // — the union covers 1..=600 with no gaps and no overlaps.
+    let mut delivered_claims: Vec<(usize, u64, u64)> = Vec::new();
+    for (index, wire) in wires.iter().enumerate() {
+        for (start, end, _) in delivered_big_log_pages(wire) {
+            if !delivered_claims
+                .iter()
+                .any(|(_, seen_start, seen_end)| *seen_start == start && *seen_end == end)
+            {
+                delivered_claims.push((index + 1, start, end));
+            }
+        }
+    }
+    assert_eq!(
+        delivered_claims.first().map(|&(_, start, _)| start),
+        Some(1),
+        "the delivered claims must start at the file's first line"
+    );
+    for pair in delivered_claims.windows(2) {
+        assert_eq!(
+            pair[1].1,
+            pair[0].2 + 1,
+            "delivered claims lines {}-{} -> lines {}-{} must chain contiguously (no gaps, no \
+             overlaps in what the model actually received)",
+            pair[0].1,
+            pair[0].2,
+            pair[1].1,
+            pair[1].2
+        );
+    }
+    assert_eq!(
+        delivered_claims.last().expect("at least one claim").2,
+        BIG_LOG_LINES as u64,
+        "the delivered claims must end exactly at the file's last line — nothing skipped, \
+         nothing re-read"
+    );
+    assert_eq!(
+        delivered_claims.len(),
+        walk_pages.len(),
+        "every requested walk page must correspond to exactly one delivered claim"
+    );
+    for ((page_round, _, _), &claim) in walk_pages.iter().zip(&delivered_claims) {
+        assert_eq!(
+            *page_round, claim.0,
+            "requested window (round {page_round}) and its delivered claim lines {}-{} must \
+             first appear in the SAME request (the call item and its result enter together)",
+            claim.1, claim.2
+        );
+    }
+
+    // (d) The delivery itself, per DELIVERED claim: the page whose claim
+    // first appears in round N (1-based) is delivered in the SAME
+    // request. Strictly, per page: exactly one delivered body claims it;
+    // the body carries the claim; NO truncation marker (a final-budget
+    // page reaches the model verbatim — a head+tail clip here is a
+    // REGRESSION); and every block ID sits on its page with its true
+    // source line number, never leaking into a page that does not claim
+    // its line.
+    for (page_no, &(request_round, start, end)) in delivered_claims.iter().enumerate() {
+        let page_no = page_no + 1;
+        let page_deliveries = delivered_big_log_pages(&wires[request_round - 1]);
+        let delivered: Vec<&(u64, u64, String)> = page_deliveries
+            .iter()
+            .filter(|(claimed_start, claimed_end, _)| {
+                *claimed_start == start && *claimed_end == end
+            })
+            .collect();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "round {request_round}: exactly one delivered body must claim page {page_no} \
+             (lines {start}-{end})",
+        );
+        let text = &delivered[0].2;
+        assert!(
+            text.contains(&format!("lines={start}-{end}/{BIG_LOG_LINES}")),
+            "round {request_round}: the delivered page {page_no} body must carry its own \
+             continuation claim lines={start}-{end}/{}",
+            BIG_LOG_LINES
+        );
+        assert!(
+            !text.contains("runtime truncated"),
+            "round {request_round}: page {page_no} (lines {start}-{end}) was clipped before \
+             reaching the model (runtime truncation marker present) — under final-budget \
+             paging this is a DELIVERY REGRESSION, the page must arrive verbatim"
+        );
+        let mut page_diagnostics = Vec::new();
+        for (line, id) in BIG_LOG_MID_MARKER_LINES
+            .iter()
+            .chain(BIG_LOG_CONTROL_MARKER_LINES.iter())
+        {
+            let in_claim = (*line as u64) >= start && (*line as u64) <= end;
+            // The body renders `{line:>6} | {source line}` — the block ID
+            // must appear with its TRUE source line number (G3 identity).
+            let rendered = format!("{line:>6} | row-{line:04} {id}");
+            if in_claim {
+                assert!(
+                    text.contains(&rendered),
+                    "round {request_round}: block ID {id} (line {line}) must be delivered ON the \
+                     page claiming lines {start}-{end}, with its true source line number \
+                     (expected rendered row {rendered:?})"
+                );
+            } else {
+                assert!(
+                    !text.contains(id),
+                    "round {request_round}: block ID {id} (line {line}) must not leak into the \
+                     page claiming lines {start}-{end} — every line is delivered exactly once"
+                );
+            }
+            page_diagnostics.push(format!(
+                "L{line}={}",
+                if in_claim { "on-page" } else { "-" }
+            ));
+        }
+        eprintln!(
+            "KV_SEQ_DELIVERY round={request_round} page={page_no} \
+             claim=lines={start}-{end}/{} chars={} markers[{}] clipped=false",
+            BIG_LOG_LINES,
+            text.chars().count(),
+            page_diagnostics.join(" "),
         );
     }
 }
