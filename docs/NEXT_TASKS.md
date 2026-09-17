@@ -6,7 +6,40 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**第十批（`c8a62355` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十批与五份回执；CI 终验以合并后 run 为准）。** 第九批已全部关闭（2026-09-17，本地集成回归全绿；CI 收尾见 CURRENT.md）。剩余条件任务 T8（需授权预算/凭据；含 KV 端点三态 NOT_RUN 的补测与 `context_manage` 租赁进出对供应商复用边界的影响核对）；C0 回执指出的同构 spawn→assign 窗口（agent-process `create_job_object`、`integrity.rs`）已随第十批 G5 收口。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**第十一批（`d3a05d29` 续审）开工（2026-09-18）**：C0 根因已随第十批终验上游收口（`b06892de` 钉宽＋attempt 2 绿），本批只补事件链最小诊断；H1/H2（Context 语义生命周期）先行，H3/H5、H4、C 线 KV 扩展并行，GUI 继续后置。**第十批（`c8a62355` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十批与五份回执；CI 终验 run `35278745998` 见 CURRENT.md）。** 第九批已全部关闭（2026-09-17，本地集成回归全绿；CI 收尾见 CURRENT.md）。剩余条件任务 T8（需授权预算/凭据；含 KV 端点三态 NOT_RUN 的补测与 `context_manage` 租赁进出对供应商复用边界的影响核对）；C0 回执指出的同构 spawn→assign 窗口（agent-process `create_job_object`、`integrity.rs`）已随第十批 G5 收口。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+
+## 第十一批（`d3a05d29` 续审：C0 残余＋H1–H5＋KV 扩展）
+
+审查基线 `d3a05d29`（报告：[REVIEW.md](reviews/2026-09-18-review-d3a05d29/REVIEW.md)，任务规格：[NEXT_ACTIONS.md](reviews/2026-09-18-review-d3a05d29/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-18-review-d3a05d29/COVERAGE.md)，CI 摘录：[CI_OBSERVATION.md](reviews/2026-09-18-review-d3a05d29/CI_OBSERVATION.md)，机制探针：[MECHANISM_RESULTS.json](reviews/2026-09-18-review-d3a05d29/MECHANISM_RESULTS.json)）。主线：**启发式相关性不能直接决定约束失效；冷热驻留位置不能决定语义；字节预算不能代替字符边界；写前拒绝不等同于日志损坏。** 审查环境无 Rust 工具链，红例由实施补；五个切片文件所有权互不重叠可并行，同一 crate 内串行（H1→H2；H3→H5）。第九/第十批修复保留不重开。实施环境 Windows＋cargo 1.97.1。
+
+### C0 残余 — t7 旅程等待的事件链最小诊断（agent-host tests）
+根因已上游收口：`b06892de` 把 `wait_file_content` 截止沿 C1 先例钉宽 30s→120s，run `35278745998` attempt 2 全绿（第十批终验，见 CURRENT.md）。残余（审查要求，不改生产代码）：等待失败时 panic 信息携带执行链各阶段已观测事实（审批请求/放行、工具调用观察、效果回执、磁盘 exists/len），成功路径零噪音；不预先创建文件、不删磁盘断言。
+
+### H1/H2 — Context 语义生命周期（B，context-simple；H1 先行）
+用户动作：否定/保留指令不误删仍有效要求；明确替代在热页与冷页产生一致结果。
+- H1（P1）：`gc/reachability.rs` 的 `has_retention_protection` 分词只裁词两端标点，`don't`/`don’t` 内部撇号保留、匹配不上 `dont`——否定句绕过保护，`has_whole_entity_cue` 的直接宾语规则把「Don't remove X」当成整体撤销，旧决策被排入 Superseded。修复：分词规范化内部撇号（`'`/`’`）＋补常见缩写否定词；保守方向只防终结；「Remove X」正对照保持生效；歧义共存，不追加无边界词表。
+- H2（P2）：`queue_decision_supersessions`/`apply_terminal_semantic` 只覆盖 Resident/Warm/pending_externalize_retry/已加载 external 四位置，未加载 `pending_external_cards`（只有 (id, card hash)，元数据在磁盘卡片）错过语义终态；卡片经 `hydrate_card_for_outcome`/`hydrate_pending_cards` 安装时按保存的旧状态装回，Live 复活。修复沿 `PendingColdConsumed` 结构先例：持久化有界 deferred 语义意图（精确实体/任务/证明内容，cap＋溢出计数），两个安装点落账应用（证明规则与即时路径同源：`entities_match_exact`＋`names_the_same_requirement_in`），同型覆盖 verified-fixed（过 `has_matching_verification_evidence`）；`apply_terminal_semantic` external 分支已用 `get_mut`（卡片认领会失效），已加载位置无复活缺口，不重做。
+- 红例：否定写法矩阵（直/弯撇号、Do not、Never、Keep、明确 Remove 正对照）走真实 ingest→maintain；同一条旧 Decision 五位置（heap/warm/retry/已加载 external/未加载冷卡）语义结果等价；冷卡「Remove X」→安装→checkpoint→restore→fetch 旧 Live 不复活；跨任务同实体不误终结；卡读取瞬时失败意图保留。
+- 停止：不全历史 hydration、不永久 pin、不动 Core anchor、不放宽终态校验、热预算语义不变。
+
+### H3/H5 — 真实源结束与真实文本交付（A/B，tool-runtime；两片分开成型）
+用户动作：合法最大工件能有限读完；中文错误/路径/标识符完整到达模型。
+- H3（P2，`tools/artifact.rs`）：扫描完成性只看 `file.take(MAX_SCAN_BYTES)` 的 `limit() > 0`——恰好 8 MiB 时真实 EOF 与预算耗尽同时发生，被一律判为扫描未完；`has_more` 含 `!scanned.complete`，末段交付后仍返回 201/401/601… 续读参数，每次从起点重扫。共享进程捕获器本就截到恰好 8 MiB，属正常生产者边界值。修复：预算耗尽时有界 1 字节 EOF 探测区分 SourceEnd/BudgetStop；大于预算的真实后缀仍必须报不完整。
+- H5（P2，`tools/stream.rs`）：`pump_stream` 按 4,000 原始字节切片，`StreamCapture::record` 对每片独立 `from_utf8_lossy`——跨片合法 UTF-8（如 3999 ASCII＋「界」）被替换字符破坏；原始工件字节无损，失真在模型可见文本。修复：stdout/stderr 分别维护 ≤3 字节增量解码尾缀，EOF 冲刷按 lossy 语义，真实非法输入明确替换；原始捕获/字节统计/背压/取消不变，不缓存整条无换行输出。
+- 红例：cap−1/cap/cap+1 各有/无结尾换行、多行/单行，continuation 原样连读有限终止（不得代补参数）；2/3/4 字节字符跨 3997–4001 边界、无换行 EOF、双流尾缀独立、真实非法 UTF-8 恰当 U+FFFD、原始工件逐字节一致。
+- 停止：真实 EOF 而非预算猜测；合法 UTF-8 无伪替换；既有 F1/F2/F6/G2/G3 与预算/取消语义不回归；未测量不报性能收益。
+
+### H4 — 拒绝阶段决定恢复许可（C，agent-storage）
+用户动作：尚未写盘的容量拒绝可执行压缩补救；实际损坏仍禁止继续追加。
+- 现状：`append_operation_record` 写前容量检查拒绝时 WAL 未变，但 `append_and_sync` 把一切错误统一写成 `writer.failed` 永久封禁——同一句柄随即不能执行错误提示中的 compaction。G4 的 `<base>.lock` 生命周期锁与旧 WAL 格式不得回退。
+- 修复：按失败阶段分类——写前拒绝类型化返回、writer 保持健康（可有限一次压缩重试，压缩后仍容不下明确拒绝、不循环）；部分写入/flush/sync 失败维持 sticky 封禁走恢复，一字不放宽。
+- 红例：可注入小额度下拒绝前后 WAL 逐字节相同、marker 有效、同句柄 compact 成功后再 append 正常；部分写入与 sync 故障负对照仍封禁。若上层匹配分支需要适配，只在报告中说明，不越界改。
+
+### KV — 有值缓存桶、实际维护、失败/重试轨迹（C，agent-compose tests）
+现有 26 轮轨迹断言全 Main、maintenance=0、cache 三桶全 Unknown——证明缺测不补零，未证明有值结算与维护路径。沿现有 `kv_production_sequence.rs` 新增独立测试（现有断言一字不改）：本地合成非零缓存读/写/输出桶（标 SYNTHETIC_USAGE，账目可复算、缺测仍 Unknown）；同任务一次失败尝试＋成功重试（attempts/retries 精确、两尝试各结算一次）；真实触发一次维护调用（lane 归属与主调用分开）——本地装配确无维护入口时如实记录可达缺口，不硬造。ENDPOINT_ACCEPTED/SERVER_HIT/NET_TASK_COST 保持 NOT_RUN 归 T8。
+- 停止：同一真实任务产物与语义完整性不下降；不为缓存稳定延迟用户指令或保留失效规则（H1/H2 的语义正确性是缓存对照的前提）。
+
+
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 

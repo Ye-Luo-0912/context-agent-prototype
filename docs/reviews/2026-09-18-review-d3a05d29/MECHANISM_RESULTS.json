@@ -1,0 +1,190 @@
+{
+  "baseline": "d3a05d297295da1ece66b00245fa027f2ee12852",
+  "execution_environment": {
+    "python": "3.13.5",
+    "system": "Linux"
+  },
+  "rust_repository_tests": "NOT_RUN",
+  "dotnet_tests": "NOT_RUN",
+  "vendor_calls": "NOT_RUN",
+  "repository_modified": false,
+  "H1_negation": {
+    "evidence_kind": "PYTHON_PORT_OF_SELECTED_PREDICATES",
+    "older": "Use AuthService.rs with a 5-second timeout",
+    "cases": [
+      {
+        "incoming": "Remove AuthService.rs",
+        "tokens": [
+          "remove",
+          "authservice.rs"
+        ],
+        "retention_protected": false,
+        "direct_object_matches": true,
+        "same_entity": true,
+        "would_queue_via_direct_object_branch": true,
+        "intended_withdrawal": true
+      },
+      {
+        "incoming": "Do not remove AuthService.rs",
+        "tokens": [
+          "do",
+          "not",
+          "remove",
+          "authservice.rs"
+        ],
+        "retention_protected": true,
+        "direct_object_matches": true,
+        "same_entity": true,
+        "would_queue_via_direct_object_branch": false,
+        "intended_withdrawal": false
+      },
+      {
+        "incoming": "Don't remove AuthService.rs",
+        "tokens": [
+          "don't",
+          "remove",
+          "authservice.rs"
+        ],
+        "retention_protected": false,
+        "direct_object_matches": true,
+        "same_entity": true,
+        "would_queue_via_direct_object_branch": true,
+        "intended_withdrawal": false
+      },
+      {
+        "incoming": "Don’t remove AuthService.rs",
+        "tokens": [
+          "don’t",
+          "remove",
+          "authservice.rs"
+        ],
+        "retention_protected": false,
+        "direct_object_matches": true,
+        "same_entity": true,
+        "would_queue_via_direct_object_branch": true,
+        "intended_withdrawal": false
+      },
+      {
+        "incoming": "Never remove AuthService.rs",
+        "tokens": [
+          "never",
+          "remove",
+          "authservice.rs"
+        ],
+        "retention_protected": true,
+        "direct_object_matches": true,
+        "same_entity": true,
+        "would_queue_via_direct_object_branch": false,
+        "intended_withdrawal": false
+      }
+    ],
+    "limitation": "No ContextEngine ingest/maintain or Rust regression was executed."
+  },
+  "H2_cold_semantics": {
+    "evidence_kind": "STATIC_CALL_CHAIN_ONLY",
+    "rust_test": "NOT_RUN"
+  },
+  "H3_exact_cap_eof": {
+    "evidence_kind": "REAL_TEMP_FILE_IO_PLUS_COVERAGE_FORMULA_PORT",
+    "cases": [
+      {
+        "file_bytes": 8388607,
+        "scanned_bytes": 8388607,
+        "remaining_take_budget": 1,
+        "current_completion_formula": true,
+        "actual_eof_at_scan_boundary": true
+      },
+      {
+        "file_bytes": 8388608,
+        "scanned_bytes": 8388608,
+        "remaining_take_budget": 0,
+        "current_completion_formula": false,
+        "actual_eof_at_scan_boundary": true
+      },
+      {
+        "file_bytes": 8388609,
+        "scanned_bytes": 8388608,
+        "remaining_take_budget": 0,
+        "current_completion_formula": false,
+        "actual_eof_at_scan_boundary": false
+      }
+    ],
+    "post_content_continuations": [
+      {
+        "request_start": 1,
+        "request_end": 200,
+        "has_more": true,
+        "next_start_line": 201,
+        "source_lines": 1
+      },
+      {
+        "request_start": 201,
+        "request_end": 400,
+        "has_more": true,
+        "next_start_line": 401,
+        "source_lines": 1
+      },
+      {
+        "request_start": 401,
+        "request_end": 600,
+        "has_more": true,
+        "next_start_line": 601,
+        "source_lines": 1
+      },
+      {
+        "request_start": 601,
+        "request_end": 800,
+        "has_more": true,
+        "next_start_line": 801,
+        "source_lines": 1
+      }
+    ],
+    "limitation": "Does not run Tokio Take, ArtifactReadTool, Broker or Runtime."
+  },
+  "H4_wal_prewrite_refusal": {
+    "evidence_kind": "STATIC_CALL_CHAIN_ONLY",
+    "rust_test": "NOT_RUN"
+  },
+  "H5_stream_utf8": {
+    "evidence_kind": "REAL_PYTHON_UTF8_DECODE_ON_PRODUCTION_SIZED_BYTE_BOUNDARIES",
+    "cases": [
+      {
+        "character": "¢",
+        "raw_hex": "c2a2",
+        "chunk_lengths": [
+          4000,
+          1
+        ],
+        "per_chunk_replacement_count": 2,
+        "valid_character_preserved_per_chunk": false,
+        "raw_artifact_bytes_preserved": true,
+        "incremental_decoder_preserves_text": true
+      },
+      {
+        "character": "界",
+        "raw_hex": "e7958c",
+        "chunk_lengths": [
+          4000,
+          2
+        ],
+        "per_chunk_replacement_count": 3,
+        "valid_character_preserved_per_chunk": false,
+        "raw_artifact_bytes_preserved": true,
+        "incremental_decoder_preserves_text": true
+      },
+      {
+        "character": "🧪",
+        "raw_hex": "f09fa7aa",
+        "chunk_lengths": [
+          4000,
+          3
+        ],
+        "per_chunk_replacement_count": 4,
+        "valid_character_preserved_per_chunk": false,
+        "raw_artifact_bytes_preserved": true,
+        "incremental_decoder_preserves_text": true
+      }
+    ],
+    "limitation": "Rust pump_stream/StreamCapture were inspected, not executed."
+  }
+}

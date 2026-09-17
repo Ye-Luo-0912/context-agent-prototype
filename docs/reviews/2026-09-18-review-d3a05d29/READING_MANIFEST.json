@@ -1,0 +1,224 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "baseline": "d3a05d297295da1ece66b00245fa027f2ee12852",
+  "previous_baseline": "c8a623554f762505061cdfdd7466ccaa995a3de0",
+  "distinct_text_files_read": 20,
+  "whole_repository_line_by_line_complete": false,
+  "files": [
+    {
+      "path": "Cargo.toml",
+      "actual_coverage": "全文",
+      "source_refs": [
+        "turn636file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/Cargo.toml"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/page.rs",
+      "actual_coverage": "全文",
+      "source_refs": [
+        "turn637file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/tool-runtime/src/tools/page.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/fs.rs",
+      "actual_coverage": "1–550 返回被截断；430–735 完整区间。不能将前一次请求范围全部视为已读。",
+      "source_refs": [
+        "turn638file0",
+        "turn639file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/tool-runtime/src/tools/fs.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/artifact.rs",
+      "actual_coverage": "1–280；280–645",
+      "source_refs": [
+        "turn641file0",
+        "turn642file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/tool-runtime/src/tools/artifact.rs"
+    },
+    {
+      "path": "crates/agent-process/src/contained_spawn.rs",
+      "actual_coverage": "1–295",
+      "source_refs": [
+        "turn643file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/agent-process/src/contained_spawn.rs"
+    },
+    {
+      "path": "crates/context-simple/src/engine.rs",
+      "actual_coverage": "1–195；530–760；1570–1830；2530–2680；2700–2940；3270–3455",
+      "source_refs": [
+        "turn664file0",
+        "turn644file0",
+        "turn645file0",
+        "turn647file0",
+        "turn646file0",
+        "turn670file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/context-simple/src/engine.rs"
+    },
+    {
+      "path": "crates/context-simple/src/gc/reachability.rs",
+      "actual_coverage": "1–340；340–620；780–1000（另复核1–235）",
+      "source_refs": [
+        "turn650file0",
+        "turn659file0",
+        "turn661file0",
+        "turn678file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/context-simple/src/gc/reachability.rs"
+    },
+    {
+      "path": "crates/context-simple/src/index/external.rs",
+      "actual_coverage": "1–315；315–640",
+      "source_refs": [
+        "turn651file0",
+        "turn655file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/context-simple/src/index/external.rs"
+    },
+    {
+      "path": "crates/context-simple/src/gc/full/mod.rs",
+      "actual_coverage": "1–310",
+      "source_refs": [
+        "turn656file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/context-simple/src/gc/full/mod.rs"
+    },
+    {
+      "path": "crates/agent-storage/src/lib.rs",
+      "actual_coverage": "55–280；575–790；940–1110",
+      "source_refs": [
+        "turn653file0",
+        "turn657file0",
+        "turn658file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/agent-storage/src/lib.rs"
+    },
+    {
+      "path": "crates/context-simple/src/gc/minor.rs",
+      "actual_coverage": "1–315",
+      "source_refs": [
+        "turn660file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/context-simple/src/gc/minor.rs"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/DeltaCoalescer.cs",
+      "actual_coverage": "全文",
+      "source_refs": [
+        "turn662file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/clients/dotnet/Agent.Client/DeltaCoalescer.cs"
+    },
+    {
+      "path": "clients/dotnet/Agent.Client/BoundedEventQueue.cs",
+      "actual_coverage": "全文",
+      "source_refs": [
+        "turn663file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/clients/dotnet/Agent.Client/BoundedEventQueue.cs"
+    },
+    {
+      "path": "crates/context-simple/src/index/entity.rs",
+      "actual_coverage": "1–300",
+      "source_refs": [
+        "turn665file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/context-simple/src/index/entity.rs"
+    },
+    {
+      "path": "crates/agent-contracts/src/operation.rs",
+      "actual_coverage": "1–210",
+      "source_refs": [
+        "turn666file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/agent-contracts/src/operation.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/process.rs",
+      "actual_coverage": "1–220",
+      "source_refs": [
+        "turn667file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/tool-runtime/src/tools/process.rs"
+    },
+    {
+      "path": "crates/tool-runtime/src/tools/stream.rs",
+      "actual_coverage": "1–230；220–420（返回已到文件结尾）",
+      "source_refs": [
+        "turn668file0",
+        "turn669file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/tool-runtime/src/tools/stream.rs"
+    },
+    {
+      "path": "docs/reviews/2026-09-18-review-c8a62355/KV_SEQUENCE_COMPLETENESS_RECEIPT.md",
+      "actual_coverage": "全文；仅作为作者回执，不能冒充本环境实测",
+      "source_refs": [
+        "turn671file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/docs/reviews/2026-09-18-review-c8a62355/KV_SEQUENCE_COMPLETENESS_RECEIPT.md"
+    },
+    {
+      "path": "crates/agent-compose/tests/kv_production_sequence.rs",
+      "actual_coverage": "1580–1825；其余部分未在本轮通读",
+      "source_refs": [
+        "turn672file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/agent-compose/tests/kv_production_sequence.rs"
+    },
+    {
+      "path": "crates/agent-host/tests/host_t7_journey.rs",
+      "actual_coverage": "1250–1405",
+      "source_refs": [
+        "turn677file0"
+      ],
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/d3a05d297295da1ece66b00245fa027f2ee12852/crates/agent-host/tests/host_t7_journey.rs"
+    }
+  ],
+  "navigation_only": [
+    "commit comparison: seven commits ahead",
+    "context-simple source/gc directory trees"
+  ],
+  "failed_reads": [
+    "crates/context-simple/src/reachability.rs: wrong path/404, corrected to gc/reachability.rs",
+    "generic GitHub fetch of Actions job logs URL refused; dedicated fetch_workflow_job_logs succeeded"
+  ],
+  "search_not_used_as_current_evidence": [
+    "recorded_card search returned an older commit; used only for navigation"
+  ],
+  "environment": {
+    "cargo": "not found",
+    "rustc": "not found",
+    "dotnet": "not found",
+    "git_access": "DNS failure; no checkout",
+    "archive_download": "not obtained"
+  },
+  "executed_here": [
+    "standalone Python predicate port",
+    "temporary-file exact-scan-cap probe",
+    "UTF-8 boundary decode probe"
+  ],
+  "not_run_here": [
+    "Rust workspace tests",
+    "new Rust regressions",
+    "dotnet tests",
+    "Windows tests",
+    "real terminal tests",
+    "paid provider calls"
+  ],
+  "ci": {
+    "run_id": 35278745998,
+    "attempt": 1,
+    "status": "completed",
+    "conclusion": "failure",
+    "failed_job": 105396528808,
+    "failed_test": "named_pipe_t7_same_task_full_backend_journey",
+    "source_ref": "turn674file0",
+    "note": "Dedicated job log was read; no citation marker was supplied by that action."
+  }
+}
