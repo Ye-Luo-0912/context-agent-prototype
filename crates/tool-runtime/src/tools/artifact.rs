@@ -300,6 +300,11 @@ fn is_char_boundary(bytes: &[u8], index: usize) -> bool {
 /// instead of refusing the read.
 const MAX_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 
+/// Sequential-scan buffer. The default 8 KiB would make every
+/// budget-sized page of an 8 MiB artifact pay ~1000 refills; the scan is
+/// strictly sequential, so a large buffer trades only memory.
+const SCAN_BUFFER_BYTES: usize = 1024 * 1024;
+
 pub struct ArtifactReadTool {
     workspace: Workspace,
 }
@@ -416,7 +421,8 @@ impl Tool for ArtifactReadTool {
         // itself. Nothing trusts a size probe, and the report says when
         // the totals stopped at the scan budget.
         let file = confined.into_tokio();
-        let mut reader = tokio::io::BufReader::new(file.take(MAX_SCAN_BYTES));
+        let mut reader =
+            tokio::io::BufReader::with_capacity(SCAN_BUFFER_BYTES, file.take(MAX_SCAN_BYTES));
         // G2: the page is captured under the FINAL delivered budget — the
         // same number the trusted broker clamps this tool to — with each
         // span's numbering prefix, its separator, and a worst-case
@@ -539,9 +545,23 @@ impl Tool for ArtifactReadTool {
                 capture_closed = true;
             }
         }
-        // `take` returns 0 reads both at true EOF and at the scan budget;
-        // remaining budget distinguishes them.
-        let scan_complete = reader.get_ref().limit() > 0;
+        // `take` returns 0 reads both at true EOF and at the scan budget.
+        // A remaining budget proves the source ended; an EXHAUSTED budget
+        // only proves the boundary was reached — yet a file of exactly
+        // MAX_SCAN_BYTES bytes (what the shared process capture produces
+        // when it truncates) is a real source end, not a budget stop. The
+        // exhausted case is decided by one bounded 1-byte read through the
+        // scan handle itself, bypassing the exhausted `take`: the handle
+        // is positioned at the scan start plus exactly the scanned bytes,
+        // so reading 0 bytes there means the source ended (complete) and
+        // reading 1 byte means a real suffix follows (budget stop,
+        // incomplete). A read error also keeps the conservative
+        // "incomplete". The probe costs one syscall, runs after the scan
+        // loop, and never enters the capture.
+        let mut scan_complete = reader.get_ref().limit() > 0;
+        if !scan_complete {
+            scan_complete = matches!(reader.get_mut().get_mut().read(&mut [0_u8; 1]).await, Ok(0));
+        }
         let scanned = ScannedPosition {
             lines: counted_lines,
             bytes: scanned_bytes,
@@ -2136,6 +2156,249 @@ mod tests {
             "the next page pointer stays reachable: {}",
             output.model_content
         );
+    }
+
+    // -- H3 regressions (eleventh batch): SourceEnd vs BudgetStop --------------
+    //
+    // The scan's `take(MAX_SCAN_BYTES)` returns 0 both at true EOF and at
+    // the budget; a shared-process capture truncates artifacts to EXACTLY
+    // that budget, so an exactly-cap-sized file is a normally producible
+    // boundary value whose end must be recognized as the source's end.
+
+    /// Write an UNSEALED (draft) artifact. The boundary tests below are
+    /// about scan completion, not digest integrity, and the draft locator
+    /// skips the per-read digest re-verification that would otherwise
+    /// dominate the debug-build wall time of an 8 MiB multi-page walk.
+    async fn write_draft_artifact(workspace: &Workspace, run_id: RunId, bytes: &[u8]) -> String {
+        use tokio::io::AsyncWriteExt;
+        let mut draft = workspace
+            .create_artifact(run_id, "process", "log")
+            .await
+            .unwrap();
+        draft.write_all(bytes).await.unwrap();
+        draft.locator().to_string()
+    }
+
+    /// Build an artifact whose FILE SIZE is exactly `size` bytes.
+    /// `line_len == 0` builds one single line; otherwise `line_len`-byte
+    /// lines are emitted and the last line takes the remainder. A
+    /// requested trailing newline counts toward `size`.
+    fn cap_sized_body(size: usize, line_len: usize, newline_terminated: bool) -> Vec<u8> {
+        let mut body = Vec::with_capacity(size + 1);
+        if line_len == 0 {
+            body.resize(size - usize::from(newline_terminated), b'a');
+        } else {
+            while size - body.len() >= line_len {
+                body.resize(body.len() + line_len - 1, b'x');
+                body.push(b'\n');
+            }
+            let rest = size - body.len();
+            assert!(
+                rest > usize::from(newline_terminated),
+                "the boundary remainder must keep a non-empty last line"
+            );
+            body.resize(size - usize::from(newline_terminated), b'y');
+        }
+        if newline_terminated {
+            body.push(b'\n');
+        }
+        assert_eq!(
+            body.len(),
+            size,
+            "the boundary artifact must be exactly `size` bytes"
+        );
+        body
+    }
+
+    /// H3: scan completion must reflect the SOURCE, not the budget. An
+    /// artifact of exactly MAX_SCAN_BYTES bytes is complete; one byte
+    /// more stays honestly incomplete. Parameterized over
+    /// cap-1/cap/cap+1, with and without a trailing newline, single- and
+    /// multi-line (real temp artifacts throughout).
+    #[tokio::test]
+    async fn scan_completion_at_the_cap_boundary_reflects_the_source_not_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let cap = MAX_SCAN_BYTES as usize;
+        for size in [cap - 1, cap, cap + 1] {
+            for newline_terminated in [false, true] {
+                for line_len in [0, 100] {
+                    let body = cap_sized_body(size, line_len, newline_terminated);
+                    let expected_lines = std::str::from_utf8(&body).unwrap().lines().count();
+                    let reference = write_draft_artifact(&workspace, run_id, &body).await;
+                    let output = value(
+                        tool.execute(
+                            run_id,
+                            "c",
+                            json!({ "reference": reference }),
+                            None,
+                            CancellationToken::new(),
+                        )
+                        .await
+                        .unwrap(),
+                    );
+                    assert!(output.ok);
+                    let label =
+                        format!("size={size} newline={newline_terminated} line_len={line_len}");
+                    assert_eq!(
+                        output.metadata["total_lines"], expected_lines,
+                        "the scanned totals must cover the whole prefix: {label}"
+                    );
+                    assert_eq!(
+                        output.metadata["total_lines_complete"],
+                        size <= cap,
+                        "complete must mean the SOURCE ended, not that the budget did: {label}"
+                    );
+                    if size <= cap {
+                        assert!(
+                            !output.summary.contains("totals are incomplete"),
+                            "a complete scan must not declare incomplete totals: {label} — {}",
+                            output.summary
+                        );
+                    } else {
+                        assert!(
+                            output.summary.contains("totals are incomplete"),
+                            "one byte past the cap must stay honestly incomplete: {label} — {}",
+                            output.summary
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// H3: an exactly-cap-sized SINGLE-line artifact must terminate
+    /// finitely once its whole content is delivered: following ONLY the
+    /// continuations the model-visible body returns — through the real
+    /// broker — ends at a real "end of artifact" with has_more=false,
+    /// never an endless chain of start_line=201/401/601... rescans of the
+    /// same prefix.
+    #[tokio::test]
+    async fn cap_sized_single_line_terminates_through_returned_continuations() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let body = cap_sized_body(MAX_SCAN_BYTES as usize, 0, true);
+        let reference = write_draft_artifact(&workspace, run_id, &body).await;
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let pages = walk_pages_to_end(
+            &tool,
+            &broker,
+            run_id,
+            json!({ "reference": reference }),
+            900,
+        )
+        .await;
+        assert!(pages.len() > 10, "an 8 MiB line cannot fit one page");
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.metadata["total_lines_complete"] == true),
+            "every page must see the probe-confirmed real end"
+        );
+        let last = pages.last().unwrap();
+        assert_eq!(last.metadata["has_more"], false);
+        assert!(
+            last.model_content.contains("end of artifact (1 lines)"),
+            "the walk must end at the artifact's real end: {}",
+            last.model_content
+        );
+    }
+
+    /// H3: same termination guarantee for a MULTI-line cap-sized artifact
+    /// whose last line has no trailing newline — the exact-cap boundary
+    /// must not be reported as a budget stop.
+    #[tokio::test]
+    async fn cap_sized_multiline_artifact_terminates_through_returned_continuations() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let body = cap_sized_body(MAX_SCAN_BYTES as usize, 104_858, false);
+        let expected_lines = std::str::from_utf8(&body).unwrap().lines().count();
+        assert!(expected_lines > 10);
+        let reference = write_draft_artifact(&workspace, run_id, &body).await;
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let pages = walk_pages_to_end(
+            &tool,
+            &broker,
+            run_id,
+            json!({ "reference": reference }),
+            900,
+        )
+        .await;
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.metadata["total_lines_complete"] == true),
+            "every page must see the probe-confirmed real end"
+        );
+        let last = pages.last().unwrap();
+        assert_eq!(last.metadata["total_lines"], expected_lines);
+        assert_eq!(last.metadata["has_more"], false);
+        assert!(
+            last.model_content
+                .contains(&format!("end of artifact ({expected_lines} lines)")),
+            "the walk must end at the artifact's real end: {}",
+            last.model_content
+        );
+    }
+
+    /// H3: one byte past the cap keeps the honest BudgetStop behavior —
+    /// the totals stay incomplete, and following a returned continuation
+    /// still advances without ever claiming a real end.
+    #[tokio::test]
+    async fn one_byte_past_the_cap_keeps_honest_incomplete_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(dir.path()).await.unwrap();
+        let run_id = RunId::new();
+        let body = cap_sized_body(MAX_SCAN_BYTES as usize + 1, 0, false);
+        let reference = write_draft_artifact(&workspace, run_id, &body).await;
+        let tool = ArtifactReadTool::new(workspace.clone());
+        let broker = agent_workspace::WorkspaceOutputBroker::new(std::sync::Arc::new(workspace));
+
+        let first =
+            read_through_broker(&tool, &broker, run_id, json!({ "reference": reference })).await;
+        assert_eq!(first.metadata["total_lines_complete"], false);
+        assert!(
+            first.summary.contains("totals are incomplete"),
+            "the budget stop must be declared: {}",
+            first.summary
+        );
+
+        // Follow the returned continuation verbatim: it advances, but no
+        // page may upgrade the claim to a complete scan or a real end.
+        let mut previous = (0usize, 0usize);
+        let mut args = continuation_args(&first.model_content);
+        for page_index in 0..3 {
+            let output = read_through_broker(&tool, &broker, run_id, args.clone()).await;
+            assert!(output.ok);
+            assert_eq!(
+                output.metadata["total_lines_complete"], false,
+                "an over-budget artifact must never claim a complete scan (page {page_index})"
+            );
+            assert!(
+                !output.model_content.contains("end of artifact"),
+                "a budget-stopped scan must never claim a real end: {}",
+                output.model_content
+            );
+            let start = args["start_line"].as_u64().unwrap() as usize;
+            let offset = args
+                .get("line_byte_offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            assert!(
+                (start, offset) > previous,
+                "the returned continuation must advance"
+            );
+            previous = (start, offset);
+            args = continuation_args(&output.model_content);
+        }
     }
 
     /// G2 safety net for the single maintenance entry: if the envelope
