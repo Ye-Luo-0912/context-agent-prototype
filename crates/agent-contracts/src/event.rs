@@ -80,10 +80,14 @@ pub enum AnchorPatchKind {
 #[serde(rename_all = "snake_case")]
 pub enum ToolLeaseBoundary {
     /// The first model request for a newly applied user directive. Ephemeral
-    /// leases from an aborted/older directive cannot cross this boundary.
+    /// leases from an aborted/older directive cannot cross this boundary;
+    /// explicit loads are re-established only by the new directive's model
+    /// decisions.
     DirectiveStart,
     /// A successful model decision consumed the preceding results. Tools the
-    /// decision calls are rooted until their results reach the next decision.
+    /// decision calls are rooted until their results reach the next decision;
+    /// the bounded explicit-load cohort may keep its tools rooted across the
+    /// rest of the non-empty directive.
     ModelDecision,
 }
 
@@ -489,6 +493,16 @@ pub enum RuntimeEvent {
         #[serde(default)]
         retryable: bool,
         message: String,
+    },
+    /// A failed turn finished its usage settlement and actor cleanup.
+    /// This is the lifecycle counterpart to [`Self::TurnCompleted`]: it is
+    /// not a successful commit and never closes the task, but consumers can
+    /// stop waiting without guessing from a diagnostic `Failure` row.
+    TurnFailed {
+        turn_id: TurnId,
+        task_id: Option<TaskId>,
+        class: RuntimeFailureClass,
+        retryable: bool,
     },
     /// A retryable provider attempt ended before emitting a usable result.
     /// This live-only progress signal keeps outer watchdogs honest while the

@@ -300,7 +300,9 @@ impl OpenRound {
 /// and before every terminal path; any window left open at a new round, a
 /// turn boundary, or the end of the trace is therefore evidence of abrupt
 /// process loss, and its per-call counts are what replay can honestly claim:
-/// calls were started, some finished, and none was accounted.
+/// calls were started, some finished, and none was accounted. `TurnFailed` is
+/// a terminal boundary too, but it does not advance the successful commit
+/// barrier.
 ///
 /// Tool events outside any `ModelStarted`-anchored window are ignored — old
 /// or synthetic traces may carry them, and inventing an attribution would
@@ -369,7 +371,8 @@ pub fn analyze_batch_interruptions(events: &[RuntimeEventEnvelope]) -> BatchInte
             }
             RuntimeEvent::TurnCompleted
             | RuntimeEvent::TurnCancelled { .. }
-            | RuntimeEvent::TurnCommitFailed { .. } => flush(&mut open, &mut report),
+            | RuntimeEvent::TurnCommitFailed { .. }
+            | RuntimeEvent::TurnFailed { .. } => flush(&mut open, &mut report),
             _ => {}
         }
     }
@@ -720,8 +723,8 @@ mod tests {
     use super::*;
     use agent_contracts::{
         ContextConsumptionAck, ContextMaintenanceReport, ContextMaintenanceTrigger,
-        ContextSelection, OperationId, TaskId, ToolCall, ToolOutput, TurnCancellationReason,
-        TurnId,
+        ContextSelection, OperationId, RuntimeFailureClass, TaskId, ToolCall, ToolOutput,
+        TurnCancellationReason, TurnId,
     };
     use serde_json::json;
 
@@ -1635,6 +1638,42 @@ mod tests {
         assert_eq!(
             analyze_batch_interruptions(&events),
             BatchInterruptionReport::default()
+        );
+    }
+
+    #[test]
+    fn failed_turn_closes_an_open_batch_without_claiming_success() {
+        let run = RunId::new();
+        let turn = TurnId::new();
+        let events = vec![
+            envelope(run, 1, RuntimeEvent::RunStarted),
+            model_started_event(run, 2, turn, 1),
+            tool_started_event(run, 3, "call-1"),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ToolFinished {
+                    output: tool_output(false, "provider failed after the tool batch"),
+                    facts: None,
+                },
+            ),
+            settled_event(run, 5, turn, 1, 0, 0),
+            envelope(
+                run,
+                6,
+                RuntimeEvent::TurnFailed {
+                    turn_id: turn,
+                    task_id: None,
+                    class: RuntimeFailureClass::ProviderTransport,
+                    retryable: true,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            analyze_batch_interruptions(&events),
+            BatchInterruptionReport::default(),
+            "TurnFailed is an explicit settled boundary; it must not be reported as abrupt process loss"
         );
     }
 

@@ -454,17 +454,18 @@ impl RuntimeActor {
         let snapshot = self.round_snapshot().cloned();
 
         // Build roots before either lifecycle mechanism mutates the surface.
-        // They come from exact task requirements, typed execution needs,
-        // pending explicit loads and the preceding model batch whose results
-        // this request will consume. No free-text action plan or fixed lease
-        // duration participates.
+        // They come from exact task requirements, typed execution needs, the
+        // current directive's explicit-load cohort, pending explicit loads
+        // and the preceding model batch whose results this request will
+        // consume. No free-text action plan or fixed lease duration
+        // participates.
         let lease_catalog = self.services.tool_specs();
         let task_roots = self.tool_lease_roots(&lease_catalog, &[], true, true);
 
         // Tool lifecycle GC remains the bounded pressure/idle backstop. The
-        // same source roots protect required, pending-load and result-delivery
-        // tools; task demand can restore schema readiness but never grants
-        // authority.
+        // same source roots protect required, directive-cohort, pending-load
+        // and result-delivery tools; task demand can restore schema readiness
+        // but never grants authority.
         // It runs before lease reconciliation so a newly released schema
         // finishes this decision boundary at Warm rather than immediately
         // crossing the older Warm->Unloaded idle threshold.
@@ -835,15 +836,18 @@ impl RuntimeActor {
                 return;
             }
             // Deliberate refusal, not a fault: settle the applied input and
-            // drop the turn without fencing.
+            // publish a typed failed-turn terminal without fencing.
+            let message =
+                "the active task requires a tool that is unavailable; refusing to start the model round"
+                    .to_string();
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::Error {
-                    message: "the active task requires a tool that is unavailable; refusing to start the model round"
-                        .into(),
+                    message: message.clone(),
                 })
                 .await;
-            self.settle_aborted_turn().await;
+            self.settle_failed_turn(RuntimeFailureClass::Runtime, false)
+                .await;
             return;
         }
 
@@ -891,17 +895,19 @@ impl RuntimeActor {
                 return;
             }
             // Deliberate refusal, not a fault: settle the applied input and
-            // drop the turn without fencing.
+            // publish a typed failed-turn terminal without fencing.
+            let message = crate::output::bound_error_message(format!(
+                "the active task requires a tool whose input schema was rejected by schema compilation ({}); refusing to start the model round",
+                rejected_names
+            ));
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::Error {
-                    message: crate::output::bound_error_message(format!(
-                        "the active task requires a tool whose input schema was rejected by schema compilation ({}); refusing to start the model round",
-                        rejected_names
-                    )),
+                    message: message.clone(),
                 })
                 .await;
-            self.settle_aborted_turn().await;
+            self.settle_failed_turn(RuntimeFailureClass::Runtime, false)
+                .await;
             return;
         }
 
@@ -937,18 +943,20 @@ impl RuntimeActor {
                 return;
             }
             // Deliberate refusal, not a fault: settle the applied input and
-            // drop the turn without fencing.
+            // publish a typed failed-turn terminal without fencing.
+            let message = format!(
+                "mandatory tool schemas exceed the per-round schema budget ({} > {} tokens); refusing to start the model round",
+                surface_plan.mandatory_schema_tokens(),
+                MAX_TOOL_SURFACE_TOKENS
+            );
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::Error {
-                    message: format!(
-                        "mandatory tool schemas exceed the per-round schema budget ({} > {} tokens); refusing to start the model round",
-                        surface_plan.mandatory_schema_tokens(),
-                        MAX_TOOL_SURFACE_TOKENS
-                    ),
+                    message: message.clone(),
                 })
                 .await;
-            self.settle_aborted_turn().await;
+            self.settle_failed_turn(RuntimeFailureClass::InputBudget, false)
+                .await;
             return;
         }
 
@@ -1469,18 +1477,20 @@ impl RuntimeActor {
                 return;
             }
             // Deliberate refusal, not a fault: settle the applied input and
-            // drop the turn without fencing.
+            // publish the typed terminal after the budget diagnostic.
+            let message = format!(
+                "model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round ({packing_input_tokens} > {max_input_budget} conservatively packed input tokens); refusing to send"
+            );
             let _ = self
                 .core
                 .emit_event(RuntimeEvent::Failure {
                     class: RuntimeFailureClass::InputBudget,
                     retryable: false,
-                    message: format!(
-                        "model input exceeds the provider window even with the context frame emptied and optional tool schemas omitted for this round ({packing_input_tokens} > {max_input_budget} conservatively packed input tokens); refusing to send"
-                    ),
+                    message: message.clone(),
                 })
                 .await;
-            self.settle_aborted_turn().await;
+            self.settle_failed_turn(RuntimeFailureClass::InputBudget, false)
+                .await;
             return;
         }
 
@@ -1966,19 +1976,29 @@ impl RuntimeActor {
         }) {
             roots.push(CONTEXT_MANAGE.to_string());
         }
-        if include_turn_leases && let Some(turn) = self.state.turn.as_ref() {
-            roots.extend(turn.pending_loaded_tools.iter().cloned());
-            roots.extend(turn.result_delivery_tools.iter().cloned());
-            // Unresolved obligations keep their exact source tool surfaced:
+        if let Some(turn) = self.state.turn.as_ref() {
+            // Unresolved obligations keep their exact source tool surfaced
+            // independently of the short-lived load/result lease switch:
             // the ledger recorded a trusted association when the row opened,
             // and this derived view releases it exactly when the row dies.
-            let obligation_source_tools: Vec<String> = turn
-                .execution
-                .obligation_source_tools()
-                .into_iter()
-                .filter(|tool_name| catalog.iter().any(|spec| spec.name == *tool_name))
-                .collect();
+            let obligation_source_tools = turn.execution.obligation_source_tools();
             roots.extend(obligation_source_tools.iter().cloned());
+            // Explicit loads are a bounded continuity source for the active
+            // directive. Unlike the one-decision result lease, this root must
+            // also participate in the reconciliation call that deliberately
+            // excludes short-lived turn leases; otherwise an intervening
+            // fs.read/edit would evict a capability the model explicitly
+            // loaded for the current work loop.
+            roots.extend(
+                turn.directive_loaded_tools
+                    .iter()
+                    .take(MAX_DIRECTIVE_LOADED_TOOLS)
+                    .cloned(),
+            );
+            if include_turn_leases {
+                roots.extend(turn.pending_loaded_tools.iter().cloned());
+                roots.extend(turn.result_delivery_tools.iter().cloned());
+            }
         }
         roots.extend(decision_calls.iter().map(|call| call.name.clone()));
         roots.sort();
@@ -1990,9 +2010,11 @@ impl RuntimeActor {
     /// The decision consumes the previous result-delivery lease. A pending
     /// explicit load is consumed only when that exact tool is called, so
     /// sequential loads form a task-local cohort instead of evicting each
-    /// other at adjacent decisions. An empty decision ends the turn and
-    /// releases every unused pending load. Reconciliation happens before
-    /// dispatch, while the actor is at a surface-safe boundary.
+    /// other at adjacent decisions. The directive cohort additionally keeps
+    /// explicitly loaded tools available across non-empty decisions; an empty
+    /// decision ends the turn and releases that cohort plus every unused
+    /// pending load. Reconciliation happens before dispatch, while the actor
+    /// is at a surface-safe boundary.
     pub(super) async fn reconcile_model_decision_leases(
         &mut self,
         calls: &[ToolCall],
@@ -2009,6 +2031,15 @@ impl RuntimeActor {
         }) else {
             return Ok(());
         };
+        // An empty decision is the terminal edge of this directive. Release
+        // the continuity cohort before computing roots so the catalog can
+        // cool explicitly loaded optional schemas at the same safe point;
+        // non-empty decisions keep the cohort alive for the next action.
+        if calls.is_empty()
+            && let Some(turn) = self.state.turn.as_mut()
+        {
+            turn.directive_loaded_tools.clear();
+        }
         let pending_loaded_tools = self
             .state
             .turn

@@ -546,6 +546,64 @@ impl RuntimeActor {
         }
     }
 
+    /// Publish the lifecycle terminal for a turn that failed after its
+    /// operation result was classified and its applied input/action batch was
+    /// settled. The diagnostic `Failure` and any `ModelUsed` row are emitted
+    /// before this barrier; consumers therefore receive one explicit end
+    /// fact without having to infer it from either channel.
+    pub(super) async fn publish_turn_failed(
+        &mut self,
+        turn_id: TurnId,
+        task_id: Option<TaskId>,
+        class: agent_contracts::RuntimeFailureClass,
+        retryable: bool,
+    ) {
+        let event = RuntimeEvent::TurnFailed {
+            turn_id,
+            task_id,
+            class,
+            retryable,
+        };
+        if let Err(error) = self.core.emit_event_durable(event).await {
+            // The turn itself is already dropped, but its terminal audit
+            // could not be made durable. Fence subsequent mutations and
+            // expose the recovery requirement instead of claiming a clean
+            // failed terminal.
+            self.state.recovery_required = true;
+            let _ = self
+                .core
+                .emit_event(RuntimeEvent::Error {
+                    message: crate::output::bound_error_message(format!(
+                        "failed to persist the model turn failure terminal: {error}"
+                    )),
+                })
+                .await;
+            let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
+        }
+    }
+
+    /// Settle a turn that stopped with a typed failure before it reached the
+    /// normal commit barrier. The diagnostic `Failure`/`Error` row is emitted
+    /// by the caller; this helper owns the common cleanup and publishes the
+    /// durable lifecycle terminal only after the applied input and action
+    /// batch have been settled.
+    pub(super) async fn settle_failed_turn(
+        &mut self,
+        class: agent_contracts::RuntimeFailureClass,
+        retryable: bool,
+    ) {
+        let identity = self
+            .state
+            .turn
+            .as_ref()
+            .map(|turn| (turn.turn_id, self.state.task_id));
+        self.settle_aborted_turn().await;
+        if let Some((turn_id, task_id)) = identity {
+            self.publish_turn_failed(turn_id, task_id, class, retryable)
+                .await;
+        }
+    }
+
     /// 周转中最多排队 `USER_INPUT_QUEUE_CAP` 条。槽满则 Rejected。
     pub(super) async fn queue_user_dialogue(&mut self, content: String) -> AgentResult<()> {
         // 与 start_turn 同一入口策略：超限正文在持久化/入账前拒绝。

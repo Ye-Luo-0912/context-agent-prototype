@@ -361,6 +361,7 @@ pub async fn run_headless<W: Write + Send + 'static>(
     let mut outcome = Drain {
         turn_completed: false,
         turn_cancelled: false,
+        turn_failed: None,
         commit_failed: false,
         recovery_required: false,
         task_completed: false,
@@ -532,6 +533,13 @@ fn approval_denied(output: &ToolOutput) -> bool {
 struct Drain {
     turn_completed: bool,
     turn_cancelled: bool,
+    /// A failed turn has finished its usage settlement and actor
+    /// cleanup. This lifecycle fact is separate from the diagnostic Failure
+    /// and from ModelUsed, both of which may arrive before it.
+    /// A failed turn has completed the Runtime cleanup barrier. Keep its
+    /// typed class so a round-budget terminal remains the resumable exit-2
+    /// path while other failures use the error exit.
+    turn_failed: Option<RuntimeFailureClass>,
     commit_failed: bool,
     recovery_required: bool,
     task_completed: bool,
@@ -561,7 +569,7 @@ impl Drain {
             || self.turn_cancelled
             || self.commit_failed
             || self.recovery_required
-            || self.round_budget
+            || self.turn_failed.is_some()
             || self.timed_out
     }
 
@@ -569,6 +577,7 @@ impl Drain {
         match event {
             RuntimeEvent::TurnCompleted => self.turn_completed = true,
             RuntimeEvent::TurnCancelled { .. } => self.turn_cancelled = true,
+            RuntimeEvent::TurnFailed { class, .. } => self.turn_failed = Some(*class),
             RuntimeEvent::TurnCommitFailed { .. } => self.commit_failed = true,
             RuntimeEvent::RecoveryRequired => self.recovery_required = true,
             RuntimeEvent::TaskCompleted { .. } => {
@@ -608,7 +617,13 @@ impl Drain {
                 approval_denied: true,
             };
         }
-        if self.round_budget {
+        if self.round_budget
+            && self.turn_failed == Some(RuntimeFailureClass::RoundBudget)
+            && !self.recovery_required
+            && !self.commit_failed
+            && !self.turn_cancelled
+            && !self.timed_out
+        {
             return HeadlessOutcome {
                 exit: EXIT_ROUND_BUDGET,
                 status: "round_budget",
@@ -618,28 +633,40 @@ impl Drain {
                 approval_denied: false,
             };
         }
-        if self.timed_out {
+        if self.turn_failed.is_some()
+            || self.turn_cancelled
+            || self.commit_failed
+            || self.recovery_required
+        {
             return HeadlessOutcome {
                 exit: EXIT_ERROR,
-                status: "timeout",
-                stop: "timeout".into(),
+                status: "failed",
+                stop: if self.recovery_required {
+                    "recovery_required"
+                } else if self.turn_cancelled {
+                    "cancelled"
+                } else if self.commit_failed {
+                    "commit_failed"
+                } else if self.turn_failed == Some(RuntimeFailureClass::ModelOutputLimit) {
+                    "model_output_limit"
+                } else if self.turn_failed == Some(RuntimeFailureClass::ProviderTransport) {
+                    "provider_transport"
+                } else if self.turn_failed == Some(RuntimeFailureClass::InputBudget) {
+                    "input_budget"
+                } else {
+                    "failure"
+                }
+                .into(),
                 task_completed: self.task_completed,
                 round_budget: false,
                 approval_denied: false,
             };
         }
-        if self.turn_cancelled || self.commit_failed || self.recovery_required {
+        if self.timed_out {
             return HeadlessOutcome {
                 exit: EXIT_ERROR,
-                status: "failed",
-                stop: if self.turn_cancelled {
-                    "cancelled"
-                } else if self.recovery_required {
-                    "recovery_required"
-                } else {
-                    "commit_failed"
-                }
-                .into(),
+                status: "timeout",
+                stop: "timeout".into(),
                 task_completed: self.task_completed,
                 round_budget: false,
                 approval_denied: false,
@@ -705,7 +732,8 @@ mod tests {
         try_maintenance_transport_from_env,
     };
     use agent_contracts::{
-        AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport, ToolCall,
+        AgentError, AgentResult, ModelCapabilities, ModelOutput, ModelRequest, ModelTransport,
+        ModelUsage, ToolCall, ToolSurfaceDemand, ToolSurfaceRequirement,
     };
     use agent_storage::FileEventJournal;
     use agent_workspace::{Workspace, WorkspaceOutputBroker};
@@ -839,6 +867,139 @@ mod tests {
             "constraint": {},
             "expires_at_ms": u64::MAX
         })
+    }
+
+    #[derive(Debug)]
+    struct TerminalFailureModel {
+        retryable: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelTransport for TerminalFailureModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities::default()
+        }
+
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            let cause = if self.retryable {
+                AgentError::Transport {
+                    message: "headless retryable terminal regression".into(),
+                    retryable: true,
+                }
+            } else {
+                AgentError::ModelOutputLimit {
+                    reason: "headless terminal regression".into(),
+                }
+            };
+            Err(AgentError::failed_with_usage(
+                ModelUsage {
+                    input_tokens: Some(12),
+                    output_tokens: Some(16),
+                    attempts: 1,
+                    ..ModelUsage::default()
+                },
+                cause,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_stops_on_a_failed_turn_after_usage_and_terminal_events() {
+        for (retryable, expected_stop) in
+            [(false, "model_output_limit"), (true, "provider_transport")]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let composed = product_compose(
+                temp.path(),
+                &[],
+                Arc::new(TerminalFailureModel { retryable }),
+                Some(4),
+            )
+            .await
+            .unwrap();
+            let mut events = composed.subscribe();
+            composed.instance.start().await.unwrap();
+            let started = Instant::now();
+            let (outcome, jsonl) = run_headless(
+                composed.handle().clone(),
+                &mut events,
+                HeadlessAction::Prompt {
+                    text: "trigger one terminal model failure".into(),
+                    work: false,
+                },
+                Duration::from_secs(5),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+            let elapsed = started.elapsed();
+            composed.shutdown().await.unwrap();
+
+            assert!(elapsed < Duration::from_secs(4), "{elapsed:?}: {outcome:?}");
+            assert_eq!(outcome.exit, EXIT_ERROR, "{outcome:?}");
+            assert_eq!(outcome.status, "failed", "{outcome:?}");
+            assert_eq!(outcome.stop, expected_stop, "{outcome:?}");
+            let text = String::from_utf8(jsonl).unwrap();
+            assert!(text.contains("\"type\":\"model_used\""), "{text}");
+            assert!(text.contains("\"type\":\"turn_failed\""), "{text}");
+            let end = session_end(&text);
+            assert_eq!(end["status"], "failed");
+            assert_eq!(end["stop"], expected_stop);
+        }
+    }
+
+    #[tokio::test]
+    async fn headless_stops_on_an_unavailable_required_surface() {
+        let temp = tempfile::tempdir().unwrap();
+        let composed = product_compose(temp.path(), &[], Arc::new(MockModelTransport), Some(4))
+            .await
+            .unwrap();
+        let mut events = composed.subscribe();
+        composed.instance.start().await.unwrap();
+        composed
+            .handle()
+            .set_focus("exercise an unavailable required tool".into())
+            .await
+            .unwrap();
+        let task_id = composed.handle().list_tasks().await.unwrap()[0].id;
+        composed
+            .handle()
+            .replace_task_tool_requirements(
+                task_id,
+                0,
+                vec![ToolSurfaceRequirement {
+                    tool_name: "missing.tool".into(),
+                    demand: ToolSurfaceDemand::MustSurface,
+                    reason: "headless terminal regression".into(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let started = Instant::now();
+        let (outcome, jsonl) = run_headless(
+            composed.handle().clone(),
+            &mut events,
+            HeadlessAction::Prompt {
+                text: "start the constrained round".into(),
+                work: false,
+            },
+            Duration::from_secs(5),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        composed.shutdown().await.unwrap();
+
+        assert!(elapsed < Duration::from_secs(4), "{elapsed:?}: {outcome:?}");
+        assert_eq!(outcome.exit, EXIT_ERROR, "{outcome:?}");
+        assert_eq!(outcome.status, "failed", "{outcome:?}");
+        assert_eq!(outcome.stop, "failure", "{outcome:?}");
+        let text = String::from_utf8(jsonl).unwrap();
+        assert!(text.contains("the active task requires a tool that is unavailable"));
+        assert!(text.contains("\"type\":\"turn_failed\""), "{text}");
+        assert_eq!(session_end(&text)["status"], "failed");
     }
 
     /// M17-B3/F09: the stdin prompt is charged at read time — a payload

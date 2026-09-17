@@ -532,13 +532,15 @@ impl RuntimeActor {
         {
             Ok(scope) => Some(scope),
             Err(error) => {
+                let message = crate::output::bound_error_message(error.to_string());
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::Error {
-                        message: error.to_string(),
+                        message: message.clone(),
                     })
                     .await;
-                self.settle_aborted_turn().await;
+                self.settle_failed_turn(RuntimeFailureClass::Runtime, false)
+                    .await;
                 return;
             }
         };
@@ -592,18 +594,20 @@ impl RuntimeActor {
                     self.state.recovery_required = true;
                     let _ = self.core.emit_event(RuntimeEvent::RecoveryRequired).await;
                 }
+                let message = crate::output::bound_error_message(format!(
+                    "tool operation admission failed before dispatch: {error}"
+                ));
                 let _ = self
                     .core
                     .emit_event(RuntimeEvent::Error {
-                        message: crate::output::bound_error_message(format!(
-                            "tool operation admission failed before dispatch: {error}"
-                        )),
+                        message: message.clone(),
                     })
                     .await;
                 if let Some(scope_id) = tool_scope {
                     let _ = self.services.context_close_scope(scope_id).await;
                 }
-                self.settle_aborted_turn().await;
+                self.settle_failed_turn(RuntimeFailureClass::Runtime, false)
+                    .await;
                 return;
             }
         };
@@ -1101,13 +1105,15 @@ impl RuntimeActor {
                     && let Err(error) = self.core.acknowledge_context_consumption(ack).await
                 {
                     let error = self.context_transition_failed(error);
+                    let message = format!("failed to commit model context consumption: {error}");
                     let _ = self
                         .core
                         .emit_event(RuntimeEvent::Error {
-                            message: format!("failed to commit model context consumption: {error}"),
+                            message: message.clone(),
                         })
                         .await;
-                    self.state.turn = None;
+                    self.settle_failed_turn(RuntimeFailureClass::Runtime, false)
+                        .await;
                     return;
                 }
                 if structurally_empty {
@@ -1125,13 +1131,15 @@ impl RuntimeActor {
                         self.advance_turn(op_tx).await;
                         return;
                     }
+                    let message = "provider returned a structurally empty completion (empty content, no tool calls, 0/0 usage); refusing to complete the turn".to_string();
                     let _ = self
                         .core
                         .emit_event(RuntimeEvent::Error {
-                            message: "provider returned a structurally empty completion (empty content, no tool calls, 0/0 usage); refusing to complete the turn".into(),
+                            message: message.clone(),
                         })
                         .await;
-                    self.settle_aborted_turn().await;
+                    self.settle_failed_turn(RuntimeFailureClass::Model, false)
+                        .await;
                     self.drain_queued_user_input(op_tx).await;
                     return;
                 }
@@ -1150,13 +1158,14 @@ impl RuntimeActor {
                     // execute a provider-emitted action against the empty
                     // captured surface, and never turn that violation into
                     // another model/tool retry cycle.
+                    let message = format!(
+                        "completion repair finalization returned {} tool call(s); actions were refused and the repair turn was ended",
+                        tool_calls.len()
+                    );
                     let _ = self
                         .core
                         .emit_event(RuntimeEvent::Error {
-                            message: format!(
-                                "completion repair finalization returned {} tool call(s); actions were refused and the repair turn was ended",
-                                tool_calls.len()
-                            ),
+                            message: message.clone(),
                         })
                         .await;
                     self.emit_input_consumed().await;
@@ -1164,7 +1173,8 @@ impl RuntimeActor {
                         self.fail_round_preparation("tool_leases_reconciled_event", error)
                             .await;
                     } else if content.trim().is_empty() {
-                        self.settle_aborted_turn().await;
+                        self.settle_failed_turn(RuntimeFailureClass::Model, false)
+                            .await;
                     } else {
                         self.finalize_turn(content, op_tx).await;
                     }
@@ -1178,17 +1188,19 @@ impl RuntimeActor {
                             tool_calls.len(),
                         ));
                     }
+                    let message = format!(
+                        "provider returned {} tool calls in one model round; hard safety limit is {}",
+                        tool_calls.len(),
+                        MAX_MODEL_TOOL_CALLS_PER_ROUND
+                    );
                     let _ = self
                         .core
                         .emit_event(RuntimeEvent::Error {
-                            message: format!(
-                                "provider returned {} tool calls in one model round; hard safety limit is {}",
-                                tool_calls.len(),
-                                MAX_MODEL_TOOL_CALLS_PER_ROUND
-                            ),
+                            message: message.clone(),
                         })
                         .await;
-                    self.settle_aborted_turn().await;
+                    self.settle_failed_turn(RuntimeFailureClass::Model, false)
+                        .await;
                     self.drain_queued_user_input(op_tx).await;
                     return;
                 }
@@ -1635,7 +1647,7 @@ impl RuntimeActor {
                     .emit_event(RuntimeEvent::Failure {
                         class,
                         retryable,
-                        message,
+                        message: message.clone(),
                     })
                     .await;
                 // COST-1 (E05.1)/COST-7 (R3-12): a failed MODEL round is
@@ -1678,8 +1690,14 @@ impl RuntimeActor {
                     }
                 }
                 // Provider failure, not runtime corruption: settle the
-                // applied input and drop the turn without fencing.
-                self.settle_aborted_turn().await;
+                // applied input and drop the turn without fencing. Model
+                // failures additionally publish a durable lifecycle terminal
+                // so headless/TUI consumers do not wait for a timeout.
+                if completion.kind == OpKind::Model {
+                    self.settle_failed_turn(class, retryable).await;
+                } else {
+                    self.settle_aborted_turn().await;
+                }
                 self.drain_queued_user_input(op_tx).await;
             }
             OperationOutcome::Cancelled { known_usage } => {
@@ -1821,9 +1839,11 @@ impl RuntimeActor {
     /// A successful catalog load happens after the model decision that
     /// requested it, so the target was not yet present in that decision's
     /// exact call roots. Keep it pending until the model calls that exact
-    /// tool, explicitly unloads it, or ends the directive. This source-driven
-    /// lifetime lets sequential loads form a usable cohort without a fixed
-    /// round TTL. The unified control tool is runtime-owned and cannot be
+    /// tool, explicitly unloads it, or ends the directive. The separate
+    /// directive cohort keeps an explicitly loaded tool available across
+    /// intervening read/edit decisions, while the pending set preserves the
+    /// existing sibling-load behavior. Both are turn-local roots; neither is
+    /// authority. The unified control tool is runtime-owned and cannot be
     /// shadowed, making this metadata a trusted lifecycle receipt.
     fn update_result_delivery_from_catalog_control(&mut self, output: &ToolOutput) {
         if !output.ok || output.tool_name != CAPABILITY_MANAGE {
@@ -1853,9 +1873,19 @@ impl RuntimeActor {
                     turn.pending_loaded_tools.push(tool_name.to_string());
                     turn.pending_loaded_tools.sort();
                 }
+                if !turn
+                    .directive_loaded_tools
+                    .iter()
+                    .any(|name| name == tool_name)
+                    && turn.directive_loaded_tools.len() < MAX_DIRECTIVE_LOADED_TOOLS
+                {
+                    turn.directive_loaded_tools.push(tool_name.to_string());
+                    turn.directive_loaded_tools.sort();
+                }
             }
             "unload" => {
                 turn.pending_loaded_tools.retain(|name| name != tool_name);
+                turn.directive_loaded_tools.retain(|name| name != tool_name);
                 turn.result_delivery_tools.retain(|name| name != tool_name);
             }
             _ => {}

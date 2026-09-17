@@ -537,6 +537,12 @@ The P1 contract adds:
   `TurnCompleted` remains reserved for a successfully committed model/context
   result, while `RuntimeHandle::cancel_turn` returns `TurnCancelAck` only after
   the cancellation barrier passes.
+- A provider or model failure is a separate terminal path: the actor settles
+  reported usage, action accounting, and the applied input, drops the failed
+  turn, and then publishes durable `TurnFailed`. The diagnostic `Failure` and
+  `ModelUsed` rows may precede it; `retryable` describes the cause and never
+  authorizes an implicit replay. Headless and UI consumers wait for this
+  lifecycle row instead of treating a diagnostic failure as cleanup proof.
 - Streaming deltas are live-only: `RuntimeEvent::ModelDelta` is broadcast to
   UI subscribers but never journaled — the final `AssistantMessage` carries
   the complete content for replay. Its envelope repeats the durable journal

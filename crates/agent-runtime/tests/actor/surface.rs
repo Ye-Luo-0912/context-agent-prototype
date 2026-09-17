@@ -565,7 +565,7 @@ async fn result_delivery_lease_survives_load_and_call_then_releases_on_non_use()
 }
 
 #[tokio::test]
-async fn pending_load_cohort_survives_adjacent_loads_until_each_tool_is_used() {
+async fn directive_load_cohort_survives_intervening_decisions_until_turn_end() {
     let model = Arc::new(CohortLeaseModel::default());
     let tools = Arc::new(RoundLocalToolDispatcher::lease_reconciling());
     let kernel = Arc::new(RuntimeServices::new(
@@ -1334,6 +1334,7 @@ async fn unsatisfiable_round_settles_input_and_reports_typed_budget_refusal() {
     let mut settled = false;
     let mut saw_commit_failed = false;
     let mut saw_input_budget = false;
+    let mut saw_turn_failed = false;
     while let Ok(envelope) = all_events.try_recv() {
         match envelope.event {
             RuntimeEvent::UserMessageAccepted { input } => {
@@ -1342,6 +1343,9 @@ async fn unsatisfiable_round_settles_input_and_reports_typed_budget_refusal() {
             RuntimeEvent::TurnCommitFailed { .. } => saw_commit_failed = true,
             RuntimeEvent::Failure { class, .. } => {
                 saw_input_budget |= class == RuntimeFailureClass::InputBudget;
+            }
+            RuntimeEvent::TurnFailed { class, .. } => {
+                saw_turn_failed |= class == RuntimeFailureClass::InputBudget;
             }
             _ => {}
         }
@@ -1355,6 +1359,10 @@ async fn unsatisfiable_round_settles_input_and_reports_typed_budget_refusal() {
         "a deliberate refusal must not journal a turn-commit failure"
     );
     assert!(saw_input_budget, "the refusal must retain its typed cause");
+    assert!(
+        saw_turn_failed,
+        "the refused round must publish its typed lifecycle terminal"
+    );
     assert!(model.requests.lock().unwrap().is_empty());
     handle.stop().await.unwrap();
 }

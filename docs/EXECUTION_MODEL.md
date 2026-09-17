@@ -11,7 +11,7 @@ the invariants in [`AGENTS.md`](../AGENTS.md).
 | --- | --- | --- |
 | **Run** | process start → stop | the actor; identity is the `RunId` on every event envelope |
 | **Task** | created → completed (long-lived, survives checkpoints) | `TaskManager`; authority is the `TaskAnchor` (goal, constraints, acceptance, plan, open loops, `next_action` advisory) |
-| **Turn** | user input → `TurnCompleted` + commit barrier | the actor's `TurnFrame` (action batch, round surface, protocol bodies, repair episode) |
+| **Turn** | user input → `TurnCompleted` + commit barrier, `TurnCancelled`, or `TurnFailed` | the actor's `TurnFrame` (action batch, round surface, protocol bodies, repair episode) |
 | **Operation** | one model call or one tool call inside a turn | tracked `InFlightOp` (generation-fenced, cancellable); tool ops carry Core operation identity and a staged effect |
 | **Effect** | prepared → dispatched → acknowledged | brokered through Core; unacknowledged applications become typed debts |
 | **Checkpoint** | safe-point → durable artifact | `CheckpointStore` envelope (see [`COMPATIBILITY.md`](COMPATIBILITY.md)) |
@@ -28,6 +28,7 @@ user input accepted
           not ready → typed refusal → semantic repair episode (bounded;
                       cycling ends in an audited text-only handoff)
   → TurnCompleted + RuntimeCommitBarrier (one durable batch)
+    or typed failure → usage/input/action settlement → durable TurnFailed
   → next model round, or finalize_turn
 ```
 

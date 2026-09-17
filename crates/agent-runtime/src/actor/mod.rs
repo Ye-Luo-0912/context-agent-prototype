@@ -417,6 +417,12 @@ struct ActiveTurn {
     /// small task-specific tool cohort. The set is unique, turn-scoped and
     /// never checkpointed or copied into Context.
     pending_loaded_tools: Vec<String>,
+    /// Explicitly loaded tools remain rooted for the rest of this active
+    /// directive, including after an intervening read/edit or a prior call.
+    /// This is a bounded continuity cohort, not an authority grant: Core
+    /// surface validation and approval still gate every execution. The cohort
+    /// is cleared when the turn ends or the model explicitly unloads a tool.
+    directive_loaded_tools: Vec<String>,
     /// Exact tools selected by the last successful model decision. Their
     /// schemas stay rooted while the calls run and until the following model
     /// decision consumes their results. The following decision either renews
@@ -664,6 +670,10 @@ struct LaunchResolutionFact {
 /// Bounded attempt ledger: the retry loop the runtime cares about is
 /// recent, not historical.
 const MAX_EDIT_ATTEMPTS: usize = 8;
+/// A directive may keep at most one model-round batch of explicit loads
+/// resident. Beyond this bound the catalog remains discoverable/reloadable,
+/// but the continuity root is deliberately capped to keep lease state bounded.
+const MAX_DIRECTIVE_LOADED_TOOLS: usize = MAX_MODEL_TOOL_CALLS_PER_ROUND;
 
 impl ActiveTurn {
     /// Whether `call` repeats a deterministic edit refusal whose target
@@ -862,6 +872,7 @@ mod edit_attempt_tests {
             pending_tools: VecDeque::new(),
             deferred_context_collect: false,
             pending_loaded_tools: Vec::new(),
+            directive_loaded_tools: Vec::new(),
             result_delivery_tools: Vec::new(),
             action_batch: None,
             tool_surface: None,

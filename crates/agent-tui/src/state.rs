@@ -1622,6 +1622,26 @@ impl AppState {
                 self.tool_status = "none".into();
                 self.push_system(format!("turn cancelled ({reason:?})"));
             }
+            RuntimeEvent::TurnFailed {
+                class, retryable, ..
+            } => {
+                // The runtime has finished settling this failed turn. The
+                // preceding Failure/ModelUsed rows carry diagnostics and
+                // cost; this lifecycle row owns the activity transition.
+                self.current_op = None;
+                self.busy = false;
+                self.streaming = false;
+                self.status = format!("failed ({class:?})");
+                self.tool_status = "none".into();
+                self.push_system(format!(
+                    "turn failed ({class:?}{}); the turn is idle and can be retried",
+                    if retryable {
+                        ", provider may be retried"
+                    } else {
+                        ""
+                    }
+                ));
+            }
             RuntimeEvent::TurnCommitFailed { phase, message } => {
                 // The model answered, but the runtime did not durably commit
                 // the turn: surface the failure instead of an idle state.
@@ -2180,6 +2200,34 @@ mod tests {
         assert!(!app.busy);
         assert!(!app.streaming);
         assert_eq!(app.status, "cancelled");
+        assert!(app.current_op.is_none());
+    }
+
+    #[test]
+    fn turn_failed_clears_live_operation_without_claiming_completion() {
+        let mut app = AppState::new(RunId::new());
+        let turn = TurnId::new();
+        let operation = OperationId::new();
+        app.apply_runtime_event(envelope(RuntimeEvent::ModelStarted {
+            turn_id: turn,
+            operation_id: operation,
+            generation: 4,
+            surface_revision: 1,
+            model_round: 1,
+            turn_checkpoint: Default::default(),
+            prompt_layers: Default::default(),
+        }));
+        app.apply_runtime_event(envelope(RuntimeEvent::TurnFailed {
+            turn_id: turn,
+            task_id: None,
+            class: agent_contracts::RuntimeFailureClass::ModelOutputLimit,
+            retryable: false,
+        }));
+
+        assert!(!app.busy);
+        assert!(!app.streaming);
+        assert_eq!(app.status, "failed (ModelOutputLimit)");
+        assert_eq!(app.tool_status, "none");
         assert!(app.current_op.is_none());
     }
 

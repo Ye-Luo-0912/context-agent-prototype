@@ -82,6 +82,12 @@ impl StatusProjection {
                 self.turns_cancelled = self.turns_cancelled.saturating_add(1);
                 self.in_flight = None;
             }
+            // A failed model operation has its own terminal lifecycle row.
+            // Usage is folded separately and never clears activity; this row
+            // is emitted only after the actor has dropped the failed turn.
+            RuntimeEvent::TurnFailed { .. } => {
+                self.in_flight = None;
+            }
             RuntimeEvent::ModelStarted { .. } => {
                 self.model_rounds = self.model_rounds.saturating_add(1);
                 self.in_flight = Some(InFlight::Model);
@@ -100,7 +106,8 @@ impl StatusProjection {
                 // operation is still live. In-flight is advanced only by
                 // lifecycle events that can name what they end
                 // (`ModelStarted`/`ToolStarted`/`ToolFinished`/
-                // `TurnCompleted`/`TurnCancelled`/`RuntimeRestored`).
+                // `TurnCompleted`/`TurnCancelled`/`TurnFailed`/
+                // `RuntimeRestored`).
                 self.input_tokens = self.input_tokens.saturating_add(*input_tokens);
                 self.output_tokens = self.output_tokens.saturating_add(*output_tokens);
                 self.cached_input_tokens = self
@@ -371,6 +378,64 @@ mod tests {
                 .iter()
                 .any(|line| line.starts_with("cancelled turns: 1")),
             "the snapshot must name the cancellation: {lines:?}"
+        );
+    }
+
+    /// A failed model turn is terminal only after its explicit lifecycle row;
+    /// the usage row before it must not be mistaken for that transition.
+    #[test]
+    fn a_failed_turn_clears_in_flight_without_counting_completion() {
+        let task_id = TaskId::new();
+        let turn_id = agent_contracts::TurnId::new();
+        let projection = fold_all(&[
+            RuntimeEvent::FocusChanged {
+                task_id,
+                goal: "generate an artifact".into(),
+            },
+            RuntimeEvent::ModelStarted {
+                turn_id,
+                operation_id: agent_contracts::OperationId::new(),
+                generation: 1,
+                surface_revision: 1,
+                model_round: 1,
+                prompt_layers: Default::default(),
+                turn_checkpoint: Default::default(),
+            },
+            RuntimeEvent::Failure {
+                class: agent_contracts::RuntimeFailureClass::ModelOutputLimit,
+                retryable: false,
+                message: "output limit".into(),
+            },
+            RuntimeEvent::ModelUsed {
+                input_tokens: 10,
+                output_tokens: 20,
+                cached_input_tokens: 0,
+                attempts: 1,
+                retries: 0,
+                usage_identity: agent_contracts::UsageIdentity::Observed,
+                role: agent_contracts::ModelCallRole::Main,
+                usage: None,
+            },
+            RuntimeEvent::TurnFailed {
+                turn_id,
+                task_id: Some(task_id),
+                class: agent_contracts::RuntimeFailureClass::ModelOutputLimit,
+                retryable: false,
+            },
+        ]);
+
+        let lines = projection.lines();
+        let status_line = lines
+            .iter()
+            .find(|line| line.starts_with("status:"))
+            .expect("status line");
+        assert!(
+            status_line.contains("in_flight=none"),
+            "TurnFailed is the activity terminal: {status_line}"
+        );
+        assert!(
+            status_line.contains("turns=0"),
+            "a failed turn is not a completion: {status_line}"
         );
     }
 

@@ -306,6 +306,11 @@ async fn ack_failure_keeps_the_reported_model_usage_in_the_account() {
             .any(|envelope| matches!(envelope.event, RuntimeEvent::TurnCompleted)),
         "the refused round must not be reported as completed"
     );
+    assert!(
+        seen.iter()
+            .any(|envelope| matches!(envelope.event, RuntimeEvent::TurnFailed { .. })),
+        "the refused round must publish an explicit failed-turn terminal after usage settlement"
+    );
     handle.stop().await.unwrap();
 }
 

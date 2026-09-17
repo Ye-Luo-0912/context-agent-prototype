@@ -32,6 +32,12 @@ compatibility declaration; each section names the owning artifact.
 - Deleting a variant or reusing a name with different fields is a
   breaking change and requires a compatibility note here plus a version
   bump of the producing binary.
+- `RuntimeEvent::TurnFailed` is an additive durable lifecycle row. It marks a
+  failed turn after usage/input/action settlement; it never advances the
+  successful commit barrier or authorizes replay. Older consumers may ignore
+  it and continue to treat `TurnCompleted`/`TurnCancelled` as their known
+  terminals, while newer consumers should wait for this row after a typed
+  model failure.
 
 ## Provider wire profile
 
@@ -71,6 +77,11 @@ compatibility declaration; each section names the owning artifact.
 - ToolSpec is a model-visible schema, not authority. Host tool policies
   bind builtin arguments to EffectIntents; a plugin cannot self-
   authorize. Policy revisions are stamped on authority leases.
+- A model `capability.manage load` is a bounded, turn-local surface
+  continuity request. The loaded schema may remain visible across non-empty
+  decisions in that directive; an empty terminal decision, explicit unload,
+  or a new directive releases it. Core surface validation and approval still
+  gate execution.
 - The change journal (`.focus-agent/changes.jsonl`) records every
   durable workspace mutation with its preparing call — review/revert
   substrate; treat it as append-only.

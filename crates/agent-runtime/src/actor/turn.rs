@@ -479,6 +479,7 @@ impl RuntimeActor {
             pending_tools: VecDeque::new(),
             deferred_context_collect: false,
             pending_loaded_tools: Vec::new(),
+            directive_loaded_tools: Vec::new(),
             result_delivery_tools: Vec::new(),
             action_batch: None,
             tool_surface: None,
@@ -714,7 +715,7 @@ impl RuntimeActor {
                 .emit_event(RuntimeEvent::Failure {
                     class: RuntimeFailureClass::RoundBudget,
                     retryable: false,
-                    message,
+                    message: message.clone(),
                 })
                 .await;
             // Deliberate refusal (round budget), not a fault: settle the
@@ -749,7 +750,8 @@ impl RuntimeActor {
             // control returns, so barrier here (this waits on the store
             // write, not on the engine).
             let _ = self.await_pending_checkpoint().await;
-            self.settle_aborted_turn().await;
+            self.settle_failed_turn(RuntimeFailureClass::RoundBudget, false)
+                .await;
             return;
         }
         self.spawn_model_operation(op_tx).await;

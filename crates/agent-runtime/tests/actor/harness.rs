@@ -1432,8 +1432,9 @@ pub(crate) struct LeaseFlowModel {
 }
 
 /// Loads two optional tools in adjacent decisions and then uses each one.
-/// A decision-bound lease drops the first schema while loading the second;
-/// the source-driven cohort lease keeps both available until exact use.
+/// The directive continuity cohort keeps both schemas available across the
+/// intervening decisions, including after the first exact use; the empty
+/// terminal decision releases the cohort.
 #[derive(Debug, Default)]
 pub(crate) struct CohortLeaseModel {
     pub(crate) requests: Mutex<Vec<ModelRequest>>,
@@ -1567,8 +1568,8 @@ impl ModelTransport for CohortLeaseModel {
                 "unused sibling loads must coexist (large={has_large}, peer={has_peer})"
             ),
             4 => assert!(
-                !has_large && has_peer,
-                "A expires after result delivery; B remains"
+                has_large && has_peer,
+                "explicit loads remain available through the active directive"
             ),
             _ => panic!("unexpected extra model decision {step}"),
         }
