@@ -6,7 +6,7 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**第十批（`c8a62355` 续审）2026-09-18 开工：G1 与 G2/G3 先行，G4、G5、KV 序列按文件所有权并行（见下方第十批）。** 第九批已全部关闭（2026-09-17，本地集成回归全绿；CI 收尾见 CURRENT.md）。剩余条件任务 T8（需授权预算/凭据；含 KV 端点三态 NOT_RUN 的补测与 `context_manage` 租赁进出对供应商复用边界的影响核对）；C0 回执指出的同构 spawn→assign 窗口（agent-process `create_job_object`、`integrity.rs`）即第十批 G5。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**第十批（`c8a62355` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十批与五份回执；CI 终验以合并后 run 为准）。** 第九批已全部关闭（2026-09-17，本地集成回归全绿；CI 收尾见 CURRENT.md）。剩余条件任务 T8（需授权预算/凭据；含 KV 端点三态 NOT_RUN 的补测与 `context_manage` 租赁进出对供应商复用边界的影响核对）；C0 回执指出的同构 spawn→assign 窗口（agent-process `create_job_object`、`integrity.rs`）已随第十批 G5 收口。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
 ## S1 — 冷目录测试自锁（已关闭 2026-09-15）
 
@@ -277,41 +277,28 @@ B2 落地回执：[B1_B2_THIRD_BATCH_RECEIPT](reviews/2026-09-16-review-3bdb269c
 
 ### C1 — checkpoint 分片墙钟预算满载抖动（CI 阻塞续查，context-simple）——已关闭（2026-09-17，`8996ffeb`）
 落地回执：[C1_CHECKPOINT_SPILL_RECEIPT](reviews/2026-09-16-review-71f8a586/C1_CHECKPOINT_SPILL_RECEIPT.md)。CI run `35158964457`（基线 `7631dd72`，C0 被挡住后露出）Windows 分片三测失败：`external_spilled` 计数短缺（15/20、19/20、12/14），Linux 同 run 全绿、本机 0.26s 全绿。根因：checkpoint capture 卡片写入循环的 `external_checkpoint_io_budget_ms`（默认 2s，`engine.rs:1462` 任一迭代越线即停）在满载 runner（该二进制 401s，慢约 40 倍）中途耗尽，剩余计划卡片本次静默留 inline——**屏障完整性从不依赖 spill**：截短后剩余条目以全量元数据内联进 checkpoint 值（F2 成文契约），恢复完整无损、跨 capture 收敛；两个 shortfall 不同排除写入被吞与测试互踩。修复沿 cold_bounds 先例（run `3499986097` spilled 38/40 → 钉宽）：给漏钉的两个 fixture（`spill_config`、`carded_history`）钉 `external_checkpoint_io_budget_ms: 60_000`，生产代码零改动；并补此前缺失的确定性回归 `an_exhausted_capture_io_budget_stays_inline_and_converges_on_later_captures`（预算注入 0 三测同签名转红；生产臂注入 `&& false` 变异转红→恢复）。`cargo test -p context-simple` ×3 442/0；生产默认 2s 预算保留（真实满载盘语义不变）；CI 终验 run `35169239599` Windows 分片 ✓（19m27s 满载）。
-
-## 第十批（`c8a62355` 续审）——开工（2026-09-18）
+## 第十批（`c8a62355` 续审）——已全部关闭（2026-09-18，本地集成回归全绿；CI 终验待 run 记录）
 
 审查基线 `c8a62355`（报告：[REVIEW.md](reviews/2026-09-18-review-c8a62355/REVIEW.md)，任务规格：[NEXT_ACTIONS.md](reviews/2026-09-18-review-c8a62355/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-18-review-c8a62355/COVERAGE.md)，机制探针：[MECHANISM_RESULTS.json](reviews/2026-09-18-review-c8a62355/MECHANISM_RESULTS.json)）。主线：**逻辑 owner 不随驻留位置变化；continuation 不越过尚未交付给模型的源位置；journal 写者身份不随 WAL 代际变化；必需隔离在目标代码运行前建立。** 四条不变量各只有一个生产维护入口；上轮 F1/F2 动态 `end_line`、行内偏移与 C0 挂起创建修复保留不重做。审查环境无 Rust 工具链，红例由实施补；实施环境为 Windows＋cargo 1.97.1，Unix 专属分支按平台语义单独记账、不冒充已执行。
 
-### G1 — 逻辑 owner 驱动 reconcile（B，context-simple）——开工
-用户动作：固定小热预算下冷历史仍可检索/取回；恢复后 reconcile 不把现存冷 owner 当孤儿，也不把全部历史拉回热表。
-现状：`engine.rs::reconcile_store_protecting` 的 owner 快照只含已加载 `state.external`＋resident/Warm/写重试，不含 `pending_external_cards` 与带版本冷定位；`store.rs::run_reconcile_io_protecting` 把既不在热 map 又不在 resident 集合的 blob 直接放进 rebuilt_candidates（`metadata_complete=false` 只保护删除分支，不阻止重新认领）；`commit_reconcile` 只查 `external.get(id)` 即插入 blob 重建条目，不移除既有 pending 定位，调用方返回前也无 metadata-residency 结算。反例（决策表探针已验证分支组合）：热上限 1、热 A、冷 B/C、blob/卡片齐全，hydration 因 HotCap 停止 → B/C 被重新认领进热目录且 pending 保留 → 双重所有权＋热预算失守。
-修复方向：完整逻辑 owner 快照（resident/Warm/写重试/已加载 external/带版本身份的 pending 冷定位）驱动 reconcile；未读冷卡片＝详情未知≠无主；commit 复核全部 owner 位置，只接纳真正孤儿且走既有预算结算/背压；不用 blob 状态覆盖已知冷卡片身份。禁止全历史 hydration、无限 pin、放宽 owner 校验。
-回归终点：上述反例＋真正孤儿正对照；重复 reconcile owner 唯一且各位置互斥、冷卡片版本保持、checkpoint/restore 后正文可取回；保护根/删除延期行为不回退。`cargo test -p context-simple`。
+### G1 — 逻辑 owner 驱动 reconcile（B，context-simple）——已关闭（`62b20e4b`）
+回执：[G1_OWNER_RECONCILE_RECEIPT](reviews/2026-09-18-review-c8a62355/G1_OWNER_RECONCILE_RECEIPT.md)。owner 快照补齐 `pending_external_cards`＋commit 全 owner 位置复核；未读冷卡片＝详情未知≠无主；真孤儿接纳走既有 `settle_metadata_residency` 单一结算。审查反例红→绿（热 1→3＋pending 2 重复 → 每 id 恰一 owner、卡片版本保持），真孤儿正对照、重复 reconcile 幂等、checkpoint/restore 往返全过。context-simple **448/0**（基线 442＋6），clippy/fmt 干净。残余（非本片恶化）：新接纳孤儿无卡片时自身不能降级、报告类型化记账；双并发操作竞态由 commit 复核覆盖无专门竞态测试。
 
-### G2/G3 — 最终模型预算内的连续交付（A/B，tool-runtime＋agent-workspace）——开工
-用户动作：原样使用工具返回的 continuation 读完原始工件，不跳过中间行/行内后缀，不把真实第 3 行显示成第 2 行。
-现状：`tool-runtime/src/tools/artifact.rs` 按内部 ~2 MiB capture 上限计算 next_start_line/next_line_byte_offset；`agent-workspace/src/broker.rs` 随后可把正文裁成首尾 16,000 字符并把整页另存工件，continuation 不按最终交付位置重算（broker 的截断失效逻辑只覆盖 file-window 声明，不含 artifact 分页字段）。UTF-8 边界：行捕获循环 `chunk.is_empty() → continue` 使放不下一个多字节字符的行被跳过、后随短行仍被接纳，`last_captured_line` 越过空洞，渲染按收集序重编号（真实第 3 行显示为第 2 行，`window_truncated=false`、`has_more=false`）。
-修复方向：分页直接受最终 model-content 预算约束（预留行号/footer/引用/包络），或可信裁剪器维护源区间映射并重写继续位置；扫描位置、capture 位置、最终交付位置分开表达；从第一个不可展示位置停止后续 capture，continuation 指向该位置；行号绑定源位置；分隔符预算统一。只加 `window_truncated` 标志不算完成。
-回归终点（经真实 tool→broker→最终正文）：500 行 75.5 KB 普通日志（第 100/300 行独立 marker）按返回 continuation 连读，交付源区间/块 ID 无缺口无重叠，end 仅在完整交付后出现；3 MiB 单行（1 MiB/2.5 MiB 块 ID）同口径；UTF-8 反例（余 1 字节、下一行首字符 3 字节、后随 ASCII 短行）从第一个不可展示位置停止且源行号正确；正常短页不退化。`cargo test -p tool-runtime`、`cargo test -p agent-workspace`。
+### G2/G3 — 最终模型预算内的连续交付（A/B，tool-runtime）——已关闭（`d1d5c8dd`）
+回执：[G2_G3_DELIVERED_POSITION_RECEIPT](reviews/2026-09-18-review-c8a62355/G2_G3_DELIVERED_POSITION_RECEIPT.md)。新增共享 `tools/page.rs` 单一维护入口：`FINAL_BODY_CHARS＝MAX_TOOL_MODEL_CONTENT_CHARS`（16k）一处定义，工具按最终正文预算分页并同源预留 header/footer/行号/分隔符；`finalize_within_budget` 从保留 span 推导游标与交付声明——游标永不越过未交付源位置；`DeliveredSpan` 真实源行号（重编号结构性不可能）。扫描/捕获/交付三位置分别表达进 metadata。G3：capture 在第一个不可展示位置关闭，不越空洞接纳后行；fs.read 同缺陷形态（KV 轨迹证实）一并修复：`lines=S-E/N` 声明只描述实际交付区间、新增 `has_more`/`next_start_line`/正文续读子句、超页预算的行显式声明跳过。artifact 三探针（500 行日志、3 MiB 单行、UTF-8 反例）＋fs 四探针红→绿；既有 F1/F2/F6 与 fs 19 测不改保持。tool-runtime **299/0**、agent-workspace 125/0、conformance 35/0、`core3_restore_snapshot_paging` 绿。经纪（兜底）未改。残余：fs.read 超预算场景 metadata start/end 语义＝交付区间（装得下时不变），下游 `FileBodyWindow` 精确度保持或提高。
 
-### G4 — journal 生命周期锁（C，agent-storage）——开工
-范围：库级 `FileOperationJournal`；正常 Workspace 外层 effect-journal 锁已提供保护，本片不得宣称生产必现或移除该锁。
-现状：`open` 先读 metadata 定代际再开 WAL 取锁，锁后继续使用此前读到的 metadata、不复核代际；`compact_locked` 对下一代固定路径 create+truncate→写记录→才 try_lock→发布→切 writer→释放旧代锁→删旧代。交错反例：B 持旧 metadata 打开旧代、尚未取锁；A 完成压缩发布并释放/删除旧代；B 对仍打开的旧代句柄取锁成功、按旧 metadata 返回为健康写者；B 再压缩到它推导的下一代时先截断 A 正在使用的路径、后才发现锁竞争——拒锁太晚。
-修复方向：写者锁绑定不随 WAL 轮换的 journal 身份（如稳定 lock 文件），在读 metadata 之前取得并持有整个生命周期，持有期间不被 unlink 重建；候选代际安全创建，不先截断可能被活动写者使用的路径；保留旧 WAL/metadata 格式、祖先标记、恢复兼容与 Workspace 外层锁。
-回归终点：barrier 控制 open（读旧 metadata 后、取锁前）×compact（发布）交错，竞争方不得作为旧代健康写者返回；竞争 compaction 被拒时候选文件内容/长度逐字节不变；普通双开独占正对照。Windows 本机执行；Unix 分支按 cfg 语义单独记账。`cargo test -p agent-storage`（并确认 `-p agent-workspace` journal 集成不回退）。
+### G4 — journal 生命周期锁（C，agent-storage）——已关闭（`b0652cde`）
+回执：[G4_JOURNAL_LIFECYCLE_LOCK_RECEIPT](reviews/2026-09-18-review-c8a62355/G4_JOURNAL_LIFECYCLE_LOCK_RECEIPT.md)。写者独占绑定稳定 `<base>.lock`（不随代际轮换、**读 metadata 之前**取得、持整个生命周期、不被 unlink 重建）；候选代际 `create_new`／先锁后清，旧的先截断写入后取锁流程移除；每代 WAL 锁保留为纵深防御；Workspace 外层锁未动未削弱。barrier 交错反例红→绿（旧代码：陈旧 opener 对已删除仍打开的 G1 句柄取锁成功、按旧 metadata 返回健康写者）；竞争压缩拒绝时候选逐字节不变（旧代码红：24→0 截断）；同进程双开类型化拒绝正对照（Windows 执行）。agent-storage **30/0**、agent-workspace 125/0；cfg(unix) 镜像仅编译验证未执行，Windows 同进程 LockFileEx 变体已执行。
 
-### G5 — Windows containment 入口收敛（A，agent-process）——开工
-C0 已修复 proof runner（挂起创建→入 Job→确认恢复，fail-closed），本片复用该机制，不另写一份。
-现状：通用 `host.rs` 仍普通 spawn 后分配 Job；`integrity.rs::run_wrap` 同样先让目标运行，再 `let _ = assign_pid_to_job(...)` 忽略关联结果。
-修复方向：提取小型公共"已建立 containment 的子进程"入口：必需 Job 关联在目标代码运行前完成；关联失败回收未运行的 child（有界确认死亡＋类型化拒绝）；成功恢复后才把运行句柄交给调用方。attestation 来自实际成功证据；Core 审批/EffectIntent 不搬进 runner；不因内层关联失败断言整棵进程树必然失控。
-回归终点：每个真实生产 spawn 入口（host spawn、run_wrap）用可控屏障、立即派生后代、强制关联失败、宿主死亡覆盖；原 proof 路径继续通过。本机 Windows 实际执行。`cargo test -p agent-process`、`cargo test -p agent-capability-process`。
+### G5 — Windows containment 入口收敛（A，agent-process）——已关闭（`c8b0f3b3`）
+回执：[G5_CONTAINED_SPAWN_RECEIPT](reviews/2026-09-18-review-c8a62355/G5_CONTAINED_SPAWN_RECEIPT.md)。新共享入口 `contained_spawn.rs`（CREATE_SUSPENDED→必需 Job 关联→确认恢复，fail-closed：关联失败 kill＋有界确认死亡＋类型化拒绝）；generic `ProcessHost::connect` 与 Low-IL `run_wrap` 都经它，忽略关联结果的 `let _ = assign_pid_to_job` 移除；attestation 来自"首指令前关联确认＋恢复确认"，不来自"创建了 Job 对象"。注入 300ms 延迟红→绿（后代逃逸、双存活变体即 C0 快机签名）；每生产入口的后代随宿主死亡、强制关联失败无 runnable child、正常路径控制全过（env-seam 强制失败经真实生产入口）。agent-process **86/0**、capability-process **58/0**；compose `proof_supervision` 绿。行为变化如实：必需关联被拒从降级改 fail-closed（tool-runtime C0 路径仍降级——分歧已记录）；`resume_suspended_process` 在两 crate 重复待集成统一。
 
-### C（续）— KV 生产序列验收完整性（C，agent-compose 测试层）——开工
-保留 `kv_production_sequence.rs` 真实磁盘断言/同任务 key/工具加载撤销/恢复与费用脚本测试，只补三类验证：
-1. **完整稳定前缀**：比较整个 `input[0..=B0/B1]` 及参与匹配的 tools/schema，不只比断点所在最后一项；
-2. **真正交付的证据**：把工件最终交付的源区间/块 ID 集合接入请求轨迹（依赖 G2/G3 修复；允许先行落地、在 G2/G3 合并后转绿记账）；
-3. **完整成本口径**：LedgerRow 扩展 cache read/write/miss、真实 attempt、主调用与维护调用、缺测状态；同一累计 snapshot 不重复加。脚本值只证明传输与结算，不报告真实命中率/价格收益。
-真实端点接受/命中/净费用仍归 T8 NOT_RUN。`cargo test -p agent-compose --test kv_production_sequence`。
+### C（续）— KV 生产序列验收完整性（C，agent-compose 测试层）——已关闭（`1680e181`）
+回执：[KV_SEQUENCE_COMPLETENESS_RECEIPT](reviews/2026-09-18-review-c8a62355/KV_SEQUENCE_COMPLETENESS_RECEIPT.md)。九批断言全保留；三类补全：**(1) 完整稳定前缀**——每轮整个 `input[0..=B0]` 逐项对照基线＋相邻轮整段公共断点前缀逐字节一致＋轮首分歧仅限 B1 证据项，tools/schema 整块 canonical 比较；**(2) 真实交付证据**——轨迹 26 轮/8 回合，走读段由捕获服务器从工具返回的 continuation 子句逐字生成（实际 9 页 1→600），交付声明链无缺口无重叠、每页无截断标记、块 ID 按真实源行号在声明页交付（EXPECTED-RED 随 G2/G3 落地转绿）；**(3) 完整成本口径**——LedgerRow 扩展 cache 三桶（Known/Unknown，不补零）/attempts/retries/主辅 lane/typed 上报，期望行从实际服务派生、身份唯一不重复计、总额三方一致。KV 四连绿 **14.0s**；LOCAL_WIRE=PASS、ENDPOINT_ACCEPTED/SERVER_HIT/NET_TASK_COST 仍 NOT_RUN 归 T8。
+
+### 第十批集成回归（2026-09-18，本地 Windows，全部实际执行）
+
+`cargo test -p context-simple` 448/0；`-p tool-runtime` 299/0（1 ignored）；`-p agent-workspace` 125/0；`-p agent-storage` 30/0；`-p agent-process` 86/0；`-p agent-capability-process` 58/0；`-p agent-compose` 全套 0 失败（含 KV 14.0s、proof_supervision）；`-p agent-host` 31/0；`-p agent-core` 172/0；`-p agent-contracts` 198/0；`-p agent-conformance` 35/0；`-p agent-runtime` 744/0。`cargo fmt --all -- --check` 干净；`cargo clippy --workspace --all-targets -- -D warnings` 干净；doc gate OK。未执行：真实供应商实验（T8）、Unix 平台语义（cfg 门控仅编译）、GUI。
 
 ## T1–T7 完成记录（历史）
 
