@@ -24,7 +24,9 @@ use tokio::sync::Mutex;
 use tokio::time::{Instant, timeout};
 
 use crate::health::{ConnectionEpoch, ConnectionHealth, ConnectionStatus};
-use crate::session::{DuplexTransport, FramedProtocolSession, StdioDuplexTransport};
+use crate::session::{
+    BoundedSendError, DuplexTransport, FramedProtocolSession, StdioDuplexTransport,
+};
 use crate::supervisor::ProcessSupervisor;
 
 /// Client protocol version echoed by every request; a mismatched child is
@@ -633,7 +635,12 @@ impl ProcessHost {
         }
         let response = match timeout(
             host.config.startup_timeout,
-            host.exchange_response(ping, None, None),
+            host.exchange_response(
+                ping,
+                None,
+                None,
+                Instant::now() + host.config.startup_timeout,
+            ),
         )
         .await
         {
@@ -719,7 +726,13 @@ impl ProcessHost {
     /// connection: the request may have been written, so the response — if
     /// it ever arrives — must not be mistaken for a later request's answer.
     pub async fn call(&self, op: Value) -> AgentResult<Value> {
-        match timeout(self.config.request_timeout, self.call_unbounded(op)).await {
+        let deadline = Instant::now() + self.config.request_timeout;
+        match timeout(
+            self.config.request_timeout,
+            self.call_unbounded(op, deadline),
+        )
+        .await
+        {
             Ok(inner) => inner,
             Err(_) => {
                 self.poison_and_reap(format!(
@@ -747,9 +760,10 @@ impl ProcessHost {
         op: Value,
         cancel: &agent_contracts::CancellationToken,
     ) -> AgentResult<Value> {
+        let deadline = Instant::now() + self.config.request_timeout;
         match timeout(
             self.config.request_timeout,
-            self.exchange(op, None, Some(cancel)),
+            self.exchange(op, None, Some(cancel), deadline),
         )
         .await
         {
@@ -782,9 +796,10 @@ impl ProcessHost {
     where
         B: SystemBroker,
     {
+        let deadline = Instant::now() + self.config.request_timeout;
         match timeout(
             self.config.request_timeout,
-            self.exchange(op, Some(broker), Some(cancel)),
+            self.exchange(op, Some(broker), Some(cancel), deadline),
         )
         .await
         {
@@ -803,8 +818,8 @@ impl ProcessHost {
         }
     }
 
-    async fn call_unbounded(&self, op: Value) -> AgentResult<Value> {
-        self.exchange(op, None, None).await
+    async fn call_unbounded(&self, op: Value, deadline: Instant) -> AgentResult<Value> {
+        self.exchange(op, None, None, deadline).await
     }
 
     /// Write one request frame, then read frames until the final response.
@@ -822,21 +837,25 @@ impl ProcessHost {
     /// kill-then-reap.
     ///
     /// Every direction is bounded: the request and the system answers are
-    /// capped before a byte is written (`encode_frame`), response frames are
-    /// capped while reading, and the total bytes moved by one call are
-    /// capped by `max_call_bytes`. Every framing violation — oversize,
-    /// partial EOF, non-UTF-8 or unparseable frames —
-    /// poisons the connection and terminates the child tree, so a
+    /// capped before a byte is written (`encode_frame`) and every write is
+    /// bounded by the remaining request deadline and the cancel token
+    /// (`send_bounded`), response frames are capped while reading, and the
+    /// total bytes moved by one call are capped by `max_call_bytes`. Every
+    /// framing violation — oversize, partial EOF, non-UTF-8 or unparseable
+    /// frames — poisons the connection and terminates the child tree, so a
     /// half-consumed exchange can never corrupt a later request/response
-    /// pair.
+    /// pair. The same failure policy covers a write abandoned mid-frame by
+    /// cancel or deadline: the connection is poisoned and the tree is
+    /// terminated, never reused.
     async fn exchange(
         &self,
         op: Value,
         broker: Option<&dyn SystemBroker>,
         cancel: Option<&agent_contracts::CancellationToken>,
+        deadline: Instant,
     ) -> AgentResult<Value> {
         Ok(self
-            .exchange_response(op, broker, cancel)
+            .exchange_response(op, broker, cancel, deadline)
             .await?
             .get("value")
             .cloned()
@@ -848,12 +867,40 @@ impl ProcessHost {
         op: Value,
         broker: Option<&dyn SystemBroker>,
         cancel: Option<&agent_contracts::CancellationToken>,
+        deadline: Instant,
     ) -> AgentResult<Value> {
-        let result = self.exchange_once(op, broker, cancel).await;
+        let result = self.exchange_once(op, broker, cancel, deadline).await;
         if self.poison_reason().is_some() {
             self.supervisor.reap().await;
         }
         result
+    }
+
+    /// Take the transport lock under the call's remaining deadline and
+    /// cancellation. Waiting for the send permission is part of the call's
+    /// budget: a wedged in-flight exchange (its own bounds settle it) must
+    /// not pin the next caller past its deadline, and a cancel must not
+    /// wait on it either. Nothing is written while waiting, so neither
+    /// bound poisons here — the in-flight exchange owns its own settlement.
+    async fn acquire_transport(
+        &self,
+        deadline: Instant,
+        cancel: Option<&agent_contracts::CancellationToken>,
+    ) -> Result<tokio::sync::MutexGuard<'_, StdioDuplexTransport>, AgentError> {
+        tokio::select! {
+            biased;
+            transport = self.transport.lock() => Ok(transport),
+            _ = async {
+                match cancel {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => Err(AgentError::Cancelled),
+            _ = tokio::time::sleep_until(deadline) => Err(AgentError::Context(format!(
+                "process '{}' gave up waiting for the connection while another exchange was still in flight; nothing was written",
+                self.config.program
+            ))),
+        }
     }
 
     async fn exchange_once(
@@ -861,6 +908,7 @@ impl ProcessHost {
         op: Value,
         broker: Option<&dyn SystemBroker>,
         cancel: Option<&agent_contracts::CancellationToken>,
+        deadline: Instant,
     ) -> AgentResult<Value> {
         if let Some(reason) = self.poison_reason() {
             return Err(AgentError::Context(format!(
@@ -868,7 +916,10 @@ impl ProcessHost {
                 self.config.program
             )));
         }
-        let mut transport = self.transport.lock().await;
+        let mut transport = match self.acquire_transport(deadline, cancel).await {
+            Ok(transport) => transport,
+            Err(error) => return Err(error),
+        };
         if let Some(reason) = transport.poison_reason() {
             return Err(AgentError::Context(format!(
                 "process '{}' connection poisoned: {reason}",
@@ -901,13 +952,24 @@ impl ProcessHost {
         }
         // Outbound cap: the request is rejected *before* any byte is
         // written, so an over-cap call can never leave a half-written frame
-        // on the pipe and the connection stays usable.
+        // on the pipe and the connection stays usable. The write itself is
+        // then bounded by the remaining deadline and the cancel token: a
+        // peer that stopped reading must not pin the call past either.
         let request_line =
             crate::frame::encode_frame(&Value::Object(request), self.config.max_frame_bytes)?;
         let mut exchanged = request_line.len();
 
-        if let Err(error) = transport.send_encoded_line(&request_line).await {
-            return Err(self.transport_error(&mut *transport, "write", error));
+        match transport
+            .send_bounded(&request_line, deadline, cancel)
+            .await
+        {
+            Ok(()) => {}
+            Err(BoundedSendError::Abandoned) => {
+                return Err(self.settle_abandoned_send(&mut *transport, cancel));
+            }
+            Err(BoundedSendError::Failed(error)) => {
+                return Err(self.transport_error(&mut *transport, "write", error));
+            }
         }
 
         let mut system_calls = 0usize;
@@ -938,12 +1000,10 @@ impl ProcessHost {
                         // that stopped reading must not stall the abort on
                         // a full pipe. Settlement is kill-then-reap either
                         // way.
-                        if tokio::time::timeout(
-                            CANCEL_SEND_TIMEOUT,
-                            transport.send_encoded_line(&line),
-                        )
-                        .await
-                        .is_err()
+                        if transport
+                            .send_bounded(&line, Instant::now() + CANCEL_SEND_TIMEOUT, None)
+                            .await
+                            .is_err()
                         {
                             return Err(self.settle_cancelled(&mut *transport));
                         }
@@ -1040,6 +1100,13 @@ impl ProcessHost {
                                 json!({ "system_ok": false, "error": error.to_string() })
                             }
                         };
+                        if cancel.is_some_and(agent_contracts::CancellationToken::is_cancelled) {
+                            // The request frame was already written, so this
+                            // is cancel-after-write: no answer may cross the
+                            // wire after cancel. The connection settles
+                            // poisoned either way.
+                            return Err(self.settle_cancelled(&mut *transport));
+                        }
                         let encoded = serde_json::to_string(&answer).map_err(|e| {
                             AgentError::Context(format!("serialize system answer: {e}"))
                         })?;
@@ -1075,8 +1142,22 @@ impl ProcessHost {
                                 ),
                             ));
                         }
-                        if let Err(error) = transport.send_encoded_line(&answer_line).await {
-                            return Err(self.transport_error(&mut *transport, "write", error));
+                        // The answer write is bounded like the request
+                        // write: a child that stopped reading after sending
+                        // its system request must not pin the call past the
+                        // cancel or the deadline with a half-written answer
+                        // on the pipe.
+                        match transport
+                            .send_bounded(&answer_line, deadline, cancel)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(BoundedSendError::Abandoned) => {
+                                return Err(self.settle_abandoned_send(&mut *transport, cancel));
+                            }
+                            Err(BoundedSendError::Failed(error)) => {
+                                return Err(self.transport_error(&mut *transport, "write", error));
+                            }
                         }
                         continue;
                     }
@@ -1204,6 +1285,33 @@ impl ProcessHost {
         transport.poison(reason);
         self.supervisor.kill_tree();
         AgentError::Cancelled
+    }
+
+    /// A bounded send was abandoned (cancel or deadline) while the frame
+    /// may have been half-written. The pipe can no longer be trusted, so
+    /// the connection is poisoned and the child tree is terminated — the
+    /// abandoned frame is never retried. Attribution follows the caller's
+    /// bound: a fired cancel token settles as `Cancelled`, with no claim
+    /// about what the peer did or did not execute; otherwise the request
+    /// deadline settles as the timeout.
+    fn settle_abandoned_send(
+        &self,
+        transport: &mut impl DuplexTransport,
+        cancel: Option<&agent_contracts::CancellationToken>,
+    ) -> AgentError {
+        if cancel.is_some_and(agent_contracts::CancellationToken::is_cancelled) {
+            return self.settle_cancelled(transport);
+        }
+        let reason = self.record_poison(
+            "frame write did not finish within the request deadline; the pipe may hold a partial frame"
+                .into(),
+        );
+        transport.poison(reason);
+        self.supervisor.kill_tree();
+        AgentError::Context(format!(
+            "process '{}' request timed out waiting for the frame write; connection poisoned",
+            self.config.program
+        ))
     }
 
     /// Ask the child to exit gracefully, then reap it. The host is consumed,

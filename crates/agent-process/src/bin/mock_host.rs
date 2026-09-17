@@ -16,7 +16,7 @@ use agent_contracts::ToolOutput;
 use agent_platform_protocol::{ActiveFeatures, FEATURE_LEGACY_INVOKE_OUTPUT};
 use agent_process::PROTOCOL_VERSION;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 
 fn main() {
     if !std::env::args().any(|arg| arg == "--serve") {
@@ -118,6 +118,23 @@ async fn server_loop() {
                 std::thread::sleep(Duration::from_millis(50));
             }
         });
+    }
+
+    // Blocked-write mode: answer the handshake ping, then stop reading
+    // stdin so the host's next frame write meets real pipe backpressure.
+    // Before parking, the child consumes exactly `n` more bytes and writes
+    // that count to `MOCK_READ_SNAPSHOT` — parent-side proof that a partial
+    // write had actually started when the test cancels. With
+    // `MOCK_EMIT_SYSTEM_FRAME=1` it first writes one mid-invoke system
+    // request, so the blocked write is the host's broker *answer*.
+    if let Some(n) = std::env::var("MOCK_STOP_READING_AFTER_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        let emit_system = std::env::var("MOCK_EMIT_SYSTEM_FRAME").ok().as_deref() == Some("1");
+        let snapshot = std::env::var("MOCK_READ_SNAPSHOT").ok();
+        stop_reading_server(n, emit_system, snapshot.as_deref()).await;
+        return;
     }
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -581,6 +598,53 @@ async fn server_loop() {
             _ => {}
         }
     }
+}
+
+/// The blocked-write fixture: one real handshake ping, then the child
+/// stops reading stdin forever (it only parks; the process stays alive
+/// until the host's kill-then-reap settles it). `n` bytes are consumed
+/// first so the parent can prove the host's frame write had actually
+/// started (and then wedged on pipe backpressure) when the test cancels.
+async fn stop_reading_server(n: usize, emit_system: bool, snapshot: Option<&str>) {
+    let mut reader = BufReader::new(tokio::io::stdin());
+    let mut writer = BufWriter::new(tokio::io::stdout());
+
+    // One handshake ping, exactly like the generic loop's first frame.
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .expect("handshake ping line");
+    let ping: Value = serde_json::from_str(line.trim()).expect("ping json");
+    let id = ping.get("id").and_then(Value::as_u64).unwrap_or(0);
+    reply_ping(&mut writer, id, &ping).await;
+
+    // Optionally make the host's *next* blocked write a broker answer
+    // instead of the first request.
+    if emit_system {
+        let frame = json!({ "system": "fs.read", "path": "blocked-answer.txt" });
+        let _ = writer
+            .write_all(serde_json::to_string(&frame).unwrap().as_bytes())
+            .await;
+        let _ = writer.write_all(b"\n").await;
+        let _ = writer.flush().await;
+    }
+
+    // Consume exactly n bytes, publish the count, then never read again.
+    let mut consumed = 0usize;
+    let mut buf = [0u8; 4096];
+    while consumed < n {
+        let want = (n - consumed).min(buf.len());
+        match reader.read(&mut buf[..want]).await {
+            Ok(0) => break,
+            Ok(got) => consumed += got,
+            Err(_) => break,
+        }
+    }
+    if let Some(path) = snapshot {
+        let _ = std::fs::write(path, consumed.to_string());
+    }
+    std::future::pending::<()>().await;
 }
 
 /// One mid-invoke system round trip: write the child's `{"system": ...}`

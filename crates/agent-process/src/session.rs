@@ -16,8 +16,9 @@ use async_trait::async_trait;
 use tokio::io::{
     AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
+use tokio::time::Instant;
 
-use agent_contracts::{AgentError, AgentResult};
+use agent_contracts::{AgentError, AgentResult, CancellationToken};
 
 use crate::frame::{FrameError, FrameErrorKind, encode_frame, encode_frame_bytes, read_frame};
 
@@ -44,6 +45,20 @@ pub struct FramedProtocolSession<R, W> {
     writer: W,
     max_frame_bytes: usize,
     poisoned: Option<String>,
+}
+
+/// Why a bounded send ([`FramedProtocolSession::send_bounded`]) ended
+/// without completing the frame.
+#[derive(Debug)]
+pub enum BoundedSendError {
+    /// The caller's bound (cancel token or deadline) fired while the frame
+    /// was still being written. The pipe may hold a partial frame: the
+    /// caller must poison and terminate the connection, never reuse it and
+    /// never retry the frame. No claim is made about what the peer did or
+    /// did not execute.
+    Abandoned,
+    /// The pipe failed (write or flush IO error).
+    Failed(AgentError),
 }
 
 /// Inherited anonymous-pipe backend of [`DuplexTransport`].
@@ -130,6 +145,44 @@ where
     pub async fn send_encoded_line(&mut self, line: &[u8]) -> AgentResult<()> {
         self.ensure_writable()?;
         self.write_line(line).await
+    }
+
+    /// Write one already-capped frame under the caller's remaining deadline
+    /// and cancellation token. This is the single bounded write path for
+    /// every protocol frame that can block on pipe backpressure (the first
+    /// request, each broker answer, the peer cancel frame): `write_all` and
+    /// `flush` are raced against both bounds instead of being awaited
+    /// bare, so a peer that stopped reading can no longer pin the caller
+    /// past its cancel or deadline.
+    ///
+    /// Abandonment is honest about the wire: dropping the write future
+    /// mid-poll may leave a *partial frame* on the pipe, so [`BoundedSendError::Abandoned`]
+    /// means the caller must poison and terminate this connection — never
+    /// reuse it, never retry the frame. It does not claim whether the peer
+    /// executed anything. Only a fully written and flushed frame returns
+    /// `Ok(())`.
+    pub async fn send_bounded(
+        &mut self,
+        line: &[u8],
+        deadline: Instant,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), BoundedSendError> {
+        self.ensure_writable().map_err(BoundedSendError::Failed)?;
+        // Biased: a cancel that is already observable when the write first
+        // yields wins over a write result that completed in the same wake-up,
+        // so a cancelled send always settles as cancelled (the connection is
+        // poisoned by the caller either way — never reused).
+        tokio::select! {
+            biased;
+            _ = async {
+                match cancel {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => Err(BoundedSendError::Abandoned),
+            _ = tokio::time::sleep_until(deadline) => Err(BoundedSendError::Abandoned),
+            written = self.write_line(line) => written.map_err(BoundedSendError::Failed),
+        }
     }
 
     fn ensure_writable(&self) -> AgentResult<()> {
