@@ -64,8 +64,37 @@ struct OperationWriterState {
 /// successful append crosses an OS stable-storage barrier (`sync_all`) before
 /// returning. The checksum detects torn/corrupt frames; it is not an
 /// authentication mechanism.
+///
+/// # Concurrency contract (writer identity, G4)
+///
+/// Writer exclusivity is bound to the journal's identity, not to a WAL
+/// generation: `open` acquires an exclusive OS lock on a stable lock file
+/// (`<base>.lock`) BEFORE reading any journal truth (metadata, WAL
+/// generations, leftover compaction candidates) and holds it until the
+/// journal is dropped. The lock file never rotates across compactions and is
+/// never unlinked/recreated while held, so a stale opener can never pair a
+/// pre-compaction metadata snapshot with a post-compaction lock acquisition
+/// and come back as a healthy writer on a superseded generation. Both
+/// cross-process openers and independent handles in the same process
+/// serialize through this lock (`File::try_lock` is flock per open file
+/// description on Unix, LockFileEx per handle on Windows — two handles of
+/// the same process conflict on both; the same-process rejection is
+/// exercised by tests on Windows in this repository, the Unix mirror is
+/// `#[cfg(unix)]`-gated and was not executed in a Windows environment).
+///
+/// Each WAL generation file is additionally locked while it is the active
+/// writer target — defense in depth against non-cooperating writers that
+/// open the WAL path directly — and compaction establishes the
+/// next-generation candidate with a safe creation flow (create_new, or a
+/// non-truncating open plus lock plus explicit reset) so a path that may
+/// belong to another writer is never truncated before the lock decides
+/// ownership.
 pub struct FileOperationJournal {
     path: PathBuf,
+    /// The journal lifecycle lock: taken before the first metadata read and
+    /// held until drop. Underscored because it is never read — its purpose
+    /// is ownership, and closing the handle releases the lock.
+    _journal_lock: File,
     writer: Mutex<OperationWriterState>,
 }
 
@@ -73,6 +102,43 @@ impl FileOperationJournal {
     pub fn open(path: impl AsRef<Path>) -> AgentResult<(Self, OperationJournalRecovery)> {
         let path = path.as_ref().to_path_buf();
         let metadata_path = path.with_extension("meta.json");
+        let lock_path = path.with_extension("lock");
+
+        // The parent directory chain is created up front so the lifecycle
+        // lock file can exist next to the metadata it guards. The chain of
+        // directories that were missing here is re-synced when a brand-new
+        // WAL first appears in them, preserving the original first-creation
+        // durability contract.
+        let mut directory_sync_chain = Vec::new();
+        if let Some(parent) = lock_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            directory_sync_chain.push(parent.to_path_buf());
+            let mut cursor = parent;
+            while !cursor.exists() {
+                let Some(ancestor) = cursor.parent() else {
+                    break;
+                };
+                directory_sync_chain.push(ancestor.to_path_buf());
+                cursor = ancestor;
+            }
+            fs::create_dir_all(parent).map_err(|error| {
+                AgentError::Storage(format!(
+                    "create operation journal directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        // G4 lifecycle lock: acquired BEFORE any journal truth is read.
+        // Everything below — metadata, WAL generations, leftovers — is
+        // therefore read under the lock and can never be older than the
+        // lock itself; an opener racing a concurrent compaction either
+        // fails here (the first journal still lives) or reads the already
+        // published generation. The lock is held for the journal's whole
+        // lifetime and never rotates with the WAL.
+        let journal_lock = open_journal_lock(&lock_path)?;
+
         let existing_metadata = if metadata_path.exists() {
             Some(read_authority_metadata(&metadata_path)?)
         } else {
@@ -105,24 +171,6 @@ impl FileOperationJournal {
                 wal_path.display()
             )));
         }
-        let mut directory_sync_chain = Vec::new();
-        if let Some(parent) = wal_path.parent() {
-            directory_sync_chain.push(parent.to_path_buf());
-            let mut cursor = parent;
-            while !cursor.exists() {
-                let Some(ancestor) = cursor.parent() else {
-                    break;
-                };
-                directory_sync_chain.push(ancestor.to_path_buf());
-                cursor = ancestor;
-            }
-            fs::create_dir_all(parent).map_err(|error| {
-                AgentError::Storage(format!(
-                    "create operation journal directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -135,6 +183,9 @@ impl FileOperationJournal {
                     wal_path.display()
                 ))
             })?;
+        // Defense in depth on top of the lifecycle lock: the active WAL
+        // generation is exclusively locked too, so a writer that bypasses
+        // `open` and opens the WAL path directly still contends here.
         file.try_lock().map_err(|error| {
             AgentError::Storage(format!(
                 "lock operation journal {} exclusively: {error}",
@@ -148,8 +199,8 @@ impl FileOperationJournal {
                     wal_path.display()
                 ))
             })?;
-            for directory in directory_sync_chain {
-                sync_directory(&directory)?;
+            for directory in &directory_sync_chain {
+                sync_directory(directory)?;
             }
         }
         let recovery = recover_operation_file(&mut file, &wal_path)?;
@@ -176,6 +227,7 @@ impl FileOperationJournal {
         Ok((
             Self {
                 path,
+                _journal_lock: journal_lock,
                 writer: Mutex::new(OperationWriterState {
                     file,
                     next_seq,
@@ -188,6 +240,35 @@ impl FileOperationJournal {
             recovery,
         ))
     }
+}
+
+/// Open (creating on first use) and exclusively lock the journal lifecycle
+/// lock file. The file is a plain, never-rotating identity marker next to
+/// the journal metadata: it carries no data, is never unlinked or replaced
+/// while a journal lives, and a failure to take it means another writer —
+/// in this process or another — owns the journal.
+fn open_journal_lock(path: &Path) -> AgentResult<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| {
+            AgentError::Storage(format!(
+                "open operation journal lock {}: {error}",
+                path.display()
+            ))
+        })?;
+    file.try_lock().map_err(|error| {
+        AgentError::Storage(format!(
+            "lock operation journal {} exclusively: {error}; \
+             another writer already owns this journal — the lifecycle lock is \
+             taken before any metadata read and never rotates across WAL generations",
+            path.display()
+        ))
+    })?;
+    Ok(file)
 }
 
 fn authority_wal_path(base: &Path, generation: u64) -> PathBuf {
@@ -675,25 +756,13 @@ fn compact_locked(
         )));
     }
 
-    let mut new_file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
-        .open(&new_path)
-        .map_err(|error| {
-            AgentError::Storage(format!(
-                "create compacted operation journal {}: {error}",
-                new_path.display()
-            ))
-        })?;
+    // G4 safe candidate creation: ownership of the next-generation path is
+    // decided by the OS file lock BEFORE any pre-existing byte is touched.
+    // A path that another writer already owns is rejected without mutating
+    // it; an unlocked leftover of a crashed (never-published) compaction is
+    // locked first and only then cleared. See open_compaction_candidate.
+    let mut new_file = open_compaction_candidate(&new_path)?;
     write_operation_records(&mut new_file, &records)?;
-    new_file.try_lock().map_err(|error| {
-        AgentError::Storage(format!(
-            "lock compacted operation journal {} exclusively: {error}",
-            new_path.display()
-        ))
-    })?;
 
     let mut ancestors = writer.metadata.ancestors.clone();
     ancestors.push(previous.clone());
@@ -757,8 +826,81 @@ fn compact_locked(
     writer.recovery = recovery;
     writer.operation_indexes = operation_indexes;
     writer.metadata = new_metadata;
+    // Best-effort removal of the superseded WAL. On Windows a foreign
+    // handle opened through std (FILE_SHARE_DELETE) turns this into a
+    // delete-pending unlink: the name disappears immediately and the stale
+    // handle stays usable until closed, but — under the lifecycle lock — no
+    // journal writer can hold that handle anymore. A foreign handle without
+    // delete sharing makes the removal fail; the leftover is then simply
+    // ignored by later opens, which follow the published metadata (see
+    // `published_generation_survives_a_crash_before_old_wal_removal`).
     let _ = fs::remove_file(old_wal);
     authority_checkpoint_marker(&writer.metadata, &writer.recovery)
+}
+
+/// Establish the next-generation compaction candidate at `path` without ever
+/// truncating a path whose ownership the lock has not decided.
+///
+/// - A fresh candidate is created with `create_new`: a path that did not
+///   exist cannot hide another writer's bytes, and it is locked
+///   immediately after creation.
+/// - An already-existing candidate can only be an unpublished leftover of a
+///   crashed compaction — the caller holds the journal lifecycle lock and
+///   the still-unpublished metadata, so no second journal could have
+///   produced it. It is opened WITHOUT truncation and locked first; a
+///   foreign handle that already holds the OS lock wins and the compaction
+///   is rejected with the candidate byte-for-byte intact. Only after the
+///   lock is granted is the stale leftover cleared and rewritten.
+fn open_compaction_candidate(path: &Path) -> AgentResult<File> {
+    let fresh = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path);
+    let mut file = match fresh {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut leftover = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|error| {
+                    AgentError::Storage(format!(
+                        "open compacted operation journal candidate {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            lock_compaction_candidate(&mut leftover, path)?;
+            leftover
+                .set_len(0)
+                .and_then(|_| leftover.seek(SeekFrom::Start(0)))
+                .map_err(|error| {
+                    AgentError::Storage(format!(
+                        "reset compacted operation journal candidate {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            return Ok(leftover);
+        }
+        Err(error) => {
+            return Err(AgentError::Storage(format!(
+                "create compacted operation journal {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    lock_compaction_candidate(&mut file, path)?;
+    Ok(file)
+}
+
+fn lock_compaction_candidate(file: &mut File, path: &Path) -> AgentResult<()> {
+    file.try_lock().map_err(|error| {
+        AgentError::Storage(format!(
+            "lock compacted operation journal {} exclusively: {error}; \
+             the next-generation candidate is owned by another writer",
+            path.display()
+        ))
+    })
 }
 
 fn write_operation_records(file: &mut File, records: &[OperationJournalRecord]) -> AgentResult<()> {
@@ -1955,6 +2097,284 @@ mod tests {
             Err(AgentError::RecoveryRequired(_))
         ));
         assert_eq!(fs::metadata(&path).unwrap().len(), before);
+    }
+
+    /// G4: an opener that has already snapshotted the generation-1 metadata
+    /// (the read the pre-fix open() performed before taking any lock) and
+    /// then watches another instance compact and publish generation 2 must
+    /// NOT come back as a healthy writer on its stale view: it is rejected
+    /// through the lifecycle lock for as long as the first journal lives,
+    /// and once that journal is gone the next open follows the PUBLISHED
+    /// metadata, never the stale snapshot. Deterministic ordering via
+    /// channels; no timing dependence.
+    #[test]
+    fn a_stale_metadata_opener_is_serialized_by_the_journal_lifecycle_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+
+        // The second opener snapshots the metadata BEFORE taking any lock —
+        // the deterministic equivalent of the pre-fix read-metadata-first
+        // ordering — and stalls on a barrier while the first instance
+        // compacts and publishes.
+        let (stale_tx, stale_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (published_tx, published_rx) = std::sync::mpsc::channel::<()>();
+        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel::<Result<(), AgentError>>();
+        let opener = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let stale = fs::read(path.with_extension("meta.json")).unwrap();
+                stale_tx.send(stale).unwrap();
+                published_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+                let attempt =
+                    FileOperationJournal::open(&path).map(|_: (FileOperationJournal, _)| ());
+                attempt_tx.send(attempt).unwrap();
+            }
+        });
+
+        let stale = stale_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let stale_json: serde_json::Value = serde_json::from_slice(&stale).unwrap();
+        assert_eq!(
+            stale_json["metadata"]["generation"], 1,
+            "the barrier must hold the second opener on a pre-compaction snapshot"
+        );
+
+        // The first instance compacts and publishes generation 2 while the
+        // second opener holds the stale snapshot — and stays alive.
+        journal.compact().unwrap();
+        published_tx.send(()).unwrap();
+
+        let attempt = attempt_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(&attempt, AgentError::Storage(message) if message.contains("operations.lock")),
+            "the stale opener must be rejected through the lifecycle lock: {attempt}"
+        );
+
+        // The first instance stays the sole healthy writer on the published
+        // generation; the rejected attempt mutated nothing.
+        assert_eq!(journal.authority_checkpoint_marker().unwrap().generation, 2);
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        opener.join().unwrap();
+
+        // After the first journal (and its lifecycle lock) is gone, the
+        // next open follows the PUBLISHED metadata, not the stale snapshot.
+        drop(journal);
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.authority_checkpoint_marker().unwrap().generation,
+            2
+        );
+        assert_eq!(recovery.last_seq, 3);
+        assert_eq!(recovery.operations.len(), 2);
+    }
+
+    /// G4: a foreign writer already owns (holds the OS lock on) the
+    /// next-generation candidate path. Compaction must reject with a typed
+    /// error and leave the candidate byte-for-byte unchanged — never
+    /// truncate/write it before the lock decides ownership.
+    #[test]
+    fn competing_compaction_is_rejected_without_touching_the_locked_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+
+        let candidate_path = path.with_file_name("operations.jsonl.g2");
+        let mut candidate = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&candidate_path)
+            .unwrap();
+        candidate.write_all(b"sentinel-candidate-bytes").unwrap();
+        candidate.flush().unwrap();
+        candidate.sync_all().unwrap();
+        candidate.seek(SeekFrom::Start(0)).unwrap();
+        candidate.try_lock().unwrap();
+        let sentinel_len = b"sentinel-candidate-bytes".len() as u64;
+
+        let meta_before = fs::read(path.with_extension("meta.json")).unwrap();
+        let error = match journal.compact() {
+            Ok(_) => panic!("a competed candidate must reject the compaction"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, AgentError::Storage(_)),
+            "a competed candidate must surface as a typed storage error: {error}"
+        );
+
+        // Byte-for-byte unchanged content and length, read through the
+        // owning handle (a second path handle may be fenced by the OS lock).
+        let mut content = Vec::new();
+        candidate.seek(SeekFrom::Start(0)).unwrap();
+        candidate.read_to_end(&mut content).unwrap();
+        assert_eq!(content, b"sentinel-candidate-bytes");
+        assert_eq!(fs::metadata(&candidate_path).unwrap().len(), sentinel_len);
+        assert!(
+            matches!(&error, AgentError::Storage(message) if message.contains("lock")),
+            "the rejection must name the candidate lock: {error}"
+        );
+        assert_eq!(
+            fs::read(path.with_extension("meta.json")).unwrap(),
+            meta_before,
+            "a rejected compaction must not publish anything"
+        );
+
+        // The writer stays healthy on the current generation.
+        assert_eq!(journal.authority_checkpoint_marker().unwrap().generation, 1);
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(journal.recover().unwrap().last_seq, 2);
+
+        // Once the foreign owner releases the candidate, compaction
+        // proceeds normally through the same candidate path.
+        drop(candidate);
+        let marker = journal.compact().unwrap();
+        assert_eq!(marker.generation, 2);
+        drop(journal);
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.authority_checkpoint_marker().unwrap().generation,
+            2
+        );
+        assert_eq!(recovery.operations.len(), 2);
+        assert_eq!(recovery.last_seq, 3);
+    }
+
+    /// G4: journal writer identity is the stable lifecycle lock file, not
+    /// the rotating WAL generation. It exists from first open, survives
+    /// compaction, is never unlinked/recreated, and rejects a same-process
+    /// second open with the lock named in the error.
+    #[test]
+    fn journal_lifecycle_lock_is_stable_across_generations_and_double_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let lock_path = path.with_extension("lock");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        assert!(lock_path.exists(), "first open establishes the lock file");
+        journal
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        journal.compact().unwrap();
+        assert!(
+            lock_path.exists(),
+            "the lifecycle lock must not rotate or be unlinked across generations"
+        );
+
+        let second = match FileOperationJournal::open(&path) {
+            Ok(_) => panic!("a second same-process open must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&second, AgentError::Storage(message) if message.contains("operations.lock")),
+            "a second same-process open must be rejected through the lifecycle lock: {second}"
+        );
+        assert!(
+            lock_path.exists(),
+            "a rejected open must not remove or recreate the lock file"
+        );
+
+        drop(journal);
+        let (reopened, _) = FileOperationJournal::open(&path).unwrap();
+        assert!(lock_path.exists());
+        drop(reopened);
+    }
+
+    /// G4: an unlocked next-generation candidate is a leftover of a crashed
+    /// (never-published) compaction. The next compaction still succeeds —
+    /// the candidate is locked first and only then cleared and rewritten —
+    /// and the resulting generation-2 WAL is a valid, recoverable journal.
+    #[test]
+    fn compaction_reuses_an_unlocked_leftover_candidate_after_locking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        {
+            let (journal, _) = FileOperationJournal::open(&path).unwrap();
+            journal
+                .append_and_sync(&upsert(operation_snapshot(
+                    OperationId::new(),
+                    OperationState::Accepted,
+                )))
+                .unwrap();
+        }
+        let candidate = path.with_file_name("operations.jsonl.g2");
+        fs::write(&candidate, b"partial crashed compaction output").unwrap();
+
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        let marker = journal.compact().unwrap();
+        assert_eq!(marker.generation, 2);
+        drop(journal);
+
+        let (reopened, recovery) = FileOperationJournal::open(&path).unwrap();
+        assert_eq!(
+            reopened.authority_checkpoint_marker().unwrap().generation,
+            2
+        );
+        assert_eq!(recovery.last_seq, 2);
+        assert_eq!(recovery.operations.len(), 1);
+        reopened
+            .append_and_sync(&upsert(operation_snapshot(
+                OperationId::new(),
+                OperationState::Accepted,
+            )))
+            .unwrap();
+        assert_eq!(reopened.recover().unwrap().last_seq, 3);
+    }
+
+    /// Unix mirror of the same-process double-open rejection: flock locks
+    /// are per open file description, so two independent handles in one
+    /// process conflict exactly like cross-process openers. The Windows
+    /// (LockFileEx) branch is exercised by
+    /// `journal_lifecycle_lock_is_stable_across_generations_and_double_open`;
+    /// this `#[cfg(unix)]` mirror was NOT executed in this (Windows)
+    /// environment.
+    #[cfg(unix)]
+    #[test]
+    fn unix_same_process_double_open_is_rejected_by_the_lifecycle_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("operations.jsonl");
+        let (journal, _) = FileOperationJournal::open(&path).unwrap();
+        let second = match FileOperationJournal::open(&path) {
+            Ok(_) => panic!("a second same-process open must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&second, AgentError::Storage(message) if message.contains("operations.lock")),
+            "{second}"
+        );
+        drop(journal);
+        let _ = FileOperationJournal::open(&path).unwrap();
     }
 
     /// STORAGE-02: a compaction whose new-WAL creation fails (before the
