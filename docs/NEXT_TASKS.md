@@ -6,9 +6,9 @@
 
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
-**第十一批（`d3a05d29` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十一批与五份回执；CI 终验以合并后 run 为准）。** 第十批已全部关闭（CI 终验 run `35278745998` 与钉宽后 run `35282364426` 见 CURRENT.md）。剩余条件任务 T8（需授权预算/凭据；含 KV 端点三态 NOT_RUN 的补测与 `context_manage` 租赁进出对供应商复用边界的影响核对）；host_e2e 起始基线抖动为未定性观察（见 CURRENT.md 已知抖动记录）。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+**第十一批（`d3a05d29` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十一批与五份回执；CI 终验 run `35289417269` 首跑全绿）。** 第十批已全部关闭（CI 终验 run `35278745998` 与钉宽后 run `35282364426` 见 CURRENT.md）。剩余条件任务 T8（需授权预算/凭据；含 KV 端点三态 NOT_RUN 的补测与 `context_manage` 租赁进出对供应商复用边界的影响核对）；host_e2e 起始基线抖动为未定性观察（见 CURRENT.md 已知抖动记录）。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
-## 第十一批（`d3a05d29` 续审：C0 残余＋H1–H5＋KV 扩展）——已全部关闭（2026-09-18，本地集成回归全绿；CI 终验待合并后 run）
+## 第十一批（`d3a05d29` 续审：C0 残余＋H1–H5＋KV 扩展）——已全部关闭（2026-09-18，本地集成回归全绿；CI 终验 run `35289417269` 全绿）
 
 审查基线 `d3a05d29`（报告：[REVIEW.md](reviews/2026-09-18-review-d3a05d29/REVIEW.md)，任务规格：[NEXT_ACTIONS.md](reviews/2026-09-18-review-d3a05d29/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-18-review-d3a05d29/COVERAGE.md)，CI 摘录：[CI_OBSERVATION.md](reviews/2026-09-18-review-d3a05d29/CI_OBSERVATION.md)，机制探针：[MECHANISM_RESULTS.json](reviews/2026-09-18-review-d3a05d29/MECHANISM_RESULTS.json)）。主线：**启发式相关性不能直接决定约束失效；冷热驻留位置不能决定语义；字节预算不能代替字符边界；写前拒绝不等同于日志损坏。** 审查环境无 Rust 工具链，红例全部由实施补齐并实测转绿；五个切片文件所有权互不重叠、五 agent 并行实施、按片独立提交；同一 crate 内串行（H1→H2；H3→H5）。第九/第十批修复保留未重开。
 
@@ -30,7 +30,7 @@
 
 ### 第十一批集成回归（2026-09-18，本地 Windows，全部实际执行）
 
-`cargo test -p context-simple` 458/0；`-p tool-runtime` 308/0（1 ignored）；`-p agent-storage` 35/0；`-p agent-compose` 全套 0 失败（含 proof_supervision 与 KV 14.04s）；`-p agent-conformance` 0 失败；`-p agent-workspace` 0 失败；`-p agent-host` 全套 0 失败。`cargo fmt --all -- --check` 干净；`cargo clippy -p context-simple -p tool-runtime -p agent-storage -p agent-host -p agent-compose --all-targets -- -D warnings` 干净。未执行：真实供应商实验（T8）、Unix 平台语义、GUI。CI 终验以合并后 run 为准。
+`cargo test -p context-simple` 458/0；`-p tool-runtime` 308/0（1 ignored）；`-p agent-storage` 35/0；`-p agent-compose` 全套 0 失败（含 proof_supervision 与 KV 14.04s）；`-p agent-conformance` 0 失败；`-p agent-workspace` 0 失败；`-p agent-host` 全套 0 失败。`cargo fmt --all -- --check` 干净；`cargo clippy -p context-simple -p tool-runtime -p agent-storage -p agent-host -p agent-compose --all-targets -- -D warnings` 干净。未执行：真实供应商实验（T8）、Unix 平台语义、GUI。CI 终验 run `35289417269` 七 job 首跑全绿（Windows full 22m12s）。
 
 
 
