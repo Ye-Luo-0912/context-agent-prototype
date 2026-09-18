@@ -76,6 +76,47 @@ class RunnerBudgetTests(unittest.TestCase):
             self.assertIn("cached_input_tokens", attempt["detail"])
             self.assertEqual(len(upstream.requests), 1)
 
+    def test_nested_details_usage_shape_settles_committed(self):
+        # DeepSeek's Responses-compatible serving reports the cache-hit
+        # bucket as input_tokens_details.cached_tokens (observed live on the
+        # 2026-09-19 paid run); it must settle committed, never unknown.
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            campaign = support.make_campaign(root / "campaign")
+            with support.StubUpstream("nested_cached") as upstream:
+                cfg = support.base_config(
+                    campaign,
+                    env=support.minimal_env(upstream.url),
+                    child_command=[sys.executable, support.stub_file(root, "request.py", support.CHILD_REQUEST), "1"],
+                )
+                code = runner.run_segment(cfg)
+            self.assertEqual(code, 0)
+            ledger = support.read_json(campaign / "budget-ledger.json")
+            attempt = ledger["attempts"][0]
+            self.assertEqual(attempt["status"], "committed")
+            self.assertEqual(attempt["usage_shape"], "input_tokens_details.cached_tokens")
+            self.assertEqual(attempt["input_tokens"], 1000)
+            self.assertEqual(attempt["cached_input_tokens"], 40)
+            expected = runner.Pricing().attempt_cost_usd(1000, 40, 100)
+            self.assertAlmostEqual(ledger["committed_usd"], expected, places=12)
+            self.assertAlmostEqual(ledger["unknown_usd"], 0.0, places=12)
+            self.assertEqual(len(upstream.requests), 1)
+
+    def test_parse_usage_accepts_nested_and_flat_cache_shapes(self):
+        nested, reason = runner.parse_usage_strict(
+            support._sse({"input_tokens": 10, "input_tokens_details": {"cached_tokens": 4}, "output_tokens": 2})
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(nested["cached_input_tokens"], 4)
+        self.assertEqual(nested["usage_shape"], "input_tokens_details.cached_tokens")
+        flat, reason = runner.parse_usage_strict(support._sse(dict(support.USAGE_FULL)))
+        self.assertIsNone(reason)
+        self.assertEqual(flat["cached_input_tokens"], 0)
+        self.assertEqual(flat["usage_shape"], "cached_input_tokens")
+        missing, reason = runner.parse_usage_strict(support._sse({"input_tokens": 10, "output_tokens": 2}))
+        self.assertIsNone(missing)
+        self.assertIn("cached_input_tokens", reason)
+
     def test_reserve_rejects_request_over_cap_before_forwarding(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

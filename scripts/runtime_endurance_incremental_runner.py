@@ -157,22 +157,45 @@ class Pricing:
         ) / 1_000_000
 
 
-# Usage parsing is tied to one wire protocol. These field names belong to the
-# OpenAI Responses event schema; switching to another endpoint protocol
+# Usage parsing is tied to one wire protocol. These field paths belong to
+# Responses-compatible endpoints; switching to another endpoint protocol
 # requires adapting this constant explicitly. Never reuse it based on the
-# model name alone.
+# model name alone. Two cache-hit shapes are accepted, both from endpoint
+# evidence: the nested input_tokens_details.cached_tokens object (observed
+# live on DeepSeek's Responses-compatible serving, 2026-09-19) and the
+# older flat cached_input_tokens field. A genuinely missing bucket stays
+# unknown and is never zero-filled.
 RESPONSES_USAGE_SCHEMA = {
     "protocol": "openai-responses",
-    "required_fields": ("input_tokens", "cached_input_tokens", "output_tokens"),
+    "buckets": {
+        "input_tokens": (("input_tokens",),),
+        "output_tokens": (("output_tokens",),),
+        "cached_input_tokens": (("input_tokens_details", "cached_tokens"), ("cached_input_tokens",)),
+    },
 }
+
+
+def _usage_bucket(usage: dict, paths):
+    """First integer found across the accepted field paths, with its path."""
+    for path in paths:
+        value = usage
+        for key in path:
+            if not isinstance(value, dict) or key not in value:
+                value = None
+                break
+            value = value[key]
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value, path
+    return None, None
 
 
 def parse_usage_strict(raw: bytes):
     """Parse the last usage block from a captured SSE stream.
 
-    Returns (usage, None) with all required fields present as integers, or
-    (None, reason) when no usage block was streamed or any required field is
-    missing/non-integer. Missing data is never zero-filled.
+    Returns (usage, None) with all required buckets present as integers plus
+    the matched `usage_shape`, or (None, reason) when no usage block was
+    streamed or any required bucket is missing/non-integer. Missing data is
+    never zero-filled.
     """
     latest = None
     for line in raw.splitlines():
@@ -188,11 +211,13 @@ def parse_usage_strict(raw: bytes):
     if latest is None:
         return None, "usage_missing"
     parsed = {}
-    for name in RESPONSES_USAGE_SCHEMA["required_fields"]:
-        value = latest.get(name)
-        if isinstance(value, bool) or not isinstance(value, int):
+    for name, paths in RESPONSES_USAGE_SCHEMA["buckets"].items():
+        value, path = _usage_bucket(latest, paths)
+        if value is None:
             return None, f"usage_incomplete:{name}"
         parsed[name] = value
+        if name == "cached_input_tokens":
+            parsed["usage_shape"] = ".".join(path)
     return parsed, None
 
 
@@ -454,6 +479,7 @@ class BudgetLedger:
                     input_tokens=usage["input_tokens"],
                     cached_input_tokens=usage["cached_input_tokens"],
                     output_tokens=usage["output_tokens"],
+                    usage_shape=usage.get("usage_shape"),
                     estimated_usd=cost,
                 )
             elif status == "upstream_rate_limited":

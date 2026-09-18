@@ -163,6 +163,8 @@ class StubUpstream:
     Modes:
       ok            complete SSE stream carrying full usage
       missing_cached usage block missing cached_input_tokens
+      nested_cached usage in the nested input_tokens_details shape observed
+                    on DeepSeek's Responses-compatible serving (2026-09-19)
       rate_limited  HTTP 429
       stall         200 + one comment chunk, then silence for stall_s seconds
       delay         sleep delay_s, then a complete "ok" stream
@@ -205,6 +207,14 @@ class StubUpstream:
                 usage = dict(USAGE_FULL)
                 if outer.mode == "missing_cached":
                     usage.pop("cached_input_tokens")
+                if outer.mode == "nested_cached":
+                    usage = {
+                        "input_tokens": 1000,
+                        "input_tokens_details": {"cached_tokens": 40},
+                        "output_tokens": 100,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 1100,
+                    }
                 body = _sse(usage)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
