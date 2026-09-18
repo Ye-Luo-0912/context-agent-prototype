@@ -4,6 +4,15 @@ The campaign workspace is deliberately outside the production crates. The
 fixture is a small runnable v1 of the incremental build/publication platform;
 the model receives the upgrade task and later correction messages. The script
 does not modify the repository checkout or print provider credentials.
+
+Campaign evidence rules:
+  - setup creates a campaign exclusively: an existing campaign directory is
+    never silently overwritten (exit 3). The only path that reseeds the
+    fixture is `--reset` together with `--yes`, after printing exactly what
+    will be destroyed (exit 4 when `--yes` is missing).
+  - l0 never reseeds. It verifies campaign identity first (baseline-lock.json
+    exists, fixture/TASK hashes match the lock, runtime binary hash matches
+    the lock; exit 5/6 otherwise) and only then runs unittest/oracle.
 """
 
 from __future__ import annotations
@@ -11,7 +20,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -21,7 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 CAMPAIGN = REPO / "target" / "runtime-endurance-v1" / "incremental-platform-20260919"
 WORK = CAMPAIGN / "workspace"
-
+DEFAULT_BINARY = REPO / "target/debug/agent-tui.exe"
 
 FILES: dict[str, str] = {
     "TASK.md": """# Incremental Build and Publication Platform v1
@@ -48,58 +56,167 @@ fencing, atomic manifests, an outbox, migration and recovery documentation.
 }
 
 
-def write_file(relative: str, content: str) -> None:
-    path = WORK / relative
+def write_file(workspace: Path, relative: str, content: str) -> None:
+    path = workspace / relative
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    # newline="" keeps the on-disk bytes identical to the hashed seed content
+    path.write_text(content, encoding="utf-8", newline="")
 
 
-def setup() -> None:
-    WORK.mkdir(parents=True, exist_ok=True)
-    for relative, content in FILES.items():
-        write_file(relative, content)
-    (CAMPAIGN / "baseline-lock.json").write_text(
-        json.dumps(
+def digest(path: Path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _print_json(payload) -> None:
+    text = json.dumps(payload, ensure_ascii=False)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(json.dumps(payload, ensure_ascii=True))
+
+
+def _write_json(path: Path, payload) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.flush()
+    tmp.replace(path)
+
+
+def _destroy_scope(campaign_dir: Path, workspace: Path, lock_path: Path) -> dict:
+    """Summary of exactly what a reseeding --reset would destroy."""
+    files = []
+    if workspace.exists():
+        for path in sorted(workspace.rglob("*")):
+            if path.is_file():
+                files.append({"path": f"workspace/{path.relative_to(workspace)}", "sha256": digest(path)})
+    if lock_path.exists():
+        files.append({"path": "baseline-lock.json", "sha256": digest(lock_path)})
+    return {"count": len(files), "files": files}
+
+
+def setup(campaign_dir: Path = CAMPAIGN, reset: bool = False, yes: bool = False, binary: Path = DEFAULT_BINARY, repo: Path = REPO, head: str | None = None) -> None:
+    campaign_dir = Path(campaign_dir)
+    workspace = campaign_dir / "workspace"
+    lock_path = campaign_dir / "baseline-lock.json"
+    if (workspace.exists() or lock_path.exists()) and not reset:
+        _print_json(
             {
-                "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
-                "fixture_sha256": {
-                    relative: hashlib.sha256(content.encode()).hexdigest()
-                    for relative, content in FILES.items()
-                    if relative.startswith("fixtures/") or relative == "TASK.md"
-                },
-                "runtime_binary_sha256": hashlib.sha256((REPO / "target/debug/agent-tui.exe").read_bytes()).hexdigest(),
-                "provider_attempts": 0,
-                "status": "PREPARED",
+                "status": "rejected",
+                "reason": "campaign_dir_already_exists",
+                "campaign_dir": str(campaign_dir),
+                "hint": "pass --reset together with --yes to reseed, or choose a new --campaign-dir",
+            }
+        )
+        raise SystemExit(3)
+    if reset:
+        scope = _destroy_scope(campaign_dir, workspace, lock_path)
+        _print_json({"status": "reset", "campaign_dir": str(campaign_dir), "will_delete": scope, "confirmed": bool(yes)})
+        if not yes:
+            _print_json(
+                {
+                    "status": "rejected",
+                    "reason": "reset_requires_yes",
+                    "campaign_dir": str(campaign_dir),
+                    "hint": "rerun with --reset --yes to confirm reseeding",
+                }
+            )
+            raise SystemExit(4)
+        if workspace.exists():
+            shutil.rmtree(workspace)
+        if lock_path.exists():
+            lock_path.unlink()
+    try:
+        workspace.mkdir(parents=True)
+    except FileExistsError:
+        _print_json(
+            {
+                "status": "rejected",
+                "reason": "campaign_dir_already_exists",
+                "campaign_dir": str(campaign_dir),
+                "hint": "pass --reset together with --yes to reseed, or choose a new --campaign-dir",
+            }
+        )
+        raise SystemExit(3)
+    for relative, content in FILES.items():
+        write_file(workspace, relative, content)
+    head_value = head if head is not None else subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(repo), text=True).strip()
+    _write_json(
+        lock_path,
+        {
+            "head": head_value,
+            "fixture_sha256": {
+                relative: hashlib.sha256(content.encode()).hexdigest()
+                for relative, content in FILES.items()
+                if relative.startswith("fixtures/") or relative == "TASK.md"
             },
-            indent=2,
-        ),
-        encoding="utf-8",
+            "runtime_binary_sha256": digest(binary),
+            "provider_attempts": 0,
+            "status": "PREPARED",
+        },
     )
-    print(json.dumps({"campaign": str(CAMPAIGN), "workspace": str(WORK), "files": len(FILES)}))
+    _print_json({"status": "prepared", "campaign": str(campaign_dir), "workspace": str(workspace), "files": len(FILES)})
 
 
-def l0() -> None:
-    setup()
+def l0(campaign_dir: Path = CAMPAIGN, binary: Path = DEFAULT_BINARY, repo: Path = REPO, python_executable: str = "python") -> None:
+    campaign_dir = Path(campaign_dir)
+    workspace = campaign_dir / "workspace"
+    lock_path = campaign_dir / "baseline-lock.json"
+    if not lock_path.exists():
+        _print_json(
+            {
+                "status": "rejected",
+                "reason": "baseline_lock_missing",
+                "campaign_dir": str(campaign_dir),
+                "hint": "run the setup command first; l0 never seeds the campaign itself",
+            }
+        )
+        raise SystemExit(5)
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    differences = []
+    for relative, expected_hash in sorted(lock.get("fixture_sha256", {}).items()):
+        path = workspace / relative
+        actual_hash = digest(path) if path.exists() else None
+        if actual_hash != expected_hash:
+            differences.append({"file": relative, "expected": expected_hash, "actual": actual_hash})
+    expected_binary = lock.get("runtime_binary_sha256")
+    actual_binary = digest(binary) if Path(binary).exists() else None
+    if actual_binary != expected_binary:
+        differences.append({"file": "runtime_binary", "expected": expected_binary, "actual": actual_binary})
+    receipt = {"status": "identity_mismatch" if differences else "identity_ok", "head": lock.get("head"), "differences": differences, "results": []}
+    if differences:
+        _write_json(campaign_dir / "l0-receipt.json", receipt)
+        _print_json(receipt)
+        raise SystemExit(6)
     commands = [
-        ["python", "-m", "unittest", "discover", "-s", "tests", "-v"],
-        ["python", "oracle.py"],
+        [python_executable, "-m", "unittest", "discover", "-s", "tests", "-v"],
+        [python_executable, "oracle.py"],
     ]
-    results = []
     for command in commands:
-        result = subprocess.run(command, cwd=WORK, capture_output=True, text=True, timeout=120)
-        results.append({"command": command, "exit": result.returncode, "stdout_tail": result.stdout[-2000:], "stderr_tail": result.stderr[-1000:]})
-    (CAMPAIGN / "l0-receipt.json").write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
-    print(json.dumps({"l0": results}, ensure_ascii=False))
-    if any(result["exit"] != 0 for result in results):
+        result = subprocess.run(command, cwd=workspace, capture_output=True, text=True, timeout=120)
+        receipt["results"].append({"command": command, "exit": result.returncode, "stdout_tail": result.stdout[-2000:], "stderr_tail": result.stderr[-1000:]})
+    _write_json(campaign_dir / "l0-receipt.json", receipt)
+    _print_json({"l0": receipt}, )
+    if any(result["exit"] != 0 for result in receipt["results"]):
         raise SystemExit(1)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Prepare and drive the isolated Runtime endurance application campaign.")
     parser.add_argument("command", choices=["setup", "l0"])
-    args = parser.parse_args()
-    (setup if args.command == "setup" else l0)()
+    parser.add_argument("--campaign-dir", type=Path, default=CAMPAIGN)
+    parser.add_argument("--reset", action="store_true")
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--binary", type=Path, default=DEFAULT_BINARY)
+    args = parser.parse_args(argv)
+    if args.command == "setup":
+        setup(args.campaign_dir, reset=args.reset, yes=args.yes, binary=args.binary)
+    else:
+        l0(args.campaign_dir, binary=args.binary)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
