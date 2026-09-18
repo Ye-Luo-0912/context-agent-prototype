@@ -793,7 +793,11 @@ pub(crate) struct State {
     /// the target body sits only as a `(id, card hash)` row is applied when
     /// that card installs (batch drain, per-id service, or restore
     /// rehydration), so a loaded position and an unloaded cold card get the
-    /// same semantic outcome. Persisted and bounded
+    /// same semantic outcome. CTX-11 (B-1): each intent carries a bounded,
+    /// persisted target view — a causal creation bound (later-created
+    /// entries are never targets) and per-target settlement accounting
+    /// (one settled target does not consume the obligation for the rest).
+    /// Persisted and bounded
     /// (`reachability::PENDING_COLD_SEMANTIC_INTENT_CAP`, oldest dropped);
     /// see `reachability::PendingColdSemanticIntent`.
     #[serde(default)]
@@ -804,6 +808,18 @@ pub(crate) struct State {
     /// silently forgotten obligation.
     #[serde(default)]
     pub(crate) cold_semantic_intents_dropped: u64,
+    /// CTX-11 (B-1): how many intents recorded a target snapshot larger
+    /// than `reachability::COLD_INTENT_TARGET_SNAPSHOT_CAP` (the snapshot
+    /// keeps the oldest ids and is flagged truncated; a truncated intent
+    /// never claims completion). Honest bounded-accounting fact.
+    #[serde(default)]
+    pub(crate) cold_semantic_intent_snapshots_truncated: u64,
+    /// CTX-11 (B-1): how many intents filled their settled-target set
+    /// (`reachability::COLD_INTENT_SETTLED_TARGETS_CAP`) and stopped
+    /// growing the accounting — the real settlements are never blocked by
+    /// it. Honest bounded-accounting fact.
+    #[serde(default)]
+    pub(crate) cold_semantic_intent_settlement_overflows: u64,
     /// Segment-local reactivation instrumentation. Skipped in checkpoints
     /// and zeroed on restore; run-global aggregation is event-side.
     #[serde(skip)]

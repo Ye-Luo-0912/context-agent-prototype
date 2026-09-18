@@ -175,6 +175,17 @@ fn names_the_same_requirement_in(content: &str, older_text: &str) -> bool {
     if has_retention_protection(content) {
         return false;
     }
+    names_the_same_requirement_proven(content, older_text)
+}
+
+/// The three proof branches of [`names_the_same_requirement_in`] *without*
+/// the retention guard. CTX-11 (B-1): a deferred cold intent's
+/// retention/negation conclusion is fixed once at record time over the FULL
+/// input and carried by the intent itself, so the application path must
+/// never re-judge a truncated diagnostic copy — the copy can only lose
+/// positive evidence (conservative), never re-introduce a veto that the
+/// full text did not have.
+fn names_the_same_requirement_proven(content: &str, older_text: &str) -> bool {
     // A verbatim run of several words is the strongest available proof:
     // "replace the AuthService.rs 5-second timeout with …" quotes the line
     // it withdraws. CTX-2: the run must contain at least one CONTENT word —
@@ -660,11 +671,142 @@ pub(crate) fn queue_error_verifications(
 pub(crate) const PENDING_COLD_SEMANTIC_INTENT_CAP: usize = 64;
 
 /// CTX-11 (H2): bounded copy of the superseding message content carried by a
-/// deferred Supersede intent. The installed entry is matched against this
-/// copy with [`names_the_same_requirement_in`], so the bound must leave the
-/// requirement words intact; 4000 chars is far beyond any real decision
-/// message (the engine itself clips item bodies tighter).
+/// deferred Supersede intent. CTX-11 (B-1): the copy is the *diagnostic and
+/// positive-proof text* only — the retention/negation conclusion is decided
+/// at record time over the full input, so the truncation can only lose
+/// positive evidence (conservative coexistence), never flip a keep into a
+/// revoke. 4000 chars is far beyond any real decision message (the engine
+/// itself clips item bodies tighter).
 const COLD_INTENT_CONTENT_MAX_CHARS: usize = 4000;
+
+/// CTX-11 (B-1): cap of one intent's record-time target snapshot. The
+/// pending cold rows present when the intent was recorded are its *known*
+/// target universe; beyond the cap the snapshot is truncated and flagged —
+/// the obligation then never claims completion (retention is governed by
+/// the ring), while settlement itself stays independent of the snapshot.
+pub(crate) const COLD_INTENT_TARGET_SNAPSHOT_CAP: usize = 64;
+
+/// CTX-11 (B-1): cap of one intent's settled-target identity set. The set
+/// exists for idempotent re-entry accounting and honest overflow counting,
+/// never for the settlement itself — an overflow is counted and the real
+/// terminal transition still happens.
+pub(crate) const COLD_INTENT_SETTLED_TARGETS_CAP: usize = 16;
+
+/// CTX-11 (B-1): bounded, persisted target accounting of one deferred cold
+/// intent — the target set and causal boundary of the update obligation.
+///
+/// - `bound_event_seq` is the engine's monotonic event-sequence clock read
+///   at record time. An entry whose creation tick is **above** the bound was
+///   created *after* the revocation/verification was stated and is never a
+///   target of this intent, however well it matches: a requirement stated
+///   later cannot be revoked by an earlier withdrawal. The serde default is
+///   `u64::MAX` so pre-B-1 checkpoints keep their H2 semantics (unbounded).
+/// - `candidates` is the bounded snapshot of pending cold-card ids at record
+///   time — the set of targets knowable *then*. An intent is consumed only
+///   when every candidate has been observed on an install (settled, already
+///   terminal, or resolved as not-a-target) and at least one target was
+///   settled; a truncated snapshot never claims completion.
+/// - `settled` is the bounded identity set of settled/terminal-observed
+///   targets (idempotent re-entry does not double-count).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ColdIntentTargetView {
+    #[serde(default = "default_cold_intent_bound")]
+    pub(crate) bound_event_seq: u64,
+    #[serde(default)]
+    pub(crate) candidates: Vec<ContextItemId>,
+    #[serde(default)]
+    pub(crate) candidates_truncated: bool,
+    #[serde(default)]
+    pub(crate) settled: Vec<ContextItemId>,
+    #[serde(default)]
+    pub(crate) settlement_overflowed: bool,
+}
+
+/// Pre-B-1 checkpoints carry no bound: keep the H2 behavior (unbounded)
+/// instead of quietly narrowing old persisted obligations.
+fn default_cold_intent_bound() -> u64 {
+    u64::MAX
+}
+
+impl Default for ColdIntentTargetView {
+    fn default() -> Self {
+        // The default is the pre-B-1-compatible view: unbounded causal
+        // bound, empty accounting. Only restored old checkpoints see it;
+        // recorded intents always build their view via `for_record`.
+        Self {
+            bound_event_seq: default_cold_intent_bound(),
+            candidates: Vec::new(),
+            candidates_truncated: false,
+            settled: Vec::new(),
+            settlement_overflowed: false,
+        }
+    }
+}
+
+impl ColdIntentTargetView {
+    /// Record-time view: causal bound = the current event-sequence clock
+    /// (everything created so far is a possible target, nothing later is),
+    /// plus the bounded snapshot of the pending cold rows.
+    fn for_record(state: &mut State) -> Self {
+        let bound_event_seq = state.event_seq;
+        let candidates: Vec<ContextItemId> = state
+            .pending_external_cards
+            .iter()
+            .take(COLD_INTENT_TARGET_SNAPSHOT_CAP)
+            .map(|(id, _)| *id)
+            .collect();
+        let candidates_truncated =
+            state.pending_external_cards.len() > COLD_INTENT_TARGET_SNAPSHOT_CAP;
+        if candidates_truncated {
+            state.cold_semantic_intent_snapshots_truncated = state
+                .cold_semantic_intent_snapshots_truncated
+                .saturating_add(1);
+        }
+        Self {
+            bound_event_seq,
+            candidates,
+            candidates_truncated,
+            settled: Vec::new(),
+            settlement_overflowed: false,
+        }
+    }
+
+    /// CTX-11 (B-1): the obligation is complete — and the intent consumed —
+    /// only when the record-time snapshot was fully observed (every
+    /// candidate settled, terminal on re-entry, or resolved as not-a-target)
+    /// and at least one target was actually settled. A truncated snapshot or
+    /// a never-settled intent stays queued; retention there is governed by
+    /// the ring cap and its overflow counter, never unbounded.
+    fn obligation_complete(&self) -> bool {
+        !self.candidates_truncated && self.candidates.is_empty() && !self.settled.is_empty()
+    }
+
+    /// A candidate was observed on an install and resolved as *not* a target
+    /// of this intent.
+    fn resolve_candidate(&mut self, id: ContextItemId) {
+        self.candidates.retain(|candidate| *candidate != id);
+    }
+
+    /// Record a settled (or terminal-on-re-entry) target: shrink the open
+    /// candidate set and account the identity once. Bounded with honest
+    /// overflow — the accounting never blocks the settlement itself.
+    fn mark_settled(&mut self, state: &mut State, id: ContextItemId) {
+        self.resolve_candidate(id);
+        if self.settled.contains(&id) {
+            return;
+        }
+        if self.settled.len() >= COLD_INTENT_SETTLED_TARGETS_CAP {
+            if !self.settlement_overflowed {
+                self.settlement_overflowed = true;
+                state.cold_semantic_intent_settlement_overflows = state
+                    .cold_semantic_intent_settlement_overflows
+                    .saturating_add(1);
+            }
+            return;
+        }
+        self.settled.push(id);
+    }
+}
 
 /// CTX-11 (H2): one deferred semantic intent whose target body currently
 /// sits only as an unloaded cold card (`State::pending_external_cards`).
@@ -675,11 +817,23 @@ const COLD_INTENT_CONTENT_MAX_CHARS: usize = 4000;
 ///   [`queue_decision_supersessions`]: Decision kind (or core Decision
 ///   tag), same task context (`None` for session-level, compared like the
 ///   loaded scan compares it), exact entity match, and
-///   [`names_the_same_requirement_in`] over the stored summary.
+///   [`names_the_same_requirement_proven`] over the stored summary. The
+///   retention/negation check is NOT re-run here: it was decided once at
+///   record time over the full input (a retention-protected message is
+///   never recorded at all), so a 4000-char copy can never flip a keep
+///   into a revoke (CTX-11 B-1c).
 /// - [`PendingColdSemanticIntent::Verify`] mirrors
 ///   [`queue_error_verifications`]: Error kind, same task, same immutable
 ///   [`agent_contracts::VerificationProbe`] — re-checked against
-///   [`has_matching_verification_evidence`] at application time.
+///   [`has_matching_verification_evidence`] at application time as a
+///   *three-state* decision (CTX-11 B-1d): evidence proves the target →
+///   settle; evidence unreadable → Unresolved (the intent is retained, not
+///   consumed, no terminal state); shape mismatch → not applicable.
+///
+/// Every variant carries a [`ColdIntentTargetView`]: the causal bound
+/// (created-after-the-intent entries are never targets) and the bounded
+/// target accounting (settling one target leaves the others open; the
+/// intent is consumed only when its whole known target universe resolved).
 ///
 /// Persisted with `State`; a checkpoint/restore round trip neither drops
 /// the intent nor revives a finalized target.
@@ -690,17 +844,36 @@ pub(crate) enum PendingColdSemanticIntent {
         task_id: Option<agent_contracts::TaskId>,
         /// Exact `extract_entities` signature of the superseding message.
         entities: Vec<String>,
-        /// Bounded copy of the superseding message, matched against the
-        /// installed entry's stored summary.
+        /// Bounded copy of the superseding message: the positive-proof and
+        /// diagnostic text. The retention conclusion over the full input is
+        /// implied by the intent's existence — a protected message is never
+        /// recorded (CTX-11 B-1c).
         content: String,
         reason: String,
+        #[serde(default)]
+        target_view: ColdIntentTargetView,
     },
     Verify {
         by_id: ContextItemId,
         task_id: agent_contracts::TaskId,
         probe: agent_contracts::VerificationProbe,
         reason: String,
+        #[serde(default)]
+        target_view: ColdIntentTargetView,
     },
+}
+
+impl PendingColdSemanticIntent {
+    fn target_view(&self) -> &ColdIntentTargetView {
+        match self {
+            Self::Supersede { target_view, .. } | Self::Verify { target_view, .. } => target_view,
+        }
+    }
+
+    /// See [`ColdIntentTargetView::obligation_complete`].
+    fn obligation_complete(&self) -> bool {
+        self.target_view().obligation_complete()
+    }
 }
 
 /// CTX-11 (H2): record a deferred supersession against still-pending cold
@@ -708,9 +881,12 @@ pub(crate) enum PendingColdSemanticIntent {
 /// [`queue_decision_supersessions`] and under its exact gate (decision
 /// classification, non-empty entity signature, explicit replacement cue) so
 /// the deferred path can never widen what counts as a withdrawal; nothing
-/// is recorded when no cold card is pending, and retention-protected
-/// messages are rejected by the same [`has_retention_protection`] gate at
-/// application time.
+/// is recorded when no cold card is pending.
+///
+/// CTX-11 (B-1c): the retention/negation check runs HERE, once, over the
+/// full input — the same check the loaded path applies per target. A
+/// retention-protected message is not a withdrawal at all, so no intent is
+/// recorded and the application path never re-judges a truncated copy.
 pub(crate) fn record_cold_supersession_intent(
     state: &mut State,
     content: &str,
@@ -724,7 +900,11 @@ pub(crate) fn record_cold_supersession_intent(
     if entities.is_empty() || !has_replacement_cue(content) {
         return;
     }
+    if has_retention_protection(content) {
+        return;
+    }
     let snippet: String = content.chars().take(60).collect();
+    let target_view = ColdIntentTargetView::for_record(state);
     push_cold_intent(
         state,
         PendingColdSemanticIntent::Supersede {
@@ -739,6 +919,7 @@ pub(crate) fn record_cold_supersession_intent(
                 "superseded by decision at turn {}: '{snippet}' (recorded while the body waited on a pending cold card)",
                 state.turn
             ),
+            target_view,
         },
     );
 }
@@ -747,7 +928,8 @@ pub(crate) fn record_cold_supersession_intent(
 /// cards. Mirrors the [`queue_error_verifications`] call site: only a
 /// successful trusted probe (`task_id` + `probe` both present — a success
 /// without a recipe identity proves nothing) with pending cold cards
-/// records an intent.
+/// records an intent. The evidence re-check happens at application time as
+/// a three-state decision (CTX-11 B-1d), never as shape-matching-consumes.
 pub(crate) fn record_cold_verification_intent(
     state: &mut State,
     by_id: ContextItemId,
@@ -758,6 +940,7 @@ pub(crate) fn record_cold_verification_intent(
     if state.pending_external_cards.is_empty() {
         return;
     }
+    let target_view = ColdIntentTargetView::for_record(state);
     push_cold_intent(
         state,
         PendingColdSemanticIntent::Verify {
@@ -765,6 +948,7 @@ pub(crate) fn record_cold_verification_intent(
             task_id,
             probe,
             reason,
+            target_view,
         },
     );
 }
@@ -784,13 +968,12 @@ fn push_cold_intent(state: &mut State, intent: PendingColdSemanticIntent) {
 /// stays independent of where the body currently sits — the same rule the
 /// loaded-position scans already guarantee.
 ///
-/// An intent whose identity matches an installed entry is consumed: applied
-/// when the entry is live (the transition lands in
-/// `state.pending_ingest_transitions`, surfaced by the next maintenance
-/// report), a no-op when it is already terminal (idempotent — the card
-/// preserved the finalized state). An intent that matches nothing stays
-/// queued for a later install; a failed, cancelled or oversized install
-/// never reaches this function and leaves the ring untouched.
+/// CTX-11 (B-1): settlement is per target. One intent may match many
+/// entries (by task/entity/requirement/probe); settling one never consumes
+/// the obligation for the others. An intent is consumed only when its whole
+/// record-time target universe resolved and something settled; a failed,
+/// cancelled or oversized install never reaches this function and leaves
+/// the ring untouched.
 pub(crate) fn apply_cold_semantic_intents_on_install(
     state: &mut State,
     installed: &[&agent_contracts::ExternalizedContext],
@@ -800,28 +983,44 @@ pub(crate) fn apply_cold_semantic_intents_on_install(
     }
     let intents = std::mem::take(&mut state.pending_cold_semantic_intents);
     let mut retained: Vec<PendingColdSemanticIntent> = Vec::with_capacity(intents.len());
-    for intent in intents {
-        let mut consumed = false;
+    for mut intent in intents {
         for entry in installed {
-            if apply_cold_intent_to_entry(state, &intent, entry) {
-                consumed = true;
-            }
+            apply_cold_intent_to_entry(state, &mut intent, entry);
         }
-        if !consumed {
+        if !intent.obligation_complete() {
             retained.push(intent);
         }
     }
     state.pending_cold_semantic_intents = retained;
 }
 
-/// Apply one intent to one installed entry. Returns whether the intent's
-/// identity matched (and was therefore consumed) — regardless of whether
-/// the entry was live or already terminal.
+/// Outcome of one intent against one installed entry. The distinction is
+/// the fix for "shape matching consumes": only `Settled` and
+/// `AlreadyTerminal` resolve a target; `Unresolved` keeps the obligation
+/// open and `NotTarget` merely resolves a record-time candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdIntentApplication {
+    /// Identity mismatch, or the entry was created after the intent's
+    /// causal bound (CTX-11 B-1a: a later requirement is never revoked by
+    /// an earlier withdrawal), or the requirement proof does not hold.
+    NotTarget,
+    /// Live target settled to its terminal state this time.
+    Settled,
+    /// Matching target already terminal (the card preserved the outcome):
+    /// idempotent re-entry, accounted once, no duplicate transition.
+    AlreadyTerminal,
+    /// (Verify only) shape matches but the `by` evidence is not currently
+    /// readable: no terminal state, no consumption, no candidate resolution.
+    Unresolved,
+}
+
+/// Apply one intent to one installed entry, mutating the intent's target
+/// accounting. See [`ColdIntentApplication`] for the outcome semantics.
 fn apply_cold_intent_to_entry(
     state: &mut State,
-    intent: &PendingColdSemanticIntent,
+    intent: &mut PendingColdSemanticIntent,
     entry: &agent_contracts::ExternalizedContext,
-) -> bool {
+) -> ColdIntentApplication {
     let turn = state.turn;
     match intent {
         PendingColdSemanticIntent::Supersede {
@@ -830,22 +1029,32 @@ fn apply_cold_intent_to_entry(
             entities,
             content,
             reason,
+            target_view,
         } => {
             // Exact mirrors of the `queue_decision_supersessions` external
             // branch: same kind rule, same task comparison (None for
             // session-level equals None), exact entity identity and the
             // same summary-level requirement proof.
-            let matches = entry.item_id != *by_id
+            let shape = entry.item_id != *by_id
                 && (entry.kind == ContextKind::Decision
                     || entry
                         .tags
                         .iter()
                         .any(|tag| tag.is_core(CoreLabel::Decision)))
                 && entry.task_id == *task_id
-                && entities_match_exact(entities, &entry.entities)
-                && names_the_same_requirement_in(content, &entry.context_ref.summary);
-            if !matches {
-                return false;
+                && entities_match_exact(entities, &entry.entities);
+            // CTX-11 (B-1a): the causal bound. A matching entry created
+            // AFTER the intent was recorded is never its target.
+            if !shape || entry.created_tick > target_view.bound_event_seq {
+                target_view.resolve_candidate(entry.item_id);
+                return ColdIntentApplication::NotTarget;
+            }
+            // The retention conclusion was fixed at record time over the
+            // full input (see the enum doc); the stored copy only carries
+            // the positive proof.
+            if !names_the_same_requirement_proven(content, &entry.context_ref.summary) {
+                target_view.resolve_candidate(entry.item_id);
+                return ColdIntentApplication::NotTarget;
             }
             if !entry.semantic.is_dead()
                 && let Some(transition) = apply_terminal_semantic(
@@ -857,27 +1066,40 @@ fn apply_cold_intent_to_entry(
                 )
             {
                 state.pending_ingest_transitions.push(transition);
+                target_view.mark_settled(state, entry.item_id);
+                return ColdIntentApplication::Settled;
             }
-            true
+            // A terminal card re-entering: the obligation against it is
+            // fulfilled (idempotent, no duplicate settlement).
+            target_view.mark_settled(state, entry.item_id);
+            ColdIntentApplication::AlreadyTerminal
         }
         PendingColdSemanticIntent::Verify {
             by_id,
             task_id,
             probe,
             reason,
+            target_view,
         } => {
-            let matches = entry.item_id != *by_id
+            let shape = entry.item_id != *by_id
                 && entry.kind == ContextKind::Error
                 && entry.task_id == Some(*task_id)
                 && entry.verify_recipe.as_ref() == Some(probe);
-            if !matches {
-                return false;
+            if !shape || entry.created_tick > target_view.bound_event_seq {
+                target_view.resolve_candidate(entry.item_id);
+                return ColdIntentApplication::NotTarget;
+            }
+            // A terminal card re-entering is idempotent, exactly like the
+            // Supersede path: the card preserved the finalized state.
+            if entry.semantic.is_dead() {
+                target_view.mark_settled(state, entry.item_id);
+                return ColdIntentApplication::AlreadyTerminal;
             }
             // Same evidence re-check `drain_verifications` applies to its
-            // persisted queue: the target must still be live and the `by`
-            // observation must still prove the same task and probe.
-            if !entry.semantic.is_dead()
-                && has_matching_verification_evidence(state, entry.item_id, *by_id)
+            // persisted queue: the `by` observation must still prove the
+            // same task and probe. CTX-11 (B-1d): an unreadable evidence is
+            // *Unresolved*, not a consumption — the obligation stays open.
+            if has_matching_verification_evidence(state, entry.item_id, *by_id)
                 && let Some(transition) = apply_terminal_semantic(
                     state,
                     entry.item_id,
@@ -887,8 +1109,16 @@ fn apply_cold_intent_to_entry(
                 )
             {
                 state.pending_ingest_transitions.push(transition);
+                target_view.mark_settled(state, entry.item_id);
+                return ColdIntentApplication::Settled;
             }
-            true
+            if has_matching_verification_evidence(state, entry.item_id, *by_id) {
+                // Raced to terminal between the two checks: same idempotent
+                // accounting as a terminal re-entry.
+                target_view.mark_settled(state, entry.item_id);
+                return ColdIntentApplication::AlreadyTerminal;
+            }
+            ColdIntentApplication::Unresolved
         }
     }
 }
