@@ -64,6 +64,9 @@ pub enum CheckpointDebtReason {
     /// without a snapshot a later `--restore=latest` finds nothing and the
     /// task cannot be continued across processes.
     BudgetStopYield,
+    /// A settled failed turn must retain its latest accepted directive and
+    /// execution facts before publishing the terminal and dropping the frame.
+    FailedTurnYield,
 }
 
 impl CheckpointDebtReason {
@@ -76,6 +79,7 @@ impl CheckpointDebtReason {
             Self::CompletionCommitFailed => "completion_commit_failed",
             Self::CompletionRepairChanged => "completion_repair_changed",
             Self::BudgetStopYield => "budget_stop_yield",
+            Self::FailedTurnYield => "failed_turn_yield",
         }
     }
 }

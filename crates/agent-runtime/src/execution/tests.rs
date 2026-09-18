@@ -1438,6 +1438,38 @@ fn fs_read_same_digest_is_redundant_and_new_digest_advances() {
 }
 
 #[test]
+fn fs_read_disjoint_windows_remain_redundant_after_an_abab_loop() {
+    let mut resume = ExecutionState::default();
+    let read = |start: u32, end: u32| {
+        let mut out = read_output("src/auth.rs", "abc123");
+        out.model_content = format!("lines {start}-{end}");
+        out.metadata["start_line"] = json!(start);
+        out.metadata["end_line"] = json!(end);
+        out
+    };
+
+    assert_eq!(
+        resume.observe_tool(&read(1, 100), 1, 1).delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced
+    );
+    assert_eq!(
+        resume.observe_tool(&read(101, 200), 1, 2).delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced,
+        "a previously uncovered range is new evidence"
+    );
+    assert_eq!(
+        resume.observe_tool(&read(1, 100), 1, 3).delta,
+        agent_contracts::FrontierDelta::RedundantEvidence
+    );
+    assert_eq!(
+        resume.observe_tool(&read(101, 200), 1, 4).delta,
+        agent_contracts::FrontierDelta::RedundantEvidence
+    );
+    assert_eq!(resume.evidence.len(), 1);
+    assert_eq!(resume.evidence[0].coverage.len(), 2);
+}
+
+#[test]
 fn known_edit_advances_world_and_invalidates_revision_bound_evidence() {
     let mut resume = ExecutionState::default();
     resume.observe_tool(&git_status(), 1, 1);
@@ -2052,6 +2084,7 @@ fn restore_rejects_oversized_frontier_fields() {
             current: true,
             turn: 1,
             evidence_ref: None,
+            coverage: Vec::new(),
         });
     }
     assert!(validate_execution_state(&state).is_err());
@@ -2067,8 +2100,38 @@ fn restore_rejects_oversized_frontier_fields() {
         current: true,
         turn: 1,
         evidence_ref: None,
+        coverage: Vec::new(),
     });
     assert!(validate_execution_state(&long_key).is_err());
+
+    let mut coverage_overflow = ExecutionState::default();
+    coverage_overflow
+        .evidence
+        .push(agent_contracts::ExecutionEvidence {
+            key: "fs.read:src/auth.rs".into(),
+            outcome: "ok".into(),
+            observed_world_revision: 1,
+            validity: agent_contracts::EvidenceValidity::Resource {
+                path: "src/auth.rs".into(),
+                digest: "rev-1".into(),
+            },
+            argument_digest: String::new(),
+            outcome_digest: String::new(),
+            current: true,
+            turn: 1,
+            evidence_ref: None,
+            coverage: (0..=agent_contracts::MAX_VISIBLE_BODY_WINDOWS)
+                .map(|index| agent_contracts::FileBodyWindow {
+                    path: "src/auth.rs".into(),
+                    revision: Some("rev-1".into()),
+                    start_line: Some(index as u32 + 1),
+                    end_line: Some(index as u32 + 1),
+                    covers_file: false,
+                    complete: true,
+                })
+                .collect(),
+        });
+    assert!(validate_execution_state(&coverage_overflow).is_err());
 
     let mut negative_overflow = ExecutionState::default();
     for index in 0..=MAX_NEGATIVE_FACTS {
@@ -2704,7 +2767,7 @@ fn failure_after_trusted_verification_reblocks_readiness() {
 }
 
 #[test]
-fn stall_advice_emits_once_per_non_advancing_period() {
+fn stall_advice_persists_through_non_advancing_projections() {
     let mut state = ExecutionState {
         stall: StallState {
             consecutive_no_progress: STALL_THRESHOLD,
@@ -2719,11 +2782,11 @@ fn stall_advice_emits_once_per_non_advancing_period() {
         first.stall_warning.is_some(),
         "first projection of a stalled period must emit the hint"
     );
-    assert!(state.stall_advice_emitted);
+    assert!(!state.stall_advice_emitted);
     let second = state.view_emitting();
     assert!(
-        second.stall_warning.is_none(),
-        "the same stalled period must not repeat the hint"
+        second.stall_warning.is_some(),
+        "the current stalled state must remain visible on every model projection"
     );
 
     // A provable advance ends the period; the next stall re-emits.
@@ -2743,7 +2806,7 @@ fn stall_advice_emits_once_per_non_advancing_period() {
 }
 
 #[test]
-fn frontier_advice_emits_once_until_an_advance() {
+fn frontier_advice_persists_until_an_advance() {
     let mut state = ExecutionState::default();
     state.convergence.actions_since_frontier_advance = FRONTIER_ADVISORY_THRESHOLD;
     let first = state.view_emitting();
@@ -2751,11 +2814,11 @@ fn frontier_advice_emits_once_until_an_advance() {
         first.frontier_warning.is_some(),
         "first projection past the frontier threshold must emit the advisory"
     );
-    assert!(state.frontier_advice_emitted);
+    assert!(!state.frontier_advice_emitted);
     let second = state.view_emitting();
     assert!(
-        second.frontier_warning.is_none(),
-        "the same non-advancing period must not repeat the advisory"
+        second.frontier_warning.is_some(),
+        "the current frontier debt must remain visible on every model projection"
     );
 
     state.observe_tool(&read_output("src/auth.rs", "rev-advance"), 1, 7);
@@ -2779,17 +2842,18 @@ fn emission_ledger_survives_resume_serialization() {
         },
         ..Default::default()
     };
-    let _ = state.view_emitting();
-    assert!(state.stall_advice_emitted);
+    let first = state.view_emitting();
+    assert!(first.stall_warning.is_some());
+    assert!(!state.stall_advice_emitted);
     let wire = serde_json::to_string(&state).expect("ExecutionState must serialize");
     let mut back: ExecutionState =
         serde_json::from_str(&wire).expect("ExecutionState must deserialize");
-    assert!(back.stall_advice_emitted);
+    assert!(!back.stall_advice_emitted);
     assert!(!back.frontier_advice_emitted);
-    // A restored mid-period state keeps suppressing the same hint.
+    // A restored mid-period state keeps projecting the same current hint.
     assert!(
-        back.view_emitting().stall_warning.is_none(),
-        "restoring an emitted period must not re-arm the hint"
+        back.view_emitting().stall_warning.is_some(),
+        "restoring a stalled period must preserve its current hint"
     );
 }
 

@@ -31,7 +31,8 @@ planner；Context GC 维持冻结。
 ## P1 — Execution Evidence Frontier（CONV-01）
 
 - [x] 8. 定义最小词汇：ExecutionEvidence { key, outcome,
-      observed_world_revision, validity, argument_digest, evidence_ref }，
+      observed_world_revision, validity, argument_digest, evidence_ref,
+      bounded fs.read coverage }，
       validity ∈ { Turn, WorkspaceRevision(N), Resource(path@digest) }。
       （评审 8）——类型在 agent-contracts::context，随 ExecutionState
       持久化（serde default 向后兼容）。

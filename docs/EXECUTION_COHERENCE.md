@@ -328,7 +328,9 @@ clear the stall signature, the failure cluster, and
 active failure cluster. Successful read-only observations
 (`git.status`/`git.diff` keyed by tool at `WorkspaceRevision(n)`;
 path-carrying reads keyed `tool:path` at `Resource{path@digest}`) enter
-a bounded evidence table (≤16 rows, newest-first). Invalidated rows remain
+a bounded evidence table (≤16 rows, newest-first) with bounded
+`FileBodyWindow` coverage for disjoint reads of one resource version.
+Invalidated rows remain
 non-current in that same bounded table only as semantic fingerprints and
 never project into TaskProgress; a matching result can therefore repair
 currentness without being counted as `EvidenceAdvanced`. Each round emits
@@ -338,9 +340,21 @@ one bounded
 `frontier_no_advance_peak`,
 `evidence_invalidations` from the event stream alone. After 5
 non-advance actions the TASK PROGRESS view renders a soft advisory:
-"EXECUTION FRONTIER UNCHANGED …". TASK PROGRESS carries typed fields
+"EXECUTION FRONTIER UNCHANGED …". The warning remains in the current model
+projection until a provable frontier advance resets the state; it is not
+consumed as a one-shot notification. TASK PROGRESS carries typed fields
 only (identities / enums / digests / counts); raw bodies stay in the
 user-role layer or artifacts.
+
+Each BeforeModel snapshot also projects the actor's configured decision budget
+(current round, maximum and remaining decisions). For budgets greater than one,
+the last decision reserves a text-only response inside that same budget, with
+`DecisionBudgetFinalization` in the surface audit. It reports verified results
+and unfinished work; it does not dispatch effects, close the durable task or
+mint acceptance. One-decision probes retain their original execution semantics.
+If a model disregards the empty surface, existing surface enforcement and the
+hard round limit still apply. Cancellation, provider failure and recovery fencing
+can still end a run before an answer is available.
 
 Task relevance is derived from the same trusted host attribution plus Runtime
 task authority used by execution-policy checks. On a new directive,
@@ -635,7 +649,7 @@ change any conclusion.
 
 ### Protocol body cache (PROTO-EVID-01/02/03, landed)
 
-A per-turn LRU (≤4 entries, ≤8 KiB each, `ActiveTurn` lifetime) keeps
+A per-turn LRU (≤4 entries, ≤16 KiB each, ≤32 KiB total, `ActiveTurn` lifetime) keeps
 recently observed file bodies from successful `fs.read` results only —
 an edit echo is a patch echo, not the exact body, and never enters the
 cache. A Known mutation physically drops its touched paths; an Unknown
@@ -644,7 +658,11 @@ mutation **suspends** every entry — bytes retained, eligibility frozen
 revalidation proving the identical path@digest Fresh revives it.
 During assembly selection is checkpoint-demand driven: Runtime compares the
 bounded full `ActiveTurn` with the retained six-exchange tail and selects at
-most four exact spilled `fs.read` bodies (≤8 KiB each). The full frame is
+most four exact spilled `fs.read` bodies (≤16 KiB each, ≤32 KiB total).
+Selection streams newest reads first; freshness, range coverage and byte
+admission precede the output cap. Rejected candidates and duplicate reads
+consume no output slots. The source scan is bounded by the existing open-turn
+frame, while the selected set remains fixed-size. The full frame is
 already the open-turn audit backing, so an older demanded body remains
 available even when a latest-read LRU retained newer rows still in the tail.
 A body is re-injected
@@ -652,8 +670,10 @@ as a **user-role context-frame message** (never the Focus frame, which
 renders as System policy — PROMPT-AUTH-01) only when the turn checkpoint
 actually truncated that read, the TASK PROGRESS fact is still Fresh, and
 the digest is identical. Cache rows never enter the context engine, are
-never admitted, and never persist. `eligible` counts actual fresh checkpoint
-demand, not all cache rows, so tail-resident rows do not inflate misses.
+never admitted, and never persist. `eligible` is a bounded sample (up to 16
+distinct windows) of fresh checkpoint demand, not all cache rows, so
+tail-resident rows do not inflate misses. This diagnostic sample does not
+truncate the selection scan.
 Every assembly emits one bounded `ProtocolBodyCacheStats` event
 (eligible / hit / miss / invalidated /
 suspended / oversize / restored_body_tokens), so hit-rate claims are
@@ -961,6 +981,15 @@ The state-driven safe-point substrate is now present:
 5. Explicit pause/suspend/completion/shutdown waits for a durable checkpoint
    acknowledgement. Background failure keeps checkpoint debt visible and
    retryable; it cannot claim that the task is safely resumable.
+
+A safely settled failed model decision is also a continuation boundary. Before
+dropping its ActiveTurn, Runtime accrues `FailedTurnYield`, drains older captures,
+installs the latest accepted directive/execution state into the existing task
+snapshot, and waits for durability before `TurnFailed`. Checkpoint maintenance
+parks this failure tail on the existing operation lane. Storage or maintenance
+failure fences continuation; unconfirmed effects or cleanup never enter this
+safe snapshot path. Successful read-only exploration still accrues no additional
+per-read debt. This does not replay a model/tool call or change task completion.
 
 The bounded next action/open-loop update reuses the proposed Runtime-owned
 `task.manage` control with TaskAnchor CAS. Its first slice is task-required or

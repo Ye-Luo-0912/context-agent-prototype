@@ -5,6 +5,7 @@
 mod completion;
 mod directive;
 mod effects;
+mod failure_resume;
 mod focus;
 mod harness;
 mod ingest_cancel;

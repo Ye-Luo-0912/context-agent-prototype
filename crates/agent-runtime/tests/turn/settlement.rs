@@ -1614,8 +1614,8 @@ async fn task_progress_block_stays_within_cap_when_settlement_projected() {
     {
         let captured = requests.lock().unwrap();
         assert!(
-            !captured[0].contains("TASK PROGRESS anchor_rev="),
-            "before any mutation the progress view is empty and renders no block"
+            captured[0].contains("DECISION BUDGET: round 1 of"),
+            "before any mutation the actor still projects its real decision budget"
         );
         let mut measured = 0;
         for request in captured.iter() {
@@ -1629,8 +1629,8 @@ async fn task_progress_block_stays_within_cap_when_settlement_projected() {
             }
         }
         assert_eq!(
-            measured, 2,
-            "the write and the verified rounds both carry a bounded TASK PROGRESS block"
+            measured, 3,
+            "all decisions carry a bounded TASK PROGRESS block, including the budget-only first round"
         );
     }
     instance.shutdown().await.unwrap();

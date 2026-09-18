@@ -20,8 +20,10 @@ use agent_contracts::FileBodyWindow;
 
 /// 最多缓存的正文件数。
 pub(crate) const MAX_PROTOCOL_BODIES: usize = 4;
-/// 单份正文的最大字节数；超限不缓存（长正文本来就该走 artifact）。
-pub(crate) const MAX_PROTOCOL_BODY_BYTES: usize = 8 * 1024;
+/// A normal bounded tool window may exceed 8KiB. Let complete windows share
+/// the same aggregate budget instead of rejecting them at a smaller row cap.
+pub(crate) const MAX_PROTOCOL_BODY_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_PROTOCOL_BODY_TOTAL_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProtocolBodyEntry {
@@ -104,7 +106,14 @@ impl ProtocolBodyCache {
             }),
             dormant: false,
         });
-        while self.entries.len() > MAX_PROTOCOL_BODIES {
+        while self.entries.len() > MAX_PROTOCOL_BODIES
+            || self
+                .entries
+                .iter()
+                .map(|entry| entry.body.len())
+                .sum::<usize>()
+                > MAX_PROTOCOL_BODY_TOTAL_BYTES
+        {
             self.entries.pop_front();
         }
         BodyRecordOutcome::Stored
@@ -221,6 +230,18 @@ mod tests {
         // 超限拒收计入增量账目，drain 后归零。
         assert_eq!(cache.drain_deltas().oversize, 1);
         assert_eq!(cache.drain_deltas(), ProtocolBodyCacheDeltas::default());
+    }
+
+    #[test]
+    fn larger_windows_share_a_fixed_total_byte_budget() {
+        let mut cache = ProtocolBodyCache::default();
+        for i in 0..6 {
+            cache.record(&format!("f{i}"), "v1", &"x".repeat(10_000), None);
+        }
+        let rows = cache.eligible_rows(&[]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].identity, "f5@v1");
+        assert!(rows.iter().map(|r| r.body.len()).sum::<usize>() <= MAX_PROTOCOL_BODY_TOTAL_BYTES);
     }
 
     #[test]

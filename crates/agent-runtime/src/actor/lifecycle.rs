@@ -71,6 +71,10 @@ impl RuntimeActor {
             Err(AgentError::InvalidRequest(
                 "a task-completion / checkpoint commit is settling; retry when it completes".into(),
             ))
+        } else if self.state.pending_failed_turn_checkpoint.is_some() {
+            Err(AgentError::InvalidRequest(
+                "a failed-turn checkpoint is settling; retry when it completes".into(),
+            ))
         } else {
             self.ensure_no_active_turn()
         }
@@ -588,6 +592,155 @@ impl RuntimeActor {
     /// durable lifecycle terminal only after the applied input and action
     /// batch have been settled.
     pub(super) async fn settle_failed_turn(
+        &mut self,
+        class: agent_contracts::RuntimeFailureClass,
+        retryable: bool,
+    ) {
+        // A failure is also a continuation boundary. Input lifecycle events
+        // and sealed input bodies alone do not update restore=latest.
+        let settled = self.state.turn.as_ref().is_some_and(|turn| {
+            turn.op.is_none()
+                && turn.pending_tools.is_empty()
+                && turn
+                    .action_batch
+                    .as_ref()
+                    .is_none_or(|batch| batch.requested == batch.terminal)
+        });
+        let healthy = !self.state.recovery_required
+            && self.state.pending_tool_cleanup.is_none()
+            && !matches!(
+                self.core.recovery_status(),
+                agent_contracts::AuthorityRecoveryStatus::RecoveryRequired { .. }
+            );
+        if class != agent_contracts::RuntimeFailureClass::RoundBudget
+            && settled
+            && healthy
+            && self.state.tasks.active().is_some()
+            && self.checkpoint_store().is_some()
+        {
+            if let Err(error) = self.settle_action_batch().await {
+                self.require_effect_recovery(format!(
+                    "failed-turn batch settlement failed: {error}"
+                ))
+                .await;
+            } else {
+                self.resume_failed_turn_checkpoint(class, retryable, false)
+                    .await;
+                return;
+            }
+        }
+        self.finish_failed_turn(class, retryable).await;
+    }
+
+    /// Runs on the existing checkpoint/operation lane. Slow checkpoint
+    /// maintenance parks this tail, leaving status/cancellation responsive.
+    pub(super) async fn resume_failed_turn_checkpoint(
+        &mut self,
+        class: agent_contracts::RuntimeFailureClass,
+        retryable: bool,
+        captured: bool,
+    ) {
+        let mut captured = captured;
+        // The boundary lane is single-owner. If an older idle completion/GC
+        // is still running, park only this failed-turn continuation and return
+        // to the actor loop; awaiting `checkpoint_prepare` here would make
+        // status/cancel commands wait behind unrelated maintenance.
+        if self.state.gc_work.is_some() {
+            // The first entry still has to admit the failed-turn debt and
+            // assemble its checkpoint. Do that before parking; otherwise the
+            // occupied lane would return without creating the checkpoint the
+            // continuation promises.
+            if !captured {
+                self.accrue_checkpoint_debt(
+                    crate::checkpoint::CheckpointDebtReason::FailedTurnYield,
+                );
+                self.safe_point_resume_commit().await;
+                captured = true;
+            }
+            if self.state.pending_failed_turn_checkpoint.is_none() {
+                self.state.pending_failed_turn_checkpoint =
+                    Some(super::maintenance::PendingFailedTurnCheckpoint {
+                        class,
+                        retryable,
+                        captured,
+                    });
+            }
+            return;
+        }
+        // Cancellation may have dropped the turn while this continuation was
+        // parked. Still land its already-admitted checkpoint preparation, but
+        // never publish a second TurnFailed terminal for a TurnCancelled turn.
+        if self.state.turn.is_none() {
+            if self.state.checkpoint_prepare.is_some()
+                && let Some(op_tx) = self.op_tx()
+            {
+                let _ = self
+                    .relay_checkpoint_prepare(
+                        super::maintenance::GcContinuation::SafepointFailure {
+                            class,
+                            retryable,
+                            captured,
+                        },
+                        &op_tx,
+                    )
+                    .await;
+            }
+            return;
+        }
+        if self.state.recovery_required {
+            self.finish_failed_turn(class, retryable).await;
+            return;
+        }
+        if self.state.checkpoint_prepare.is_some()
+            && let Some(op_tx) = self.op_tx()
+            && self
+                .relay_checkpoint_prepare(
+                    super::maintenance::GcContinuation::SafepointFailure {
+                        class,
+                        retryable,
+                        captured,
+                    },
+                    &op_tx,
+                )
+                .await
+        {
+            return;
+        }
+        if let Err(error) = self.await_pending_checkpoint().await {
+            self.require_effect_recovery(format!("failed-turn checkpoint barrier failed: {error}"))
+                .await;
+            self.finish_failed_turn(class, retryable).await;
+            return;
+        }
+        if !captured {
+            self.accrue_checkpoint_debt(crate::checkpoint::CheckpointDebtReason::FailedTurnYield);
+            self.safe_point_resume_commit().await;
+            if self.state.checkpoint_prepare.is_some()
+                && let Some(op_tx) = self.op_tx()
+                && self
+                    .relay_checkpoint_prepare(
+                        super::maintenance::GcContinuation::SafepointFailure {
+                            class,
+                            retryable,
+                            captured: true,
+                        },
+                        &op_tx,
+                    )
+                    .await
+            {
+                return;
+            }
+        }
+        // Includes capture/serialization failures which may leave no write
+        // handle: the required watermark and debt must both be satisfied.
+        if let Err(error) = self.continuation_durability_gate().await {
+            self.require_effect_recovery(format!("failed turn is not durably resumable: {error}"))
+                .await;
+        }
+        self.finish_failed_turn(class, retryable).await;
+    }
+
+    pub(super) async fn finish_failed_turn(
         &mut self,
         class: agent_contracts::RuntimeFailureClass,
         retryable: bool,

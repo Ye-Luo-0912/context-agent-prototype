@@ -2407,6 +2407,9 @@ pub enum ToolSurfaceOmissionReason {
     /// Runtime entered a bounded completion-repair finalization decision.
     /// This is a text-only model round, so no action schema is offered.
     CompletionFinalization,
+    /// The actor reserved the last configured decision for an honest final
+    /// response. This says nothing about durable task acceptance.
+    DecisionBudgetFinalization,
 }
 
 impl ToolSurfaceOmissionReason {
@@ -2417,6 +2420,7 @@ impl ToolSurfaceOmissionReason {
             Self::ProviderInputBudget => "provider input budget",
             Self::Unavailable => "not available at the safe point",
             Self::CompletionFinalization => "completion repair finalization",
+            Self::DecisionBudgetFinalization => "decision budget finalization",
         }
     }
 }

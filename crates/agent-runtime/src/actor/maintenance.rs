@@ -598,6 +598,17 @@ pub(super) struct PendingGc {
     task: JoinHandle<()>,
 }
 
+/// A failed model turn whose safe-point tail could not claim the single
+/// boundary lane because an older idle GC/completion boundary owns it. This
+/// is an actor-local continuation, not a second scheduler: the existing owner
+/// remains authoritative and the tail is retried only from that owner's
+/// completion path.
+pub(super) struct PendingFailedTurnCheckpoint {
+    pub(super) class: agent_contracts::RuntimeFailureClass,
+    pub(super) retryable: bool,
+    pub(super) captured: bool,
+}
+
 impl PendingGc {
     pub(super) fn new(
         operation_id: OperationId,
@@ -631,6 +642,13 @@ pub(super) enum GcContinuation {
         /// The turn's final assistant message for the tail's evidence write.
         content: String,
     },
+    /// Failed-turn terminal parked behind either a prior checkpoint or its
+    /// own latest-directive snapshot. No new scheduler or task state owner.
+    SafepointFailure {
+        class: agent_contracts::RuntimeFailureClass,
+        retryable: bool,
+        captured: bool,
+    },
     /// Post-completion boundary work. No turn owns it; cancellation never
     /// targets it, shutdown joins it bounded, and landed deletes stay facts.
     CompletionBoundary,
@@ -643,6 +661,8 @@ impl PendingGc {
         matches!(
             self.continuation,
             GcContinuation::CheckpointMaintain(CheckpointResume::TerminalFreeze(_))
+                | GcContinuation::SafepointCommit { .. }
+                | GcContinuation::SafepointFailure { .. }
         )
     }
 
@@ -1012,24 +1032,52 @@ impl RuntimeActor {
                     // bookkeeping, then resume the turn-commit tail that the
                     // TurnCompleted ordering barrier had to defer.
                     if let Some(prepare) = self.state.checkpoint_prepare.take() {
-                        let report = match report {
-                            Ok(report) => Some(Ok(report)),
-                            Err(error) => {
-                                self.restore_checkpoint_debt(&prepare.captured_debt);
-                                self.emit_checkpoint_write_failed(error.to_string()).await;
-                                Some(Err(error))
-                            }
-                        };
                         let _ = self
                             .land_safepoint_write(
                                 prepare.sequence,
                                 prepare.anchor_revision,
                                 prepare.captured_debt,
-                                report,
+                                Some(report),
                             )
                             .await;
                     }
                     self.finalize_turn_tail(content, op_tx).await;
+                }
+                (
+                    GcContinuation::SafepointFailure {
+                        class,
+                        retryable,
+                        captured,
+                    },
+                    GcOutcome::SafepointPrepareSettled(report),
+                ) => {
+                    if let Some(turn) = self.state.turn.as_mut() {
+                        turn.op = None;
+                    }
+                    if let Some(prepare) = self.state.checkpoint_prepare.take() {
+                        match report {
+                            Ok(report) => {
+                                self.land_safepoint_write(
+                                    prepare.sequence,
+                                    prepare.anchor_revision,
+                                    prepare.captured_debt,
+                                    Some(Ok(report)),
+                                )
+                                .await
+                            }
+                            Err(error) => {
+                                self.restore_checkpoint_debt(&prepare.captured_debt);
+                                self.emit_checkpoint_write_failed(error.to_string()).await;
+                                self.require_effect_recovery(format!(
+                                    "failed-turn checkpoint maintenance failed: {error}"
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                    self.resume_failed_turn_checkpoint(class, retryable, captured)
+                        .await;
+                    self.drain_queued_user_input(op_tx).await;
                 }
                 (continuation, outcome) => {
                     // A continuation/outcome pairing that cannot happen given
@@ -1039,6 +1087,13 @@ impl RuntimeActor {
             }
         };
         dispatch.await;
+        // A failed-turn tail may have arrived while this boundary owned the
+        // lane. Retry it only after the owner has been removed, so it can use
+        // the normal relay path without blocking the actor on maintenance.
+        if let Some(pending) = self.state.pending_failed_turn_checkpoint.take() {
+            self.resume_failed_turn_checkpoint(pending.class, pending.retryable, pending.captured)
+                .await;
+        }
         // The spawned operation's future produced its completion, but its
         // task may still be returning — its captured services (and whatever
         // they hold) must be dropped before a caller can depend on those
@@ -1054,7 +1109,10 @@ impl RuntimeActor {
         let Some(pending) = self.state.gc_work.take() else {
             return Ok(());
         };
-        if let GcContinuation::SafepointCommit { .. } = pending.continuation {
+        if matches!(
+            pending.continuation,
+            GcContinuation::SafepointCommit { .. } | GcContinuation::SafepointFailure { .. }
+        ) {
             // The parked turn-commit tail dies with the cancelled turn, but
             // the relay is NEVER aborted: it still carries the safe-point
             // report home (through the completion channel, whose stale

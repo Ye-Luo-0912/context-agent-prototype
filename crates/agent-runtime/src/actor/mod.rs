@@ -1412,6 +1412,11 @@ struct ActorState {
     /// the turn's `InFlightOp`; idle work (completion boundary, checkpoint
     /// maintenance) runs without a turn and is joined by shutdown.
     gc_work: Option<maintenance::PendingGc>,
+    /// A failed-turn safe-point tail waiting behind an older idle boundary.
+    /// Keeping this separate from `gc_work` preserves the older operation's
+    /// ownership while allowing the actor loop to continue serving control
+    /// commands.
+    pending_failed_turn_checkpoint: Option<maintenance::PendingFailedTurnCheckpoint>,
     /// The actor's own operation-completion channel handle, stored at run
     /// entry so internal paths can spawn boundary work without threading
     /// the sender through every signature.

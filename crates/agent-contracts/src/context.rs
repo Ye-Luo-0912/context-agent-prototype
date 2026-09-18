@@ -1178,6 +1178,12 @@ pub struct ExecutionEvidence {
     pub turn: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>,
+    /// Bounded fs.read coverage carried by this semantic row. A path-level
+    /// key can represent multiple disjoint windows of the same revision;
+    /// retaining the windows prevents A→B→A→B reads from looking novel just
+    /// because the last read replaced the previous range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage: Vec<FileBodyWindow>,
 }
 
 fn default_execution_evidence_current() -> bool {
@@ -1194,6 +1200,10 @@ pub struct TaskProgressView {
     pub anchor_revision: u64,
     #[serde(default)]
     pub workspace_revision: u64,
+    /// Live actor budget for this decision, not durable task state. Never a
+    /// completion claim; a resumed turn derives a new budget from its host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_budget: Option<ModelDecisionBudget>,
     pub checked_files: Vec<String>,
     pub verifications: Vec<String>,
     pub failed_commands: Vec<String>,
@@ -1241,9 +1251,16 @@ pub struct TaskProgressView {
 /// on ResumePoint are not enough: 32 × 200-char rows still overflow.
 pub const MAX_TASK_PROGRESS_PROMPT_CHARS: usize = 2_048;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelDecisionBudget {
+    pub current_round: usize,
+    pub max_rounds: usize,
+}
+
 impl TaskProgressView {
     pub fn is_empty(&self) -> bool {
         self.checked_files.is_empty()
+            && self.decision_budget.is_none()
             && self.verifications.is_empty()
             && self.failed_commands.is_empty()
             && self.completion_commit_failure.is_none()
@@ -2736,7 +2753,10 @@ pub const CONTEXT_MAP_VIEW_CAP: usize = 32;
 pub const DEFAULT_CODING_AGENT_SYSTEM_PROMPT: &str = concat!(
     "You are a focused coding agent. Work on the current task only. ",
     "The selected working context is not the full catalog; prior evidence may remain outside this frame and can be searched or retrieved with context tools. ",
-    "Additional tools can be discovered and loaded with capability tools."
+    "Additional tools can be discovered and loaded with capability tools. ",
+    "Use observations to resolve the current task: turn confirmed defects into concrete fixes and focused verification. ",
+    "Keep required deliverables and unresolved failures in view; passing tests alone does not complete the request. ",
+    "After the requested work and relevant checks, provide a final answer with results and remaining limitations. An ordinary final answer ends the turn; durable task closure has separate authority."
 );
 
 /// The bounded, model-facing view of the external context map. The engine
@@ -3746,7 +3766,7 @@ mod tests {
             .filter(|part| !part.is_empty())
             .count();
         assert!(
-            (3..=4).contains(&sentences),
+            (3..=8).contains(&sentences),
             "keep the contract short, got {sentences} sentences: {prompt}"
         );
     }

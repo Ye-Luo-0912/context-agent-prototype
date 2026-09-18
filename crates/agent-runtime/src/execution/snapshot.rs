@@ -42,9 +42,9 @@ impl RoundExecutionSnapshot {
     ) -> Self {
         let due = state.verification_due_now(turn_intent);
         Self {
-            // The round snapshot is the model frame's progress source, so
-            // it consumes the edge-triggered advisory ledger: the same
-            // stall/frontier hint emits once per non-advancing period.
+            // The round snapshot is the model frame's progress source. The
+            // current stall/frontier state remains visible until a real
+            // frontier advance resets it.
             progress: state.view_emitting(),
             foreground_resources: state.foreground_resources(turn_intent),
             verification: VerificationProjection {

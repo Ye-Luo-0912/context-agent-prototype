@@ -2929,8 +2929,12 @@ impl RuntimeActor {
         // the immediate debt re-capture below — debt accrued after the
         // freeze stays live for the next settled batch, exactly like any
         // post-freeze accrual.
-        if self.state.checkpoint_prepare.is_some() {
-            self.relay_parked_checkpoint_prepare(content, op_tx).await;
+        if self.state.checkpoint_prepare.is_some()
+            && self.state.gc_work.is_none()
+            && self
+                .relay_parked_checkpoint_prepare(content.clone(), op_tx)
+                .await
+        {
             return;
         }
         if self.await_pending_checkpoint().await.is_ok() && !self.state.checkpoint_debt.is_empty() {

@@ -477,9 +477,9 @@ impl PromptAssembler {
 /// 一次模型输入组装的正文缓存账目（增量，不是累计）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProtocolBodyAssemblyStats {
-    /// Exact fresh fs.read bodies actually removed by this checkpoint and
-    /// therefore requiring restoration. Cache rows still carried in the
-    /// retained tail are not demand and do not inflate misses.
+    /// Bounded sample (at most MAX_VISIBLE_BODY_WINDOWS) of fresh fs.read
+    /// exposures removed by the checkpoint. Tail-resident rows are excluded.
+    /// This diagnostic sample never limits selection of usable bodies.
     pub eligible: u64,
     /// 实际回注的行数。
     pub restored: u64,
@@ -499,36 +499,70 @@ fn rehydrated_protocol_bodies(
     progress: Option<&TaskProgressView>,
     protocol_bodies: &[ProtocolBodyRow],
 ) -> Vec<ProtocolBodyRow> {
-    let demand = checkpoint_body_demand(full_turn, retained, progress);
-    if demand.is_empty() {
+    let Some(progress) = progress else {
         return Vec::new();
-    }
-    // The full ActiveTurn frame is the bounded audit backing for this open
-    // turn. Select exactly the windows the checkpoint left uncovered; do
-    // not depend on a path-keyed LRU that tends to retain the later
-    // window still in the tail and evict the earlier disjoint window.
-    let spilled_rows = demanded_file_read_body_rows(full_turn, &demand);
+    };
+    let fresh: HashSet<_> = progress.checked_files.iter().collect();
+    let retained_windows: Vec<_> = file_read_exposure_windows(retained)
+        .take(agent_contracts::MAX_VISIBLE_BODY_WINDOWS)
+        .collect();
     let mut restored: Vec<ProtocolBodyRow> = Vec::new();
-    for needed in demand {
-        let Some(row) = protocol_bodies
-            .iter()
-            .find(|row| row_satisfies_demand(row, &needed))
-            .cloned()
-            .or_else(|| {
-                spilled_rows
-                    .iter()
-                    .find(|row| row_satisfies_demand(row, &needed))
-                    .cloned()
-            })
+    let mut restored_bytes = 0;
+    // Stream the bounded open-turn history once, newest first. Only usable,
+    // fresh, uncovered bodies consume capacity; neither repeated nor rejected
+    // candidates hide later entries behind a candidate-count cutoff.
+    for step in full_turn.steps.iter().rev() {
+        let TurnFrameStep::ToolResult { output, facts, .. } = step else {
+            continue;
+        };
+        if output.tool_name != "fs.read" || !output.ok || output.model_content.is_empty() {
+            continue;
+        }
+        let Some(touch) = primary_result_touch(output, facts) else {
+            continue;
+        };
+        let Some(identity) = touch
+            .revision
+            .as_deref()
+            .and_then(|revision| agent_contracts::file_body_identity(&touch.path, revision))
         else {
             continue;
         };
-        if restored
-            .iter()
-            .any(|existing| existing.identity == row.identity && existing.window == row.window)
+        if !fresh.contains(&identity) {
+            continue;
+        }
+        let window = file_read_window_from_output(output, &touch);
+        let needed = window.clone().unwrap_or_else(|| FileBodyWindow {
+            path: touch.path,
+            revision: touch.revision,
+            complete: true,
+            ..Default::default()
+        });
+        if window_already_satisfied(&retained_windows, &needed)
+            || restored
+                .iter()
+                .any(|row| row_satisfies_demand(row, &needed))
         {
             continue;
         }
+        let cached = protocol_bodies
+            .iter()
+            .filter(|row| row_satisfies_demand(row, &needed))
+            .filter(|row| row.body.len() < output.model_content.len())
+            .min_by_key(|row| row.body.len());
+        let body_bytes = cached.map_or(output.model_content.len(), |row| row.body.len());
+        if body_bytes > crate::execution::body_cache::MAX_PROTOCOL_BODY_BYTES
+            || restored_bytes + body_bytes
+                > crate::execution::body_cache::MAX_PROTOCOL_BODY_TOTAL_BYTES
+        {
+            continue;
+        }
+        let row = cached.cloned().unwrap_or_else(|| ProtocolBodyRow {
+            identity,
+            body: output.model_content.clone(),
+            window,
+        });
+        restored_bytes += body_bytes;
         restored.push(row);
         if restored.len() >= agent_contracts::MAX_PROTOCOL_BODY_ROWS {
             break;
@@ -546,7 +580,9 @@ fn checkpoint_body_demand(
     retained: &TurnFrame,
     progress: Option<&TaskProgressView>,
 ) -> Vec<FileBodyWindow> {
-    let retained_windows = file_read_exposure_windows(retained);
+    let retained_windows: Vec<_> = file_read_exposure_windows(retained)
+        .take(agent_contracts::MAX_VISIBLE_BODY_WINDOWS)
+        .collect();
     let fresh_facts: Option<HashSet<String>> =
         progress.map(|progress| progress.checked_files.iter().cloned().collect());
     let mut demand = Vec::new();
@@ -574,7 +610,9 @@ fn checkpoint_body_demand(
             continue;
         }
         demand.push(window);
-        if demand.len() >= agent_contracts::MAX_PROTOCOL_BODY_ROWS {
+        // Bound diagnostics only. The restoration selector streams the source
+        // separately, so rejected rows in this sample cannot hide usable ones.
+        if demand.len() >= agent_contracts::MAX_VISIBLE_BODY_WINDOWS {
             break;
         }
     }
@@ -588,7 +626,8 @@ fn checkpoint_body_demand(
 /// the answer to a demand for L1–100 of the same version (F3). A row with
 /// no trustworthy range answers only an equally unknown demand.
 fn row_satisfies_demand(row: &ProtocolBodyRow, needed: &FileBodyWindow) -> bool {
-    if row.body.is_empty() {
+    if row.body.is_empty() || row.body.len() > crate::execution::body_cache::MAX_PROTOCOL_BODY_BYTES
+    {
         return false;
     }
     let Some(identity) = needed
@@ -672,7 +711,9 @@ pub(crate) fn visible_body_identities_for_request(
 /// window keeps its revalidation priority.
 pub(crate) fn checkpoint_spilled_body_identities(full_turn: &TurnFrame) -> Vec<String> {
     let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
-    let retained_windows = file_read_exposure_windows(&retained);
+    let retained_windows: Vec<_> = file_read_exposure_windows(&retained)
+        .take(agent_contracts::MAX_VISIBLE_BODY_WINDOWS)
+        .collect();
     let mut identities = Vec::new();
     for window in file_read_exposure_windows(full_turn) {
         if window_already_satisfied(&retained_windows, &window) {
@@ -838,33 +879,32 @@ fn file_read_body_windows(frame: &TurnFrame) -> Vec<agent_contracts::FileBodyWin
     windows
 }
 
-/// Every fs.read exposure of a frame, in frame order and one entry per
+/// Every fs.read exposure of a frame, newest first and one entry per
 /// read. The interval-aware sibling of [`file_read_body_identities`] used
 /// for *demand*: unlike [`file_read_body_windows`], a read whose range is
 /// unknown still yields an entry (with an unknown range, which proves no
 /// interval). Demand has to account for that body; coverage still cannot be
 /// claimed from it.
-fn file_read_exposure_windows(frame: &TurnFrame) -> Vec<agent_contracts::FileBodyWindow> {
-    let mut windows = Vec::new();
-    for step in &frame.steps {
+/// Stream candidates before applying freshness, coverage and output limits.
+/// Capping the source prefix loses all useful reads after the first 16 calls.
+fn file_read_exposure_windows(frame: &TurnFrame) -> impl Iterator<Item = FileBodyWindow> + '_ {
+    frame.steps.iter().rev().filter_map(|step| {
         let TurnFrameStep::ToolResult { output, facts, .. } = step else {
-            continue;
+            return None;
         };
         if output.tool_name != "fs.read" || !output.ok || output.model_content.is_empty() {
-            continue;
+            return None;
         }
-        let Some(touch) = primary_result_touch(output, facts) else {
-            continue;
-        };
+        let touch = primary_result_touch(output, facts)?;
         if touch
             .revision
             .as_deref()
             .map(str::trim)
             .is_none_or(str::is_empty)
         {
-            continue;
+            return None;
         }
-        windows.push(
+        Some(
             file_read_window_from_output(output, &touch).unwrap_or_else(|| {
                 agent_contracts::FileBodyWindow {
                     path: touch.path.clone(),
@@ -875,12 +915,8 @@ fn file_read_exposure_windows(frame: &TurnFrame) -> Vec<agent_contracts::FileBod
                     complete: true,
                 }
             }),
-        );
-        if windows.len() >= agent_contracts::MAX_VISIBLE_BODY_WINDOWS {
-            break;
-        }
-    }
-    windows
+        )
+    })
 }
 
 /// Trusted exposure window of one `fs.read` result: version plus the line
@@ -934,56 +970,6 @@ pub(crate) fn file_read_window_from_output(
         covers_file: !clipped && covers_file,
         complete: !clipped,
     })
-}
-
-/// Bodies from the bounded full turn that answer the uncovered windows.
-///
-/// F3: one slot per demanded window, not per identity. Two disjoint reads
-/// of the same `path@revision` are two demands, so the later read can no
-/// longer overwrite the earlier one out of the restoration set. Within one
-/// window the latest matching read still wins.
-fn demanded_file_read_body_rows(
-    frame: &TurnFrame,
-    demand: &[agent_contracts::FileBodyWindow],
-) -> Vec<ProtocolBodyRow> {
-    let mut rows: Vec<Option<ProtocolBodyRow>> = vec![None; demand.len()];
-    for step in &frame.steps {
-        let TurnFrameStep::ToolResult { output, facts, .. } = step else {
-            continue;
-        };
-        if output.tool_name != "fs.read"
-            || !output.ok
-            || output.model_content.is_empty()
-            || output.model_content.len() > crate::execution::body_cache::MAX_PROTOCOL_BODY_BYTES
-        {
-            continue;
-        }
-        let Some(touch) = primary_result_touch(output, facts) else {
-            continue;
-        };
-        let Some(identity) = touch
-            .revision
-            .as_deref()
-            .and_then(|revision| agent_contracts::file_body_identity(&touch.path, revision))
-        else {
-            continue;
-        };
-        // F01: this row is about to enter the request, so it carries the
-        // range that read exposed. The window is derived from the same
-        // trusted fs.read metadata the retained-tail windows use, so a
-        // spilled partial read never widens into whole-file coverage.
-        let row = ProtocolBodyRow {
-            identity,
-            body: output.model_content.clone(),
-            window: file_read_window_from_output(output, &touch),
-        };
-        for (slot, needed) in rows.iter_mut().zip(demand) {
-            if row_satisfies_demand(&row, needed) {
-                *slot = Some(row.clone());
-            }
-        }
-    }
-    rows.into_iter().flatten().collect()
 }
 
 /// Token cost of the runtime-owned Focus frame (TaskAnchor + TaskProgress +
@@ -1211,6 +1197,20 @@ fn render_task_progress(progress: &TaskProgressView) -> String {
 /// stays small; the packing loop only ever drops whole entries from it.
 fn progress_fixed_blocks(progress: &TaskProgressView) -> Vec<(u8, String)> {
     let mut blocks = Vec::new();
+    if let Some(budget) = progress.decision_budget {
+        let remaining = budget.max_rounds.saturating_sub(budget.current_round);
+        let guidance = if remaining == 0 && budget.max_rounds > 1 {
+            " This decision is text-only. Provide the final answer now: state verified results, unfinished deliverables and blockers honestly. Budget exhaustion does not establish task completion."
+        } else if remaining <= 3 {
+            " Complete the requested deliverables and necessary checks within this budget; report any unfinished work honestly in the final answer."
+        } else {
+            ""
+        };
+        blocks.push((PRIO_STALL, format!(
+            "DECISION BUDGET: round {} of {}; {} further model decision(s) after this response.{}\n",
+            budget.current_round, budget.max_rounds, remaining, guidance
+        )));
+    }
     if let Some(line) = progress.stall_warning.as_deref() {
         blocks.push((PRIO_STALL, format!("{line}\n")));
     }
@@ -3719,6 +3719,66 @@ stale={stale_bytes:?}"
         );
     }
 
+    #[test]
+    fn unusable_early_body_candidates_do_not_hide_a_later_small_body() {
+        let assembler = PromptAssembler::new("policy");
+        let mut turn = TurnFrame::new("inspect files");
+        let mut identities = Vec::new();
+        for index in 0..5 {
+            let path = format!("src/candidate-{index}.rs");
+            let body = if index < 4 {
+                "x".repeat(crate::execution::body_cache::MAX_PROTOCOL_BODY_BYTES + 1)
+            } else {
+                "small body that must be restored".to_string()
+            };
+            identities.push(format!("{path}@rev-1"));
+            push_windowed_read(
+                &mut turn,
+                &format!("candidate-{index}"),
+                &path,
+                "rev-1",
+                1,
+                10,
+                &body,
+            );
+        }
+        // Push enough later exchanges to compact all five candidates out of
+        // the retained tail while keeping the source frame bounded.
+        for index in 0..7 {
+            let path = format!("src/filler-{index}.rs");
+            push_windowed_read(
+                &mut turn,
+                &format!("filler-{index}"),
+                &path,
+                "rev-1",
+                1,
+                2,
+                "filler",
+            );
+        }
+        let progress = TaskProgressView {
+            checked_files: identities,
+            ..Default::default()
+        };
+        let history = materialized_with(Vec::new(), ContextMapView::default());
+        let assembled = assembler.assemble_with_catalog(
+            None,
+            None,
+            Some(&progress),
+            &history,
+            &turn,
+            Vec::new(),
+            &[],
+            &[],
+        );
+        let restored = restored_block(&assembled).expect("the usable fifth body must be restored");
+        assert!(restored.contains("small body that must be restored"));
+        assert!(
+            !restored.contains(&"x".repeat(128)),
+            "oversized rows stay out of the wire"
+        );
+    }
+
     /// F3: the current-turn body cache keys by path, so one entry can hold
     /// a window that answers nothing. A cache row carrying L201–300 must
     /// not be handed back as the answer to the L1–100 demand; the bounded
@@ -3874,6 +3934,140 @@ stale={stale_bytes:?}"
             !restored.contains("fn rev_two_body"),
             "a newer revision body must not stand in for the older one: {restored}"
         );
+    }
+
+    #[test]
+    fn long_workflow_recent_body_is_not_hidden_by_old_scan_prefix() {
+        let mut turn = TurnFrame::new("work");
+        for i in 0..40 {
+            push_windowed_read(
+                &mut turn,
+                &format!("old-{i}"),
+                "old.rs",
+                "old",
+                1,
+                2,
+                "old body",
+            );
+        }
+        push_windowed_read(
+            &mut turn,
+            "latest",
+            "current.rs",
+            "new",
+            1,
+            2,
+            "current body",
+        );
+        let progress = TaskProgressView {
+            checked_files: vec!["current.rs@new".into()],
+            ..Default::default()
+        };
+        let rows = rehydrated_protocol_bodies(&turn, &TurnFrame::new("work"), Some(&progress), &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "current body");
+    }
+
+    #[test]
+    fn long_workflow_restoration_prioritizes_recent_uncovered_windows() {
+        let mut turn = TurnFrame::new("work");
+        let mut progress = TaskProgressView::default();
+        for i in 0..8 {
+            let path = format!("file-{i}.rs");
+            push_windowed_read(
+                &mut turn,
+                &format!("read-{i}"),
+                &path,
+                "v1",
+                1,
+                2,
+                &format!("body-{i}"),
+            );
+            progress.checked_files.push(format!("{path}@v1"));
+        }
+        let rows = rehydrated_protocol_bodies(&turn, &TurnFrame::new("work"), Some(&progress), &[]);
+        assert_eq!(rows.len(), agent_contracts::MAX_PROTOCOL_BODY_ROWS);
+        assert_eq!(rows[0].body, "body-7");
+        assert_eq!(rows.last().unwrap().body, "body-4");
+    }
+
+    #[test]
+    fn long_workflow_rejected_recent_candidates_do_not_consume_slots() {
+        let mut turn = TurnFrame::new("work");
+        push_windowed_read(
+            &mut turn,
+            "good",
+            "good.rs",
+            "v1",
+            1,
+            2,
+            "useful older body",
+        );
+        let mut progress = TaskProgressView {
+            checked_files: vec!["good.rs@v1".into()],
+            ..Default::default()
+        };
+        for i in 0..20 {
+            let path = format!("big-{i}.rs");
+            push_windowed_read(
+                &mut turn,
+                &format!("big-{i}"),
+                &path,
+                "v1",
+                1,
+                200,
+                &"x".repeat(crate::execution::body_cache::MAX_PROTOCOL_BODY_BYTES + 1),
+            );
+            progress.checked_files.push(format!("{path}@v1"));
+        }
+        let rows = rehydrated_protocol_bodies(&turn, &TurnFrame::new("work"), Some(&progress), &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "useful older body");
+    }
+
+    #[test]
+    fn decision_budget_survives_progress_packing_without_claiming_completion() {
+        let progress = TaskProgressView {
+            decision_budget: Some(agent_contracts::ModelDecisionBudget {
+                current_round: 18,
+                max_rounds: 18,
+            }),
+            checked_files: vec!["x".repeat(300); 32],
+            ..Default::default()
+        };
+        assert!(!progress.is_empty());
+        let text = render_task_progress(&progress);
+        assert!(text.contains("round 18 of 18; 0 further model decision(s)"));
+        assert!(text.contains("unfinished deliverables and blockers honestly"));
+        assert!(!text.contains("TASK SETTLED"));
+        assert!(text.len() <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn long_workflow_large_valid_windows_share_the_existing_total_budget() {
+        let mut turn = TurnFrame::new("work");
+        let mut progress = TaskProgressView::default();
+        for i in 0..5 {
+            let path = format!("file-{i}.rs");
+            push_windowed_read(
+                &mut turn,
+                &format!("read-{i}"),
+                &path,
+                "v1",
+                1,
+                200,
+                &"x".repeat(10_000),
+            );
+            progress.checked_files.push(format!("{path}@v1"));
+        }
+        let rows = rehydrated_protocol_bodies(&turn, &TurnFrame::new("work"), Some(&progress), &[]);
+        assert_eq!(
+            rows.len(),
+            3,
+            "three complete 10KB bodies fit the existing 32KiB budget"
+        );
+        assert!(rows.iter().map(|r| r.body.len()).sum::<usize>() <= 32 * 1024);
+        assert!(rows.iter().all(|r| r.window.as_ref().unwrap().complete));
     }
 
     #[test]

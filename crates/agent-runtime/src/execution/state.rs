@@ -3,11 +3,11 @@
 use std::path::Path;
 
 use agent_contracts::{
-    ArtifactLocator, ContentDigest, EvidenceValidity, ExecutionEvidence, FrontierDelta,
-    MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind, ResourceFreshness,
-    ResourceKey, TaskProgressView, ToolExecutionAttribution, ToolExecutionPurpose,
-    ToolFailureClass, ToolFailureDomain, ToolOutput, VerificationPassEventKind,
-    path_exactly_in_directive,
+    ArtifactLocator, ContentDigest, EvidenceValidity, ExecutionEvidence, FileBodyWindow,
+    FrontierDelta, MAX_FOREGROUND_RESOURCES, MAX_TASK_ANCHOR_ITEM_CHARS, NegativeFactEventKind,
+    ResourceFreshness, ResourceKey, TaskProgressView, ToolExecutionAttribution,
+    ToolExecutionPurpose, ToolFailureClass, ToolFailureDomain, ToolOutput,
+    VerificationPassEventKind, path_exactly_in_directive,
 };
 #[cfg(test)]
 use agent_contracts::{ToolResultDisposition, TurnFrame, TurnFrameStep};
@@ -33,6 +33,9 @@ pub(super) const STALL_CLUSTER_DISTINCT_TARGETS: u32 = 2;
 pub(super) const FRONTIER_ADVISORY_THRESHOLD: u32 = 5;
 /// 前沿证据行数上限（最新在前）。
 const MAX_EVIDENCE_ROWS: usize = 16;
+/// A single semantic evidence row may retain several disjoint fs.read
+/// windows, but the table remains bounded even for adversarial read loops.
+const MAX_EVIDENCE_COVERAGE_WINDOWS: usize = agent_contracts::MAX_VISIBLE_BODY_WINDOWS;
 /// The typed plan may carry eight bounded criterion descriptions. Character
 /// caps are not byte caps, so reserve the legal four-byte UTF-8 envelope plus
 /// JSON/provenance overhead while keeping checkpoint growth strictly bounded.
@@ -207,12 +210,10 @@ pub struct ExecutionState {
     pub stall: StallState,
     #[serde(default)]
     pub failure_cluster: FailureCluster,
-    /// Edge-triggered advisory ledger: whether the current non-advancing
-    /// period already projected its stall/frontier hint into the model
-    /// frame. A frontier advance resets both, so the same advice emits once
-    /// per state transition and never repeats round after round while the
-    /// underlying state has not changed. `view()` stays a pure read; only
-    /// `view_emitting` consumes the ledger.
+    /// Legacy advisory ledger retained for checkpoint compatibility. Current
+    /// model projections keep stall/frontier warnings visible until a real
+    /// frontier advance; these flags are no longer used to hide a current
+    /// warning from a later request.
     #[serde(default)]
     pub stall_advice_emitted: bool,
     #[serde(default)]
@@ -1390,33 +1391,16 @@ impl ExecutionState {
             // when the projection switch is on and the joined label rises
             // to `SettledCandidate`; execution state never projects it.
             settlement: None,
+            decision_budget: None,
         }
     }
 
-    /// Edge-triggered projection for the model frame: a stall/frontier
-    /// advisory is emitted on the first projection of a non-advancing
-    /// period and suppressed on every later projection until a provable
-    /// frontier advance resets the period. `view()` stays the pure read
-    /// (tests, snapshots, GC-root projections); only this form consumes
-    /// the ledger, so the exact same advice never repeats round after
-    /// round while the underlying state has not transitioned.
+    /// Projection for the model frame. Warnings describe the *current*
+    /// convergence state, so every new model request must see them until a
+    /// real frontier advance resets that state. The legacy emission flags are
+    /// retained for checkpoint compatibility but are no longer consumed here.
     pub(crate) fn view_emitting(&mut self) -> TaskProgressView {
-        let mut view = self.view();
-        if view.stall_warning.is_some() {
-            if self.stall_advice_emitted {
-                view.stall_warning = None;
-            } else {
-                self.stall_advice_emitted = true;
-            }
-        }
-        if view.frontier_warning.is_some() {
-            if self.frontier_advice_emitted {
-                view.frontier_warning = None;
-            } else {
-                self.frontier_advice_emitted = true;
-            }
-        }
-        view
+        self.view()
     }
 
     /// 类型化证据行，最新在前、有界。只含 key + 结果 + world 版本；
@@ -2040,19 +2024,44 @@ impl ExecutionState {
         } else {
             bound_evidence_text(argument_digest)
         };
+        let coverage = observation_coverage_window(output, touches.first());
         if let Some(existing) = self.evidence.iter_mut().find(|row| row.key == key) {
             let same_semantic = !existing.outcome_digest.is_empty()
                 && existing.outcome_digest == outcome_digest
                 && existing.argument_digest == argument_digest;
-            if same_semantic && existing.current && existing.validity == validity {
+            let same_validity = existing.validity == validity;
+            let coverage_known = coverage
+                .as_ref()
+                .is_some_and(|window| evidence_coverage_covers(&existing.coverage, window));
+            let coverage_saturated = coverage.as_ref().is_some_and(|_| {
+                !coverage_known && existing.coverage.len() >= MAX_EVIDENCE_COVERAGE_WINDOWS
+            });
+            let coverage_advanced = same_validity
+                && coverage.as_ref().is_some_and(|window| {
+                    !coverage_known
+                        && !coverage_saturated
+                        && merge_evidence_coverage(&mut existing.coverage, window)
+                });
+            // For ranged fs.read rows, the trusted path@revision plus the
+            // already-covered interval is the semantic identity. Different
+            // body digests are expected for disjoint windows and must not
+            // make an A→B→A→B loop look like progress.
+            let equivalent_observation = same_semantic || coverage_known || coverage_saturated;
+            if equivalent_observation && existing.current && same_validity && !coverage_advanced {
                 return ObservationEvidence::Repeated;
             }
-            let reconfirmed = same_semantic && !existing.current;
+            let reconfirmed = equivalent_observation && !existing.current && !coverage_advanced;
             existing.outcome = outcome;
             existing.outcome_digest = outcome_digest;
             existing.observed_world_revision = self.workspace_revision;
             existing.validity = validity;
             existing.argument_digest = argument_digest;
+            if !same_validity {
+                existing.coverage.clear();
+                if let Some(window) = coverage.as_ref() {
+                    existing.coverage.push(window.clone());
+                }
+            }
             existing.current = true;
             existing.turn = turn;
             existing.evidence_ref = output.artifact_ref.clone();
@@ -2075,6 +2084,7 @@ impl ExecutionState {
                 current: true,
                 turn,
                 evidence_ref: output.artifact_ref.clone(),
+                coverage: coverage.into_iter().collect(),
             },
         );
         if self.evidence.len() > MAX_EVIDENCE_ROWS {
@@ -2550,8 +2560,19 @@ pub(crate) fn validate_execution_state(state: &ExecutionState) -> Result<(), Str
             || row.outcome.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.argument_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
             || row.outcome_digest.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS
+            || row.coverage.len() > MAX_EVIDENCE_COVERAGE_WINDOWS
         {
             return Err("evidence row exceeds its text bound".into());
+        }
+        for window in &row.coverage {
+            if window.path.chars().count() > agent_contracts::MAX_RESOURCE_PATH_CHARS
+                || window
+                    .revision
+                    .as_ref()
+                    .is_some_and(|revision| revision.chars().count() > MAX_TASK_ANCHOR_ITEM_CHARS)
+            {
+                return Err("evidence coverage exceeds its bound".into());
+            }
         }
     }
     for row in &state.verifications {
@@ -2648,6 +2669,83 @@ fn observation_outcome_digest(output: &ToolOutput) -> String {
         output.model_content.as_bytes()
     };
     ContentDigest::sha256_bytes(bytes).to_string()
+}
+
+/// Turn the trusted fs.read metadata into a proof-carrying interval. Unknown
+/// or clipped ranges deliberately contribute no coverage; they can still be
+/// useful as semantic observations, but must not suppress a later read.
+fn observation_coverage_window(
+    output: &ToolOutput,
+    touch: Option<&agent_contracts::ResourceTouch>,
+) -> Option<FileBodyWindow> {
+    if output.tool_name != "fs.read" {
+        return None;
+    }
+    let touch = touch?;
+    let start_line = output
+        .metadata
+        .get("start_line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok());
+    let end_line = output
+        .metadata
+        .get("end_line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok());
+    let covers_file = output
+        .metadata
+        .get("covers_file")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let clipped = output
+        .metadata
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || output
+            .metadata
+            .get("window_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    if clipped || start_line.is_none() && end_line.is_none() && !covers_file {
+        return None;
+    }
+    Some(FileBodyWindow {
+        path: touch.path.clone(),
+        revision: touch.revision.clone(),
+        start_line,
+        end_line,
+        covers_file,
+        complete: true,
+    })
+}
+
+/// Add one new interval to a semantic evidence row. The shared contract
+/// coverage predicate handles overlap/adjacency and whole-file windows; the
+/// cap keeps checkpoint growth bounded for repeated disjoint reads.
+fn merge_evidence_coverage(existing: &mut Vec<FileBodyWindow>, window: &FileBodyWindow) -> bool {
+    if evidence_coverage_covers(existing, window) {
+        return false;
+    }
+    // Once the bounded coverage ledger is full, fail closed: do not claim a
+    // new frontier that cannot be retained, otherwise the same unseen range
+    // would advance every round forever. A later world/semantic change still
+    // replaces the row and starts a fresh bounded ledger.
+    if existing.len() >= MAX_EVIDENCE_COVERAGE_WINDOWS {
+        return false;
+    }
+    existing.push(window.clone());
+    true
+}
+
+fn evidence_coverage_covers(existing: &[FileBodyWindow], window: &FileBodyWindow) -> bool {
+    agent_contracts::visible_body_windows_cover(
+        existing,
+        &window.path,
+        window.revision.as_deref(),
+        window.start_line,
+        window.end_line,
+    ) || existing.iter().any(|current| current == window)
 }
 
 pub(super) fn bound_item(text: &str) -> String {

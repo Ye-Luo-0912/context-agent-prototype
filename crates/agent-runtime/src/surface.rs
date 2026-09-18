@@ -262,6 +262,14 @@ impl RoundSurfacePlan {
     /// final answer. Every removed schema remains visible in the audit report
     /// with its original demand and authority origin.
     pub(crate) fn force_completion_finalization(&mut self) {
+        self.force_text_finalization(ToolSurfaceOmissionReason::CompletionFinalization);
+    }
+
+    pub(crate) fn force_budget_finalization(&mut self) {
+        self.force_text_finalization(ToolSurfaceOmissionReason::DecisionBudgetFinalization);
+    }
+
+    fn force_text_finalization(&mut self, reason: ToolSurfaceOmissionReason) {
         let specs = std::mem::take(&mut self.specs);
         // The omission sample may already be full from earlier budget
         // decisions. Reserve one diagnostic slot so a text-only surface can
@@ -289,7 +297,7 @@ impl RoundSurfacePlan {
                     tool_name: spec.name,
                     demand,
                     origin,
-                    reason: ToolSurfaceOmissionReason::CompletionFinalization,
+                    reason,
                     approx_tokens,
                 },
             );
@@ -441,8 +449,15 @@ impl RoundSurfacePlan {
 
         let mut omitted = self.omissions.clone();
         omitted.sort_by(|a, b| {
-            let a_final = a.reason == ToolSurfaceOmissionReason::CompletionFinalization;
-            let b_final = b.reason == ToolSurfaceOmissionReason::CompletionFinalization;
+            let is_final = |reason| {
+                matches!(
+                    reason,
+                    ToolSurfaceOmissionReason::CompletionFinalization
+                        | ToolSurfaceOmissionReason::DecisionBudgetFinalization
+                )
+            };
+            let a_final = is_final(a.reason);
+            let b_final = is_final(b.reason);
             b_final
                 .cmp(&a_final)
                 .then_with(|| b.demand.rank().cmp(&a.demand.rank()))

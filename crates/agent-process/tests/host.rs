@@ -222,6 +222,11 @@ async fn cancel_aborts_broker_work_promptly() {
 
 #[tokio::test]
 async fn cancel_without_peer_ack_still_kills_after_the_bound() {
+    // Keep this tight wall-clock assertion out of the three concurrent
+    // blocked-write fixtures below. The production ACK/kill bound is already
+    // exercised by the isolated test; this slot prevents the test harness
+    // from turning shared Windows CPU pressure into a false semantic failure.
+    let _slot = BLOCKED_WRITE_SLOT.lock().await;
     let host = spawn_mock(|config| config.request_timeout = Duration::from_secs(5)).await;
     let cancel = CancellationToken::new();
     let fire = cancel.clone();

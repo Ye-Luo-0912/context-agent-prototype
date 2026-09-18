@@ -790,6 +790,13 @@ impl RuntimeActor {
         }
         if completion_repair_terminal {
             surface_plan.force_completion_finalization();
+        } else if self.services.max_tool_rounds() > 1
+            && model_round >= self.services.max_tool_rounds()
+        {
+            // Reserve the last decision inside the existing host budget for
+            // an ordinary answer. Tool results are already settled at this
+            // safe point; no extra call, auto-acceptance or effect replay.
+            surface_plan.force_budget_finalization();
         }
         surface_plan
             .source_revisions_mut()
@@ -2110,6 +2117,7 @@ impl RuntimeActor {
     }
 
     fn capture_round_snapshot(&mut self, current_input: &str, has_external_context: bool) {
+        let max_rounds = self.services.max_tool_rounds();
         let (focus_goal, anchor) = match self
             .state
             .task_id
@@ -2123,13 +2131,18 @@ impl RuntimeActor {
         let Some(turn) = self.state.turn.as_mut() else {
             return;
         };
-        turn.round_snapshot = Some(crate::execution::RoundExecutionSnapshot::capture(
+        let mut snapshot = crate::execution::RoundExecutionSnapshot::capture(
             &mut turn.execution,
             current_input,
             focus_goal.as_deref(),
             anchor.as_ref(),
             has_external_context,
-        ));
+        );
+        snapshot.progress.decision_budget = Some(agent_contracts::ModelDecisionBudget {
+            current_round: turn.model_round,
+            max_rounds,
+        });
+        turn.round_snapshot = Some(snapshot);
     }
 
     fn round_snapshot(&self) -> Option<&crate::execution::RoundExecutionSnapshot> {

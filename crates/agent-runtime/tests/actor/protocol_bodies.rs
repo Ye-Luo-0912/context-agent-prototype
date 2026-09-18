@@ -92,6 +92,108 @@ struct SpillReadModel {
     step: AtomicUsize,
 }
 
+#[derive(Debug, Default)]
+struct BudgetFinalModel {
+    requests: Mutex<Vec<ModelRequest>>,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for BudgetFinalModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities {
+            tool_calls: true,
+            ..Default::default()
+        }
+    }
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let final_only = request.tools.is_empty();
+        self.requests.lock().unwrap().push(request);
+        Ok(ModelOutput {
+            content: if final_only {
+                "Unfinished: budget reached; no acceptance claimed.".into()
+            } else {
+                String::new()
+            },
+            tool_calls: if final_only {
+                vec![]
+            } else {
+                vec![ToolCall {
+                    id: format!("read-{}", self.requests.lock().unwrap().len()),
+                    name: "fs.read".into(),
+                    arguments: serde_json::json!({"path":"src/a.rs"}),
+                }]
+            },
+            usage: ModelUsage::default(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn last_budget_decision_is_audited_text_only_without_closing_the_task() {
+    let model = Arc::new(BudgetFinalModel::default());
+    let dispatcher = Arc::new(ProtocolReadDispatcher::default());
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig {
+            max_tool_rounds: 3,
+            ..Default::default()
+        },
+        Arc::new(TestContextEngine),
+        model.clone(),
+        dispatcher.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let (handle, _task) = spawn_runtime(Arc::new(services));
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    let submitted = handle
+        .start_work("inspect sources and deliver".into(), "budget-final".into())
+        .await
+        .unwrap();
+    let mut final_surface = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await.unwrap().event {
+                RuntimeEvent::ToolSurfacePlanned { report } if report.model_round == 3 => {
+                    assert_eq!(report.selected_total, 0);
+                    assert!(report.omitted.iter().any(|row| row.reason
+                        == agent_contracts::ToolSurfaceOmissionReason::DecisionBudgetFinalization));
+                    final_surface = true;
+                }
+                RuntimeEvent::TurnCompleted => break,
+                RuntimeEvent::TaskCompleted { .. } => panic!("budget is not task acceptance"),
+                RuntimeEvent::TurnFailed { .. } => {
+                    panic!("the reserved response should finish this turn")
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(final_surface);
+    assert_eq!(dispatcher.executed.load(Ordering::SeqCst), 2);
+    let tasks = handle.list_tasks().await.unwrap();
+    assert!(
+        tasks.iter().any(|task| task.id == submitted.task_id
+            && task.status != agent_runtime::TaskStatus::Completed)
+    );
+    {
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            3,
+            "no model call beyond the configured budget"
+        );
+        assert!(requests[2].tools.is_empty());
+        assert!(requests[2].messages.iter().any(|m| {
+            m.content
+                .contains("Budget exhaustion does not establish task completion")
+        }));
+    }
+    handle.stop().await.unwrap();
+}
+
 #[async_trait::async_trait]
 impl ModelTransport for SpillReadModel {
     fn capabilities(&self) -> ModelCapabilities {
@@ -185,6 +287,22 @@ async fn checkpointed_fs_read_body_reenters_the_user_frame_with_a_stats_event() 
         requests.len()
     );
     let final_request = requests.last().unwrap();
+    for (index, request) in requests.iter().enumerate() {
+        let max = CoreAuthorityConfig::default().max_tool_rounds;
+        let expected = format!(
+            "DECISION BUDGET: round {} of {}; {} further",
+            index + 1,
+            max,
+            max - index - 1
+        );
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|message| message.content.contains(&expected)),
+            "each actual model request must carry the actor's enforced budget: {expected}"
+        );
+    }
     let restored = final_request
         .messages
         .iter()

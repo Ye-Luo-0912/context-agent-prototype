@@ -15,6 +15,7 @@ use crate::harness::*;
 async fn engine_receives_only_the_context_frame_budget() {
     let context = Arc::new(RecordingContextEngine::default());
     let config = CoreAuthorityConfig::default();
+    let max_rounds = config.max_tool_rounds;
     let system_tokens = approx_tokens(&config.system_prompt)
         + approx_tokens(&capture_host_runtime_facts().render());
     let tool_specs = OneToolDispatcher.specs();
@@ -40,7 +41,15 @@ async fn engine_receives_only_the_context_frame_budget() {
         original_goal: task.goal.clone(),
         ..TaskAnchorView::default()
     };
-    let focus_tokens = focus_frame_tokens(Some(&focus), Some(&task_view), None);
+    let progress = agent_contracts::TaskProgressView {
+        anchor_revision: task.anchor_revision,
+        decision_budget: Some(agent_contracts::ModelDecisionBudget {
+            current_round: 1,
+            max_rounds,
+        }),
+        ..Default::default()
+    };
+    let focus_tokens = focus_frame_tokens(Some(&focus), Some(&task_view), Some(&progress));
 
     // The turn is a single model round; the engine query is recorded before
     // the actor replies, so the budget is observable immediately.

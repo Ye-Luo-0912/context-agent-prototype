@@ -32,6 +32,23 @@ mutates, and nothing here can make a half-committed state worse.
    never listed as checkpoints, and a prepared-but-undispatched effect
    reconciles NotApplied on any number of restarts.
 
+## Resume after a settled model failure
+
+In a persistent composition, a settled model/transport/output-limit failure or
+input-budget refusal saves the latest accepted directive and bounded execution
+state before `TurnFailed`. The `failed_turn_yield` checkpoint debt coalesces into
+the existing full Runtime checkpoint; any older checkpoint write drains first.
+`CheckpointDurable` precedes the failure terminal. Restart with the same workspace
+and `--restore=latest --continue` to retain the correction without re-admitting it
+as another user instruction or automatically replaying a failed tool call.
+
+This path requires a settled batch and healthy authority/cleanup state. If capture,
+maintenance or persistence fails, expect `CheckpointWriteFailed` and recovery
+fencing, not a claim that the newest directive is resumable. Slow checkpoint
+maintenance uses the existing operation lane so status and cancellation remain
+available. An abrupt process death before this barrier is still governed by the
+last durable checkpoint; this is not full replay of every journaled user input.
+
 ## A child process outlives a crashed host (PROCESS-01)
 
 Two layers keep a SIGKILLed or aborted host from leaving an unsupervised

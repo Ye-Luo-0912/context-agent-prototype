@@ -419,14 +419,23 @@ impl RuntimeActor {
         captured_debt: Vec<CheckpointDebtReason>,
         report: Option<AgentResult<ContextMaintenanceReport>>,
     ) {
-        if let Some(Ok(maintain_report)) = report
-            && let Err(error) = self
+        if let Some(report) = report {
+            let maintain_report = match report {
+                Ok(report) => report,
+                Err(error) => {
+                    self.restore_checkpoint_debt(&captured_debt);
+                    self.emit_checkpoint_write_failed(error.to_string()).await;
+                    return;
+                }
+            };
+            if let Err(error) = self
                 .emit_context_maintained(ContextMaintenanceTrigger::Checkpoint, maintain_report)
                 .await
-        {
-            self.restore_checkpoint_debt(&captured_debt);
-            self.emit_checkpoint_write_failed(error.to_string()).await;
-            return;
+            {
+                self.restore_checkpoint_debt(&captured_debt);
+                self.emit_checkpoint_write_failed(error.to_string()).await;
+                return;
+            }
         }
         let capture = self.capture_checkpoint().await;
         let snapshot = match capture {
@@ -500,6 +509,24 @@ impl RuntimeActor {
         content: String,
         op_tx: &mpsc::Sender<OperationCompletion>,
     ) -> bool {
+        self.relay_checkpoint_prepare(
+            super::maintenance::GcContinuation::SafepointCommit { content },
+            op_tx,
+        )
+        .await
+    }
+
+    pub(super) async fn relay_checkpoint_prepare(
+        &mut self,
+        continuation: super::maintenance::GcContinuation,
+        op_tx: &mpsc::Sender<OperationCompletion>,
+    ) -> bool {
+        // The boundary lane is single-slot. Its owner (for example a prior
+        // completion's storage GC) must not be overwritten by this relay.
+        // Callers retain the ordinary checkpoint barrier as the fallback.
+        if self.state.gc_work.is_some() {
+            return false;
+        }
         let Some(mut prepare) = self.state.checkpoint_prepare.take() else {
             return false;
         };
@@ -591,7 +618,7 @@ impl RuntimeActor {
         self.state.checkpoint_prepare = Some(prepare);
         self.state.gc_work = Some(super::maintenance::PendingGc::new(
             operation_id,
-            super::maintenance::GcContinuation::SafepointCommit { content },
+            continuation,
             relay,
         ));
         true
