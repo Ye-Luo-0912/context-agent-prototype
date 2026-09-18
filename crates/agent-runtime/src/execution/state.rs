@@ -69,7 +69,7 @@ pub struct FrontierObservation {
     pub verification_pass_events: Vec<VerificationPassTransition>,
 }
 
-/// [`ExecutionState::record_observation_evidence`] 的三值结果。
+/// [`ExecutionState::record_observation_evidence`] 的分类结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObservationEvidence {
     /// 新证据或证据内容变化。
@@ -79,6 +79,12 @@ pub(super) enum ObservationEvidence {
     Reconfirmed,
     /// 同 key 同 validity 同结果的重复观察。
     Repeated,
+    /// BR3: the successful read carries a body window the bounded coverage
+    /// ledger cannot represent (cap full, no legal coalescing). Local
+    /// summary capacity is "cannot fully compare", not "proven repeated":
+    /// the observation stays honest no-progress debt and never counts as
+    /// repeated behavior.
+    UntrackedNovelty,
     /// 该输出不产生前沿证据（无可键化路径且非命令成功）。
     None,
 }
@@ -416,6 +422,13 @@ pub struct ConvergenceState {
     /// 最近 delta，最旧在前，有界环形。
     #[serde(default)]
     pub recent_deltas: Vec<FrontierDelta>,
+    /// BR3: bounded count of reads whose body window could not be retained
+    /// by the coverage ledger (cap full, no legal coalescing). They are
+    /// honest no-progress debt but never "repeated behavior": the runtime
+    /// cannot compare what it did not retain. Any provable frontier
+    /// advance ends the episode.
+    #[serde(default)]
+    pub untracked_observations: u32,
 }
 
 /// How one [`ResourceFact`] was last observed. Observability only: it
@@ -1427,7 +1440,9 @@ impl ExecutionState {
     }
 
     /// 收敛 advisory：连续 [`FRONTIER_ADVISORY_THRESHOLD`] 个动作无可证明
-    /// 前沿推进即触发。软提示：模型仍自主选择下一步。
+    /// 前沿推进即触发。软提示：模型仍自主选择下一步。BR3：未追踪观察
+    /// 期未结束时，提示必须如实表达"覆盖未知"，不得把首次阅读新区域
+    /// 描述成重复已知内容。
     pub(super) fn frontier_warning(&self) -> Option<String> {
         if self.convergence.actions_since_frontier_advance < FRONTIER_ADVISORY_THRESHOLD {
             return None;
@@ -1439,9 +1454,17 @@ impl ExecutionState {
             .map(|delta| delta.token())
             .collect::<Vec<_>>()
             .join(",");
+        let advice = if self.convergence.untracked_observations > 0 {
+            format!(
+                "{} read(s) reached regions the local coverage summary cannot represent (coverage untracked): the runtime cannot prove whether their content was new or already known.",
+                self.convergence.untracked_observations
+            )
+        } else {
+            "Re-reading known state or repeating outcomes does not move the task.".to_string()
+        };
         Some(format!(
-            "EXECUTION FRONTIER UNCHANGED: {} action(s) without a provable frontier advance (recent deltas: {}). Re-reading known state or repeating outcomes does not move the task; act on what you know, change strategy, or finish.",
-            self.convergence.actions_since_frontier_advance, recent
+            "EXECUTION FRONTIER UNCHANGED: {} action(s) without a provable frontier advance (recent deltas: {}). {} Act on what you know, change strategy, or finish.",
+            self.convergence.actions_since_frontier_advance, recent, advice
         ))
     }
 
@@ -1478,21 +1501,26 @@ impl ExecutionState {
         None
     }
 
-    /// 收敛记账：可证明推进的 delta 清空停滞签名、失败聚类与无推进
-    /// 债务；其余 delta 只推进入环形缓冲并累计债务。逐签名停滞与跨
-    /// 目标聚类只在重复行为（NoProgress / RedundantEvidence）下累计，
-    /// Unknown 失效不冒充停滞也不清账。
+    /// 收敛记账：可证明推进的 delta 清空停滞签名、失败聚类、无推进
+    /// 债务与未追踪观察计数；其余 delta 只推进入环形缓冲并累计债务。
+    /// 逐签名停滞与跨目标聚类只在重复行为（NoProgress /
+    /// RedundantEvidence / EvidenceReconfirmed）下累计，Unknown 失效
+    /// 不冒充停滞也不清账。BR3：未追踪观察（本地覆盖摘要装不下、
+    /// 无法完整比较）计入无推进债务，但不得冒充"重复行为"——它
+    /// 既不证明推进、也不证明重复。
     pub(super) fn update_convergence(
         &mut self,
         identity: &OperationIdentity,
         failure: Option<ToolFailureClass>,
         delta: FrontierDelta,
+        evidence: ObservationEvidence,
     ) {
         self.push_delta(delta);
         if delta.advances_frontier() {
             self.stall = StallState::default();
             self.failure_cluster = FailureCluster::default();
             self.convergence.actions_since_frontier_advance = 0;
+            self.convergence.untracked_observations = 0;
             // A provable advance ends the advisory period: the next
             // non-advancing run emits its hints again.
             self.stall_advice_emitted = false;
@@ -1536,6 +1564,13 @@ impl ExecutionState {
                 | FrontierDelta::RedundantEvidence
                 | FrontierDelta::EvidenceReconfirmed
         ) {
+            return;
+        }
+        // BR3: an untracked observation cannot be compared against what the
+        // local summary did not retain, so it never accumulates the
+        // repeated-behavior signature. Its no-progress debt was already
+        // counted above.
+        if matches!(evidence, ObservationEvidence::UntrackedNovelty) {
             return;
         }
         if self.stall.tool != identity.tool_name
@@ -2033,20 +2068,34 @@ impl ExecutionState {
             let coverage_known = coverage
                 .as_ref()
                 .is_some_and(|window| evidence_coverage_covers(&existing.coverage, window));
-            let coverage_saturated = coverage.as_ref().is_some_and(|_| {
-                !coverage_known && existing.coverage.len() >= MAX_EVIDENCE_COVERAGE_WINDOWS
-            });
+            // BR3: a not-covered window is only comparable while the bounded
+            // ledger can represent it. Plain merge first; once the ledger is
+            // full, a legal in-place coalescing (adjacent/overlapping windows
+            // of one identity merge into their identical union) may still
+            // represent the window without growing the set. Only when even
+            // that fails is the observation untracked: the local summary ran
+            // out of capacity, which is "cannot fully compare", never
+            // "proven repeated".
+            let mut coverage_untracked = false;
             let coverage_advanced = same_validity
+                && !coverage_known
                 && coverage.as_ref().is_some_and(|window| {
-                    !coverage_known
-                        && !coverage_saturated
-                        && merge_evidence_coverage(&mut existing.coverage, window)
+                    if merge_evidence_coverage(&mut existing.coverage, window) {
+                        true
+                    } else {
+                        let consolidated =
+                            consolidate_evidence_coverage(&mut existing.coverage, window);
+                        coverage_untracked = !consolidated;
+                        consolidated
+                    }
                 });
             // For ranged fs.read rows, the trusted path@revision plus the
             // already-covered interval is the semantic identity. Different
             // body digests are expected for disjoint windows and must not
-            // make an A→B→A→B loop look like progress.
-            let equivalent_observation = same_semantic || coverage_known || coverage_saturated;
+            // make an A→B→A→B loop look like progress. Ledger saturation is
+            // deliberately NOT part of this identity: exhausted local
+            // capacity is not evidence about the world.
+            let equivalent_observation = same_semantic || coverage_known;
             if equivalent_observation && existing.current && same_validity && !coverage_advanced {
                 return ObservationEvidence::Repeated;
             }
@@ -2066,6 +2115,11 @@ impl ExecutionState {
             existing.turn = turn;
             existing.evidence_ref = output.artifact_ref.clone();
             self.bump_evidence_revision();
+            if coverage_untracked {
+                self.convergence.untracked_observations =
+                    self.convergence.untracked_observations.saturating_add(1);
+                return ObservationEvidence::UntrackedNovelty;
+            }
             return if reconfirmed {
                 ObservationEvidence::Reconfirmed
             } else {
@@ -2735,6 +2789,110 @@ fn merge_evidence_coverage(existing: &mut Vec<FileBodyWindow>, window: &FileBody
         return false;
     }
     existing.push(window.clone());
+    true
+}
+
+/// BR3: represent `window` in a full coverage ledger WITHOUT growing the
+/// entry count past the cap. The only legal transformation is lossless
+/// coalescing: adjacent or overlapping bounded windows of the exact same
+/// path@revision (complete capture, non-empty revision) merge into their
+/// identical union, and one whole-file window subsumes its identity group.
+/// The covered set is therefore identical before and after — no coverage is
+/// fabricated. Returns `false` with the ledger unchanged when even the
+/// coalesced ledger cannot represent the window; the caller must then
+/// classify the observation as untracked novelty, never as a proven repeat.
+fn consolidate_evidence_coverage(
+    existing: &mut Vec<FileBodyWindow>,
+    window: &FileBodyWindow,
+) -> bool {
+    debug_assert!(existing.len() >= MAX_EVIDENCE_COVERAGE_WINDOWS);
+    fn merge_identity(candidate: &FileBodyWindow) -> Option<(String, String)> {
+        if !candidate.complete {
+            return None;
+        }
+        let revision = candidate
+            .revision
+            .as_deref()
+            .map(str::trim)
+            .filter(|revision| !revision.is_empty())?;
+        Some((
+            agent_contracts::normalize_resource_path(&candidate.path),
+            revision.to_string(),
+        ))
+    }
+    let Some(window_identity) = merge_identity(window) else {
+        return false;
+    };
+    let mut group: Vec<(u32, u32)> = Vec::new();
+    let mut kept: Vec<FileBodyWindow> = Vec::new();
+    for candidate in existing.iter() {
+        let joins = merge_identity(candidate).is_some_and(|other| other == window_identity);
+        if joins && candidate.covers_file {
+            // A stored whole-file window already covers every interval of
+            // this identity, so the coverage predicate would have reported
+            // the window known before consolidation. Defensive only.
+            return true;
+        }
+        if joins
+            && let (Some(start), Some(end)) = (candidate.start_line, candidate.end_line)
+            && start <= end
+        {
+            group.push((start, end));
+        } else {
+            kept.push(candidate.clone());
+        }
+    }
+    let new_range = if window.covers_file {
+        if group.is_empty() {
+            // Nothing of this identity to subsume: the entry count would
+            // grow past the cap.
+            return false;
+        }
+        None
+    } else {
+        match (window.start_line, window.end_line) {
+            (Some(start), Some(end)) if start <= end => Some((start, end)),
+            _ => return false,
+        }
+    };
+    let mut intervals = group.clone();
+    if let Some(range) = new_range {
+        intervals.push(range);
+    }
+    intervals.sort_unstable();
+    let mut merged: Vec<(u32, u32)> = Vec::new();
+    for (start, end) in intervals {
+        // Same adjacency rule as the contract coverage predicate; entries
+        // are sorted, so the last interval is the only merge candidate.
+        if merged
+            .last()
+            .is_some_and(|(prev_start, prev_end)| *prev_start <= start && prev_end + 1 >= start)
+        {
+            let (first, last) = merged.pop().expect("checked non-empty");
+            merged.push((first, last.max(end)));
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let represented = if window.covers_file { 1 } else { merged.len() };
+    if kept.len() + represented > MAX_EVIDENCE_COVERAGE_WINDOWS {
+        return false;
+    }
+    *existing = kept;
+    if window.covers_file {
+        existing.push(window.clone());
+    } else {
+        for (start, end) in merged {
+            existing.push(FileBodyWindow {
+                path: window.path.clone(),
+                revision: window.revision.clone(),
+                start_line: Some(start),
+                end_line: Some(end),
+                covers_file: false,
+                complete: true,
+            });
+        }
+    }
     true
 }
 

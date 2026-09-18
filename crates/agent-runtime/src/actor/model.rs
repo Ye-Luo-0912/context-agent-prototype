@@ -359,6 +359,20 @@ impl FinalPackInputs {
         self.packing_total.unwrap_or(self.input_total)
     }
 }
+
+/// BR4: one explicit decision — may this round start although a task
+/// MustSurface requirement cannot be satisfied? Ordinary execution rounds
+/// refuse fail-closed. A text-only finalization round (completion-repair
+/// terminal or budget text finalization) carries no tool execution
+/// obligations: its schemas and mandatory set are already empty, it must
+/// not send tools, and the missing requirement names a tool this round
+/// will never call — so it never blocks the reserved answer.
+fn refuses_for_unavailable_must(
+    text_only: Option<crate::surface::TextOnlyFinalizationReason>,
+    unavailable_must: &[ToolSurfaceRequirement],
+) -> bool {
+    text_only.is_none() && !unavailable_must.is_empty()
+}
 impl RuntimeActor {
     /// Prepare + spawn one model round: close the consumed tool frames,
     /// maintenance, materialize, assemble, then the model call as an
@@ -751,16 +765,15 @@ impl RuntimeActor {
             },
         ));
 
-        let mut unavailable_must = Vec::new();
+        // Unsatisfiable MustSurface requirements stay typed as requirements
+        // until the refusal decision, so a text-only finalization round can
+        // waive them into the audit omissions without losing information.
+        let mut unavailable_must: Vec<ToolSurfaceRequirement> = Vec::new();
         let mut unavailable_optional = Vec::new();
         for requirement in &requirements {
             if !candidate_names.contains(requirement.tool_name.as_str()) {
                 if requirement.demand == ToolSurfaceDemand::MustSurface {
-                    unavailable_must.push(ToolSurfaceBlock {
-                        tool_name: requirement.tool_name.clone(),
-                        demand: requirement.demand,
-                        reason: ToolSurfaceBlockReason::Unavailable,
-                    });
+                    unavailable_must.push(requirement.clone());
                 } else {
                     unavailable_optional.push(requirement.clone());
                 }
@@ -788,6 +801,11 @@ impl RuntimeActor {
         if let Some(turn) = self.state.turn.as_mut() {
             turn.recovery_surface_request = None;
         }
+        // The text-only mode is applied BEFORE the MustSurface gate consults
+        // it (BR4): an ordinary execution round fail-closes on a missing
+        // required tool, but a text-only finalization round carries no tool
+        // execution obligations at all, so the reserved answer must not be
+        // blocked by a tool this round will never call.
         if completion_repair_terminal {
             surface_plan.force_completion_finalization();
         } else if self.services.max_tool_rounds() > 1
@@ -811,8 +829,21 @@ impl RuntimeActor {
         for requirement in &unavailable_optional {
             surface_plan.add_unavailable(requirement);
         }
+        // BR4: a text-only finalization round waives its unsatisfiable
+        // MustSurface requirements instead of refusing; the waived rows stay
+        // visible in the audit report rather than vanishing silently.
+        if surface_plan.text_only_finalization().is_some() {
+            for requirement in &unavailable_must {
+                surface_plan.add_unavailable(requirement);
+            }
+        }
 
-        if !completion_repair_terminal && !unavailable_must.is_empty() {
+        // BR4: the refusal decision reads the explicit text-only mode from
+        // the plan. Ordinary execution rounds stay fail-closed; both
+        // text-only finalization reasons (completion-repair terminal and
+        // budget text finalization) carry no tool execution obligations
+        // and must not be blocked by a required tool they will never call.
+        if refuses_for_unavailable_must(surface_plan.text_only_finalization(), &unavailable_must) {
             let surface_revision = match self.issue_surface_revision() {
                 Ok(revision) => revision,
                 Err(error) => {
@@ -820,6 +851,14 @@ impl RuntimeActor {
                     return;
                 }
             };
+            let blocked = unavailable_must
+                .iter()
+                .map(|requirement| ToolSurfaceBlock {
+                    tool_name: requirement.tool_name.clone(),
+                    demand: requirement.demand,
+                    reason: ToolSurfaceBlockReason::Unavailable,
+                })
+                .collect();
             let report = surface_plan.unsatisfiable_report(
                 SurfaceReportContext {
                     turn_id,
@@ -829,7 +868,7 @@ impl RuntimeActor {
                     input_budget_tokens: 0,
                 },
                 ToolSurfaceBlockReason::Unavailable,
-                unavailable_must,
+                blocked,
             );
             if let Err(error) = self
                 .core
@@ -2888,6 +2927,462 @@ mod failure_class_tests {
             }),
             (RuntimeFailureClass::Runtime, false),
             "local buffering pressure is neither provider damage nor retryable"
+        );
+    }
+}
+
+/// BR4: text-only finalization must not be blocked by a required tool the
+/// reserved answer will never call. These tests drive the real actor flow
+/// with controlled fixtures (no provider traffic).
+#[cfg(test)]
+mod budget_finalization_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use agent_contracts::{
+        AgentError, AgentResult, ContextDiagnostics, ContextEngine, ContextIngress,
+        ContextItemSummary, ContextMaintenanceReport, ContextMaintenanceTrigger, ContextQuery,
+        ContextStateTransition, MaterializedContext, ModelCapabilities, ModelChunk, ModelEventSink,
+        ModelOutput, ModelRequest, ModelTransport, RuntimeEvent, RuntimeEventEnvelope, ScopeId,
+        ScopeKind, ToolCall, ToolCatalogEntry, ToolDispatcher, ToolExecutionRequest, ToolLifecycle,
+        ToolOutcome, ToolOutput, ToolRisk, ToolSpec, ToolSurfaceDemand, ToolSurfaceOmissionReason,
+        ToolSurfacePlanStatus, ToolSurfaceRequirement,
+    };
+    use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
+
+    use super::refuses_for_unavailable_must;
+    use crate::surface::TextOnlyFinalizationReason;
+    use crate::{RuntimeHandle, RuntimeServices, spawn_runtime};
+
+    fn fs_read_spec() -> ToolSpec {
+        ToolSpec {
+            name: "fs.read".into(),
+            description: "read a workspace file".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }
+    }
+
+    /// A second, fail-closed tool that stays on the surface across rounds,
+    /// so the reserved text round has a schema to displace (the budget
+    /// finalization marker stays observable).
+    fn docs_search_spec() -> ToolSpec {
+        ToolSpec {
+            name: "docs.search".into(),
+            description: "search docs".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        }
+    }
+
+    /// Empty in-process engine: no context bodies participate.
+    #[derive(Debug)]
+    struct FinalizationTestEngine;
+
+    #[async_trait::async_trait]
+    impl ContextEngine for FinalizationTestEngine {
+        async fn ingest(&self, _ingress: ContextIngress) -> AgentResult<()> {
+            Ok(())
+        }
+        async fn maintain(
+            &self,
+            _trigger: ContextMaintenanceTrigger,
+        ) -> AgentResult<ContextMaintenanceReport> {
+            Ok(ContextMaintenanceReport::default())
+        }
+        async fn materialize(&self, _query: ContextQuery) -> AgentResult<MaterializedContext> {
+            Ok(MaterializedContext {
+                materialization_id: 0,
+                focus: None,
+                task: None,
+                items: Vec::new(),
+                external: agent_contracts::ContextMapView::default(),
+                selected: Vec::new(),
+                approx_tokens: 0,
+                foreground: Vec::new(),
+                required_item_ids: Vec::new(),
+                required_misses: Default::default(),
+                optional_misses: Default::default(),
+                diagnostics: ContextDiagnostics::default(),
+            })
+        }
+        async fn open_scope(
+            &self,
+            _kind: ScopeKind,
+            _parent: Option<ScopeId>,
+        ) -> AgentResult<ScopeId> {
+            Ok(ScopeId::new())
+        }
+        async fn close_scope(
+            &self,
+            _scope_id: ScopeId,
+        ) -> AgentResult<Vec<ContextStateTransition>> {
+            Ok(Vec::new())
+        }
+        async fn diagnostics(&self) -> AgentResult<ContextDiagnostics> {
+            Ok(ContextDiagnostics::default())
+        }
+        async fn inspect(&self, _limit: usize) -> AgentResult<Vec<ContextItemSummary>> {
+            Ok(Vec::new())
+        }
+        async fn checkpoint(&self) -> AgentResult<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+        async fn restore(&self, _data: serde_json::Value) -> AgentResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Answers with one `fs.read` tool call, then with a plain final answer.
+    /// Every request is recorded so the test can assert the final round's
+    /// tool surface.
+    #[derive(Debug, Default)]
+    struct ScriptedModel {
+        text_on_round: usize,
+        requests: Mutex<Vec<ModelRequest>>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelTransport for ScriptedModel {
+        fn capabilities(&self) -> ModelCapabilities {
+            ModelCapabilities {
+                streaming: true,
+                tool_calls: true,
+                max_output_tokens: 512,
+                context_window: Some(30_000),
+            }
+        }
+        async fn complete(&self, _request: ModelRequest) -> AgentResult<ModelOutput> {
+            unreachable!("streaming model should be driven through complete_stream")
+        }
+        async fn complete_stream(
+            &self,
+            request: ModelRequest,
+            sink: &dyn ModelEventSink,
+        ) -> AgentResult<ModelOutput> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            if request.cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            self.requests.lock().unwrap().push(request);
+            sink.on_chunk(ModelChunk::Done).await?;
+            if index + 1 < self.text_on_round {
+                Ok(ModelOutput {
+                    content: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "fs.read".into(),
+                        arguments: serde_json::json!({ "path": "src/auth.rs" }),
+                    }],
+                    usage: Default::default(),
+                })
+            } else {
+                Ok(ModelOutput {
+                    content: "reserved ordinary final answer".into(),
+                    tool_calls: Vec::new(),
+                    usage: Default::default(),
+                })
+            }
+        }
+    }
+
+    /// A task-required `fs.read` that really dies after its first execution:
+    /// the second round cannot reload it, so the MustSurface requirement
+    /// becomes unsatisfiable mid-turn.
+    #[derive(Debug, Default)]
+    struct DyingToolDispatcher {
+        loaded: AtomicBool,
+        dead: AtomicBool,
+        executions: AtomicUsize,
+    }
+
+    impl DyingToolDispatcher {
+        fn alive(&self) -> bool {
+            self.loaded.load(Ordering::SeqCst) && !self.dead.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolDispatcher for DyingToolDispatcher {
+        fn specs(&self) -> Vec<ToolSpec> {
+            let mut specs = vec![docs_search_spec()];
+            if self.alive() {
+                specs.push(fs_read_spec());
+            }
+            specs
+        }
+        fn catalog(&self) -> Vec<ToolCatalogEntry> {
+            vec![
+                ToolCatalogEntry {
+                    name: "fs.read".into(),
+                    state: if self.alive() {
+                        ToolLifecycle::Loaded
+                    } else {
+                        ToolLifecycle::Available
+                    },
+                    owner: "builtin".into(),
+                    description: "read a workspace file".into(),
+                    risk: ToolRisk::ReadOnly,
+                    roles: Vec::new(),
+                },
+                ToolCatalogEntry {
+                    name: "docs.search".into(),
+                    state: ToolLifecycle::Loaded,
+                    owner: "builtin".into(),
+                    description: "search docs".into(),
+                    risk: ToolRisk::ReadOnly,
+                    roles: Vec::new(),
+                },
+            ]
+        }
+        fn load_tool(&self, name: &str) -> AgentResult<()> {
+            if name != "fs.read" {
+                return Err(AgentError::InvalidRequest(format!("unknown tool: {name}")));
+            }
+            if self.dead.load(Ordering::SeqCst) {
+                return Err(AgentError::Tool("fs.read source died mid-turn".into()));
+            }
+            self.loaded.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn inspect_tool(&self, name: &str) -> Option<ToolSpec> {
+            (name == "fs.read").then(fs_read_spec)
+        }
+        async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            self.dead.store(true, Ordering::SeqCst);
+            self.loaded.store(false, Ordering::SeqCst);
+            Ok(ToolOutcome::Value(ToolOutput {
+                call_id: request.call.id,
+                tool_name: request.call.name,
+                ok: true,
+                summary: "read".into(),
+                model_content: "file body".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({ "path": "src/auth.rs", "revision": "r1" }),
+            }))
+        }
+    }
+
+    async fn start_turn(
+        max_tool_rounds: usize,
+        text_on_round: usize,
+    ) -> (
+        RuntimeHandle,
+        Arc<ScriptedModel>,
+        Arc<DyingToolDispatcher>,
+        Vec<RuntimeEvent>,
+    ) {
+        let model = Arc::new(ScriptedModel {
+            text_on_round,
+            ..ScriptedModel::default()
+        });
+        let tools = Arc::new(DyingToolDispatcher::default());
+        let kernel = Arc::new(RuntimeServices::new(
+            CoreAuthorityConfig {
+                max_tool_rounds,
+                ..CoreAuthorityConfig::default()
+            },
+            Arc::new(FinalizationTestEngine),
+            model.clone(),
+            tools.clone(),
+            Arc::new(PolicyApprovalGate::read_only()),
+            None,
+        ));
+        let (handle, _task) = spawn_runtime(kernel);
+        let mut events = handle.subscribe();
+        handle.start().await.unwrap();
+        handle
+            .set_focus("budget text finalization".into())
+            .await
+            .unwrap();
+        let task_id = handle.list_tasks().await.unwrap()[0].id;
+        handle
+            .replace_task_tool_requirements(
+                task_id,
+                0,
+                vec![ToolSurfaceRequirement {
+                    tool_name: "fs.read".into(),
+                    demand: ToolSurfaceDemand::MustSurface,
+                    reason: "task requires the reader".into(),
+                }],
+            )
+            .await
+            .unwrap();
+        handle.user_message("start".into()).await.unwrap();
+        let collected = drain_until_terminal(&mut events).await;
+        (handle, model, tools, collected)
+    }
+
+    async fn drain_until_terminal(
+        events: &mut tokio::sync::broadcast::Receiver<RuntimeEventEnvelope>,
+    ) -> Vec<RuntimeEvent> {
+        let mut collected = Vec::new();
+        loop {
+            let envelope = tokio::time::timeout(Duration::from_secs(30), events.recv())
+                .await
+                .expect("the turn must reach a terminal event in time")
+                .expect("the event stream stays live");
+            let terminal = matches!(
+                envelope.event,
+                RuntimeEvent::TurnCompleted | RuntimeEvent::TurnFailed { .. }
+            );
+            collected.push(envelope.event);
+            if terminal {
+                return collected;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn budget_text_finalization_round_survives_a_missing_required_tool() {
+        let (_handle, model, tools, events) = start_turn(2, 2).await;
+
+        // The reserved text finalization round is sent even though the task
+        // requirement names a tool that died mid-turn.
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, RuntimeEvent::TurnFailed { .. })),
+            "a budget text finalization round must not be refused: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TurnCompleted))
+        );
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the reserved final round must be sent");
+        assert!(
+            !requests[0].tools.is_empty(),
+            "the ordinary execution round still surfaces the required tool"
+        );
+        assert!(
+            requests[1].tools.is_empty(),
+            "the text-only finalization round must not offer any tool schema"
+        );
+        assert_eq!(
+            tools.executions.load(Ordering::SeqCst),
+            1,
+            "the text round must not execute tools (authority unchanged)"
+        );
+
+        // Event-stream separation: the budget-forced final round is
+        // identifiable in the durable surface report, so accounting can
+        // tell it apart from a naturally converged final.
+        let reports: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ToolSurfacePlanned { report } => Some(report),
+                _ => None,
+            })
+            .collect();
+        let last = reports.last().expect("surface reports were emitted");
+        assert_eq!(last.model_round, 2);
+        assert_eq!(last.status, ToolSurfacePlanStatus::Ready);
+        assert_eq!(last.selected_total, 0);
+        assert!(
+            reports[..reports.len() - 1].iter().all(|report| report
+                .omitted
+                .iter()
+                .all(|omission| omission.reason
+                    != ToolSurfaceOmissionReason::DecisionBudgetFinalization))
+        );
+        assert!(
+            last.omitted.iter().any(|omission| {
+                omission.reason == ToolSurfaceOmissionReason::DecisionBudgetFinalization
+                    && omission.tool_name == "docs.search"
+            }),
+            "the reserved round carries the budget finalization marker: {last:?}"
+        );
+        assert!(
+            last.omitted.iter().any(|omission| {
+                omission.reason == ToolSurfaceOmissionReason::Unavailable
+                    && omission.tool_name == "fs.read"
+                    && omission.demand == ToolSurfaceDemand::MustSurface
+            }),
+            "the waived MustSurface requirement stays in the audit trail: {last:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_execution_round_still_refuses_a_missing_required_tool() {
+        // Round 2 is an ordinary execution round here (budget not yet
+        // exhausted): the fail-closed MustSurface refusal is preserved.
+        let (_handle, model, tools, events) = start_turn(8, 2).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TurnFailed { .. })),
+            "an ordinary round with an unsatisfiable MustSurface tool must refuse"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TurnCompleted)),
+            "the refused turn never commits"
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert_eq!(tools.executions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn naturally_converged_final_carries_no_budget_finalization_marker() {
+        // The model converges in round 1, well inside the budget: the final
+        // is natural, so no surface report may carry the budget marker.
+        let (_handle, model, _tools, events) = start_turn(4, 1).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::TurnCompleted))
+        );
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        let marked = events.iter().any(|event| {
+            matches!(event, RuntimeEvent::ToolSurfacePlanned { report }
+            if report.omitted.iter().any(|omission| {
+                omission.reason == ToolSurfaceOmissionReason::DecisionBudgetFinalization
+            }))
+        });
+        assert!(
+            !marked,
+            "a naturally converged final must stay distinguishable from a budget-forced final"
+        );
+    }
+
+    #[test]
+    fn only_ordinary_rounds_refuse_for_unavailable_must() {
+        let missing = vec![ToolSurfaceRequirement {
+            tool_name: "fs.read".into(),
+            demand: ToolSurfaceDemand::MustSurface,
+            reason: "task requires the reader".into(),
+        }];
+        assert!(
+            refuses_for_unavailable_must(None, &missing),
+            "ordinary execution rounds stay fail-closed"
+        );
+        assert!(!refuses_for_unavailable_must(
+            Some(TextOnlyFinalizationReason::DecisionBudgetExhausted),
+            &missing
+        ));
+        assert!(!refuses_for_unavailable_must(
+            Some(TextOnlyFinalizationReason::CompletionRepairTerminal),
+            &missing
+        ));
+        assert!(
+            !refuses_for_unavailable_must(None, &[]),
+            "no missing tool, no refusal"
         );
     }
 }

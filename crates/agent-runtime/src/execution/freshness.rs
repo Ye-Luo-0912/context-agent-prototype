@@ -30,7 +30,7 @@ impl ExecutionState {
         self.last_turn = turn;
         let identity = operation_identity(output, "", None);
         let delta = FrontierDelta::RedundantEvidence;
-        self.update_convergence(&identity, None, delta);
+        self.update_convergence(&identity, None, delta, ObservationEvidence::None);
         self.refresh_validity();
         super::state::FrontierObservation {
             delta,
@@ -371,7 +371,10 @@ impl ExecutionState {
                 }
             }
         };
-        self.update_convergence(&identity, output.failure_class(), delta);
+        // BR3: the observation classification rides into convergence
+        // accounting so an untracked window (local coverage summary full)
+        // can never be counted as repeated behavior.
+        self.update_convergence(&identity, output.failure_class(), delta, obs_evidence);
         super::state::FrontierObservation {
             delta,
             actions_since_frontier_advance: self.convergence.actions_since_frontier_advance,

@@ -1469,6 +1469,196 @@ fn fs_read_disjoint_windows_remain_redundant_after_an_abab_loop() {
     assert_eq!(resume.evidence[0].coverage.len(), 2);
 }
 
+// ---- BR3: coverage-ledger saturation cannot prove repetition ----
+
+/// A successful `fs.read` window of `src/auth.rs@abc123`. The model content
+/// differs per interval so each disjoint window is a distinct semantic
+/// observation; the production cap (`MAX_VISIBLE_BODY_WINDOWS`) is used
+/// unchanged.
+fn windowed_read(start: u32, end: u32) -> ToolOutput {
+    windowed_read_at("abc123", start, end)
+}
+
+fn windowed_read_at(revision: &str, start: u32, end: u32) -> ToolOutput {
+    let mut out = read_output("src/auth.rs", revision);
+    out.model_content = format!("lines {start}-{end}");
+    out.metadata["start_line"] = json!(start);
+    out.metadata["end_line"] = json!(end);
+    out
+}
+
+/// Disjoint windows, one gap wide, so no two fills are adjacent or
+/// overlapping: window `index` spans `10*index+1 ..= 10*index+5`.
+fn fill_disjoint_windows(resume: &mut ExecutionState) {
+    for index in 0..agent_contracts::MAX_VISIBLE_BODY_WINDOWS as u32 {
+        let start = index * 10 + 1;
+        let observation =
+            resume.observe_tool(&windowed_read(start, start + 4), 1, index as u64 + 1);
+        assert_eq!(
+            observation.delta,
+            agent_contracts::FrontierDelta::EvidenceAdvanced,
+            "window {index} is a previously unseen range"
+        );
+    }
+    assert_eq!(
+        resume.evidence[0].coverage.len(),
+        agent_contracts::MAX_VISIBLE_BODY_WINDOWS,
+        "the production cap is reached without merging"
+    );
+}
+
+#[test]
+fn saturated_ledger_reports_untracked_novelty_not_repeated() {
+    let mut resume = ExecutionState::default();
+    fill_disjoint_windows(&mut resume);
+
+    // First read past the local summary cap: the runtime cannot compare
+    // what it did not retain. Honest no-progress debt, never a proven
+    // repeat and never "repeated behavior" for the stall signature.
+    let untracked = resume.observe_tool(&windowed_read(1001, 1005), 1, 99);
+    assert_eq!(
+        untracked.delta,
+        agent_contracts::FrontierDelta::NoProgress,
+        "untracked novelty claims neither progress nor repetition"
+    );
+    assert_eq!(untracked.actions_since_frontier_advance, 1);
+    assert_eq!(
+        resume.stall.consecutive_no_progress, 0,
+        "an untracked window must not drive the stall signature"
+    );
+    assert!(
+        !agent_contracts::visible_body_windows_cover(
+            &resume.evidence[0].coverage,
+            "src/auth.rs",
+            Some("abc123"),
+            Some(1001),
+            Some(1005)
+        ),
+        "the ledger must not pretend to cover what it could not retain"
+    );
+}
+
+#[test]
+fn saturated_ledger_still_proves_known_windows_repeated() {
+    let mut resume = ExecutionState::default();
+    fill_disjoint_windows(&mut resume);
+
+    // Positive control: a retained window is still exactly comparable.
+    let repeat = resume.observe_tool(&windowed_read(1, 5), 1, 99);
+    assert_eq!(
+        repeat.delta,
+        agent_contracts::FrontierDelta::RedundantEvidence
+    );
+    assert_eq!(
+        resume.evidence[0].coverage.len(),
+        agent_contracts::MAX_VISIBLE_BODY_WINDOWS
+    );
+}
+
+#[test]
+fn bridgeable_window_consolidates_the_saturated_ledger() {
+    let mut resume = ExecutionState::default();
+    fill_disjoint_windows(&mut resume);
+
+    // (6,10) is adjacent to the retained (1,5) window: coalescing the two
+    // into (1,10) keeps the covered union identical and frees no slot
+    // beyond the cap, so the observation stays fully tracked.
+    let bridged = resume.observe_tool(&windowed_read(6, 10), 1, 99);
+    assert_eq!(
+        bridged.delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced,
+        "an adjacent window is representable without growing the ledger"
+    );
+    let coverage = &resume.evidence[0].coverage;
+    assert!(coverage.len() <= agent_contracts::MAX_VISIBLE_BODY_WINDOWS);
+    assert!(
+        agent_contracts::visible_body_windows_cover(
+            coverage,
+            "src/auth.rs",
+            Some("abc123"),
+            Some(6),
+            Some(10)
+        ),
+        "the bridged window is covered after the merge"
+    );
+    assert!(
+        agent_contracts::visible_body_windows_cover(
+            coverage,
+            "src/auth.rs",
+            Some("abc123"),
+            Some(1),
+            Some(5)
+        ),
+        "coalescing preserves the covered union"
+    );
+    assert_eq!(resume.stall.consecutive_no_progress, 0);
+}
+
+#[test]
+fn new_revision_resets_untracked_accounting() {
+    let mut resume = ExecutionState::default();
+    fill_disjoint_windows(&mut resume);
+    let untracked = resume.observe_tool(&windowed_read(1001, 1005), 1, 99);
+    assert_eq!(untracked.delta, agent_contracts::FrontierDelta::NoProgress);
+    assert!(resume.convergence.untracked_observations > 0);
+
+    // A new content revision is a different evidence identity: it replaces
+    // the row, starts a fresh bounded ledger and ends the untracked
+    // episode instead of inheriting its counters.
+    let changed = resume.observe_tool(&windowed_read_at("def456", 1, 5), 1, 100);
+    assert_eq!(
+        changed.delta,
+        agent_contracts::FrontierDelta::EvidenceAdvanced
+    );
+    assert_eq!(changed.actions_since_frontier_advance, 0);
+    assert_eq!(resume.evidence[0].coverage.len(), 1);
+    assert_eq!(
+        resume.convergence.untracked_observations, 0,
+        "a provable advance ends the untracked episode"
+    );
+}
+
+#[test]
+fn frontier_warning_reports_unknown_coverage_not_repetition() {
+    let mut resume = ExecutionState::default();
+    fill_disjoint_windows(&mut resume);
+    for turn in 0..FRONTIER_ADVISORY_THRESHOLD {
+        let observation = resume.observe_tool(
+            &windowed_read(2001 + turn * 10, 2005 + turn * 10),
+            1,
+            200 + turn as u64,
+        );
+        assert_eq!(
+            observation.delta,
+            agent_contracts::FrontierDelta::NoProgress,
+            "untracked windows are honest no-progress, not redundant reads"
+        );
+    }
+
+    let warning = resume
+        .frontier_warning()
+        .expect("advisory fires at the threshold");
+    assert!(
+        warning.contains("coverage"),
+        "the hint must express the coverage fact: {warning}"
+    );
+    assert!(
+        !warning.contains("Re-reading known state"),
+        "a first read of an untracked region is not a repetition: {warning}"
+    );
+    assert!(
+        resume.stall_warning().is_none(),
+        "untracked reads never fabricate a stall"
+    );
+    assert!(
+        !resume
+            .convergence
+            .recent_deltas
+            .iter()
+            .any(|delta| { matches!(delta, agent_contracts::FrontierDelta::RedundantEvidence) })
+    );
+}
+
 #[test]
 fn known_edit_advances_world_and_invalidates_revision_bound_evidence() {
     let mut resume = ExecutionState::default();

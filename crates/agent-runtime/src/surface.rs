@@ -19,6 +19,27 @@ use crate::budget::{MAX_TOOL_SURFACE_TOKENS, approx_layer_tokens};
 
 const MAX_SNAPSHOT_OMISSIONS: usize = 128;
 
+/// Why one model round is a text-only finalization instead of an ordinary
+/// execution round. Both reasons share one rule set — the round carries no
+/// tool execution obligations (a missing required tool cannot block it),
+/// it must not send tools (schemas and the mandatory set stay empty), it
+/// must not grow an implicit extra round, and it never announces durable
+/// task acceptance or completion by itself. The reasons stay semantically
+/// separate (BR4): a completion-repair terminal closes a refused-completion
+/// repair episode, while a budget finalization spends the reserved last
+/// host-permitted round on an ordinary restricted answer. One is never
+/// folded into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TextOnlyFinalizationReason {
+    /// The bounded completion-repair episode reached its terminal stage:
+    /// Runtime asks for an ordinary final answer and the durable gate stays
+    /// shut.
+    CompletionRepairTerminal,
+    /// The host decision budget is exhausted (`model_round >=
+    /// max_tool_rounds`): the reserved last round answers in plain text.
+    DecisionBudgetExhausted,
+}
+
 /// Mutable only while one round is being prepared. It is consumed into the
 /// final immutable `ToolSurfaceSnapshot` before `ModelStarted` is emitted.
 pub(crate) struct RoundSurfacePlan {
@@ -39,6 +60,11 @@ pub(crate) struct RoundSurfacePlan {
     schema_profiles: BTreeMap<String, SchemaProfile>,
     schema_rejected: Vec<String>,
     schema_compiled: bool,
+    /// Explicit text-only mode of this round, set only through
+    /// [`Self::force_completion_finalization`] /
+    /// [`Self::force_budget_finalization`]. `None` marks an ordinary
+    /// execution round whose MustSurface obligations stay enforced.
+    text_only: Option<TextOnlyFinalizationReason>,
 }
 
 #[derive(Clone, Copy)]
@@ -214,11 +240,19 @@ impl RoundSurfacePlan {
             schema_profiles: BTreeMap::new(),
             schema_rejected: Vec::new(),
             schema_compiled: false,
+            text_only: None,
         }
     }
 
     pub(crate) fn specs(&self) -> &[ToolSpec] {
         &self.specs
+    }
+
+    /// The explicit text-only mode of this round, if any. The round
+    /// preparation gate consults this instead of guessing from separate
+    /// booleans: text-only rounds carry no tool execution obligations.
+    pub(crate) fn text_only_finalization(&self) -> Option<TextOnlyFinalizationReason> {
+        self.text_only
     }
 
     pub(crate) fn source_revisions_mut(&mut self) -> &mut ToolSurfaceSourceRevisions {
@@ -262,14 +296,28 @@ impl RoundSurfacePlan {
     /// final answer. Every removed schema remains visible in the audit report
     /// with its original demand and authority origin.
     pub(crate) fn force_completion_finalization(&mut self) {
-        self.force_text_finalization(ToolSurfaceOmissionReason::CompletionFinalization);
+        self.force_text_finalization(
+            TextOnlyFinalizationReason::CompletionRepairTerminal,
+            ToolSurfaceOmissionReason::CompletionFinalization,
+        );
     }
 
+    /// Reserve this decision for the plain-text answer that closes the
+    /// host-permitted round budget. No extra call, auto-acceptance or effect
+    /// replay follows from the mode itself.
     pub(crate) fn force_budget_finalization(&mut self) {
-        self.force_text_finalization(ToolSurfaceOmissionReason::DecisionBudgetFinalization);
+        self.force_text_finalization(
+            TextOnlyFinalizationReason::DecisionBudgetExhausted,
+            ToolSurfaceOmissionReason::DecisionBudgetFinalization,
+        );
     }
 
-    fn force_text_finalization(&mut self, reason: ToolSurfaceOmissionReason) {
+    fn force_text_finalization(
+        &mut self,
+        reason: TextOnlyFinalizationReason,
+        omission_reason: ToolSurfaceOmissionReason,
+    ) {
+        self.text_only = Some(reason);
         let specs = std::mem::take(&mut self.specs);
         // The omission sample may already be full from earlier budget
         // decisions. Reserve one diagnostic slot so a text-only surface can
@@ -297,7 +345,7 @@ impl RoundSurfacePlan {
                     tool_name: spec.name,
                     demand,
                     origin,
-                    reason,
+                    reason: omission_reason,
                     approx_tokens,
                 },
             );
@@ -1330,6 +1378,60 @@ mod tests {
             snapshot.schema_profiles.len(),
             snapshot.specs.len(),
             "profiles must match the surviving specs exactly"
+        );
+    }
+    #[test]
+    fn text_only_finalization_modes_are_explicit_and_distinct() {
+        let build = |requirements: &[ToolSurfaceRequirement]| {
+            let candidates = ToolSurfaceSnapshot {
+                specs: vec![spec("required.must", 10)],
+                generation: 7,
+                source_revisions: ToolSurfaceSourceRevisions {
+                    builtin_catalog_generation: 7,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            RoundSurfacePlan::build(candidates, requirements, |_| true)
+        };
+        let requirements = vec![requirement("required.must", ToolSurfaceDemand::MustSurface)];
+
+        let ordinary = build(&requirements);
+        assert_eq!(
+            ordinary.text_only_finalization(),
+            None,
+            "a built plan is an ordinary execution round"
+        );
+        assert_eq!(ordinary.specs().len(), 1);
+
+        let mut budget = build(&requirements);
+        budget.force_budget_finalization();
+        assert_eq!(
+            budget.text_only_finalization(),
+            Some(TextOnlyFinalizationReason::DecisionBudgetExhausted)
+        );
+        assert!(
+            budget.specs().is_empty(),
+            "a text-only round must not send any tool schema"
+        );
+        assert_eq!(budget.mandatory_schema_tokens(), 0);
+        assert!(
+            budget
+                .omissions
+                .iter()
+                .any(|row| { row.reason == ToolSurfaceOmissionReason::DecisionBudgetFinalization })
+        );
+
+        let mut repair = build(&requirements);
+        repair.force_completion_finalization();
+        assert_eq!(
+            repair.text_only_finalization(),
+            Some(TextOnlyFinalizationReason::CompletionRepairTerminal)
+        );
+        assert_ne!(
+            budget.text_only_finalization(),
+            repair.text_only_finalization(),
+            "completion-repair terminal and budget finalization stay semantically separate"
         );
     }
 }
