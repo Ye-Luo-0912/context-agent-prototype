@@ -949,7 +949,14 @@ def _finalize(cfg: RunnerConfig, state: _RunState, campaign_dir: Path, work_dir:
     events_path = state.out_dir / "events.jsonl"
     if events_path.exists():
         try:
-            event_rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            raw_rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            # The headless journal wraps each event in an envelope row
+            # ({"run_id", "seq", "event": {...}}); summary counting works on
+            # the unwrapped events.
+            event_rows = [
+                row["event"] if isinstance(row, dict) and isinstance(row.get("event"), dict) else row
+                for row in raw_rows
+            ]
         except (OSError, json.JSONDecodeError):
             event_rows = []
     terminals = [row for row in event_rows if isinstance(row, dict) and row.get("type") in ("turn_failed", "turn_completed", "recovery_required")]
