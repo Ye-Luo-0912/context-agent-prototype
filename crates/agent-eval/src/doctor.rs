@@ -244,12 +244,19 @@ async fn provider_probe() -> DoctorStep {
         None => OpenAiProtocol::default(),
     };
     let context_window = envfile::context_window().unwrap_or(128_000);
+    // Mirror the configured serving instead of a hardcoded 16-output-token
+    // floor: a reasoning-style model (e.g. deepseek-flash) exhausts 16
+    // output tokens before producing the answer and the stream ends with
+    // finish_reason=length, which reads as a data-plane failure even
+    // though the endpoint accepted the request and reported usage. The
+    // configured cap bounds cost the same way it does in production.
+    let max_output_tokens = envfile::max_output_tokens().unwrap_or(16);
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
         model,
         protocol,
-        max_output_tokens: 16,
+        max_output_tokens,
         timeout: Duration::from_secs(60),
         send_stream_options: true,
         send_max_tokens: true,
