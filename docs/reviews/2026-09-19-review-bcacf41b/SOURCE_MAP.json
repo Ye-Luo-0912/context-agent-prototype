@@ -1,0 +1,370 @@
+{
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "branch": "codex/runtime-endurance-full-plan",
+  "head": "bcacf41b9104db6ebada7adfc2a95de5e341f49b",
+  "parent": "24c354cb1f7507efa990e2b10bfef9b185e75d5d",
+  "review_date_jst": "2026-09-19",
+  "whole_repository_line_by_line_complete": false,
+  "files_read_count": 22,
+  "sources": [
+    {
+      "path": "docs/CURRENT.md",
+      "coverage": "部分：全文请求被截断；仅审阅返回部分",
+      "requested_ranges": [
+        "全文请求（截断）"
+      ],
+      "citation_bases": [
+        "turn681file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/CURRENT.md"
+    },
+    {
+      "path": "docs/NEXT_TASKS.md",
+      "coverage": "部分：指定区间返回被截断",
+      "requested_ranges": [
+        "1–90 请求（截断）"
+      ],
+      "citation_bases": [
+        "turn682file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/NEXT_TASKS.md"
+    },
+    {
+      "path": "docs/experiments/runtime-endurance-v1/RUN_2026-09-19-FULL-PLAN.md",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn684file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/experiments/runtime-endurance-v1/RUN_2026-09-19-FULL-PLAN.md"
+    },
+    {
+      "path": "docs/experiments/runtime-endurance-v1/PLAN.md",
+      "coverage": "部分：全文请求被截断",
+      "requested_ranges": [
+        "全文请求（截断）"
+      ],
+      "citation_bases": [
+        "turn685file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/experiments/runtime-endurance-v1/PLAN.md"
+    },
+    {
+      "path": "scripts/runtime_endurance_full_campaign.py",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn686file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/scripts/runtime_endurance_full_campaign.py"
+    },
+    {
+      "path": "scripts/runtime_endurance_incremental_runner.py",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn687file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/scripts/runtime_endurance_incremental_runner.py"
+    },
+    {
+      "path": "docs/experiments/runtime-endurance-v1/RUN_2026-09-19-L1.md",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn688file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/experiments/runtime-endurance-v1/RUN_2026-09-19-L1.md"
+    },
+    {
+      "path": "docs/experiments/runtime-endurance-v1/RUN_2026-09-19-L1-COMPLETE.md",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn689file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/experiments/runtime-endurance-v1/RUN_2026-09-19-L1-COMPLETE.md"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/lifecycle.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "1–185",
+        "560–825"
+      ],
+      "citation_bases": [
+        "turn690file0",
+        "turn693file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/src/actor/lifecycle.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/maintenance.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "920–1165"
+      ],
+      "citation_bases": [
+        "turn691file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/src/actor/maintenance.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/model.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "735–940"
+      ],
+      "citation_bases": [
+        "turn692file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/src/actor/model.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/execution/state.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "1–320",
+        "630–825",
+        "980–1305",
+        "1320–1660",
+        "1800–2160"
+      ],
+      "citation_bases": [
+        "turn694file0",
+        "turn699file0",
+        "turn700file0",
+        "turn706file0",
+        "turn707file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/src/execution/state.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/prompt.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "1–235",
+        "300–630"
+      ],
+      "citation_bases": [
+        "turn695file0",
+        "turn696file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/src/prompt.rs"
+    },
+    {
+      "path": "scripts/runtime_endurance_preflight.py",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn698file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/scripts/runtime_endurance_preflight.py"
+    },
+    {
+      "path": "crates/agent-runtime/tests/turn/failure_resume.rs",
+      "coverage": "全文（连续区间覆盖）",
+      "requested_ranges": [
+        "1–275",
+        "275–545",
+        "545–820（文件实际结束于794）"
+      ],
+      "citation_bases": [
+        "turn701file0",
+        "turn703file0",
+        "turn708file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/tests/turn/failure_resume.rs"
+    },
+    {
+      "path": "crates/agent-runtime/src/actor/safepoint.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "280–635",
+        "630–800"
+      ],
+      "citation_bases": [
+        "turn702file0",
+        "turn709file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/src/actor/safepoint.rs"
+    },
+    {
+      "path": "crates/context-simple/src/gc/reachability.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "180–285",
+        "635–680",
+        "670–965"
+      ],
+      "citation_bases": [
+        "turn705file0",
+        "turn714file0",
+        "turn718file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/context-simple/src/gc/reachability.rs"
+    },
+    {
+      "path": "docs/experiments/runtime-endurance-v1/scenario.json",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn710file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/experiments/runtime-endurance-v1/scenario.json"
+    },
+    {
+      "path": "docs/walkthroughs/2026-09-18-t8-kv-live.md",
+      "coverage": "全文",
+      "requested_ranges": [
+        "全文"
+      ],
+      "citation_bases": [
+        "turn712file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/docs/walkthroughs/2026-09-18-t8-kv-live.md"
+    },
+    {
+      "path": "crates/agent-runtime/src/surface.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "130–310"
+      ],
+      "citation_bases": [
+        "turn713file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-runtime/src/surface.rs"
+    },
+    {
+      "path": ".github/workflows/ci.yml",
+      "coverage": "区间",
+      "requested_ranges": [
+        "1–90"
+      ],
+      "citation_bases": [
+        "turn715file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/.github/workflows/ci.yml"
+    },
+    {
+      "path": "crates/agent-tui/src/cli.rs",
+      "coverage": "区间",
+      "requested_ranges": [
+        "1–290"
+      ],
+      "citation_bases": [
+        "turn717file0"
+      ],
+      "citation_visible_lines": "L2-L2",
+      "url": "https://github.com/Ye-Luo-0912/context-agent-prototype/blob/bcacf41b9104db6ebada7adfc2a95de5e341f49b/crates/agent-tui/src/cli.rs"
+    }
+  ],
+  "metadata_sources": {
+    "branches": "turn719file0 L2-L2",
+    "commit": "turn711file0 L2-L2",
+    "actions_initial": "turn697file0 L2-L2"
+  },
+  "changed_path_count": 38,
+  "changed_paths": [
+    "crates/agent-contracts/src/context.rs",
+    "crates/agent-contracts/src/tool.rs",
+    "crates/agent-process/tests/host.rs",
+    "crates/agent-runtime/src/actor/lifecycle.rs",
+    "crates/agent-runtime/src/actor/maintenance.rs",
+    "crates/agent-runtime/src/actor/mod.rs",
+    "crates/agent-runtime/src/actor/model.rs",
+    "crates/agent-runtime/src/actor/safepoint.rs",
+    "crates/agent-runtime/src/actor/turn.rs",
+    "crates/agent-runtime/src/checkpoint.rs",
+    "crates/agent-runtime/src/execution/body_cache.rs",
+    "crates/agent-runtime/src/execution/snapshot.rs",
+    "crates/agent-runtime/src/execution/state.rs",
+    "crates/agent-runtime/src/execution/tests.rs",
+    "crates/agent-runtime/src/prompt.rs",
+    "crates/agent-runtime/src/surface.rs",
+    "crates/agent-runtime/tests/actor/budget.rs",
+    "crates/agent-runtime/tests/actor/protocol_bodies.rs",
+    "crates/agent-runtime/tests/turn/failure_resume.rs",
+    "crates/agent-runtime/tests/turn/main.rs",
+    "crates/agent-runtime/tests/turn/settlement.rs",
+    "docs/CONFIGURATION.md",
+    "docs/EXECUTION_COHERENCE.md",
+    "docs/EXECUTION_CONVERGENCE_V1.md",
+    "docs/RECOVERY_RUNBOOK.md",
+    "docs/experiments/runtime-endurance-v1/AGENT_TASK.md",
+    "docs/experiments/runtime-endurance-v1/PLAN.md",
+    "docs/experiments/runtime-endurance-v1/RUN_2026-09-18-FIXED.md",
+    "docs/experiments/runtime-endurance-v1/RUN_2026-09-18.md",
+    "docs/experiments/runtime-endurance-v1/RUN_2026-09-19-FULL-PLAN.md",
+    "docs/experiments/runtime-endurance-v1/RUN_2026-09-19-L1-COMPLETE.md",
+    "docs/experiments/runtime-endurance-v1/RUN_2026-09-19-L1.md",
+    "docs/experiments/runtime-endurance-v1/scenario.json",
+    "docs/reviews/2026-09-18-longflow-convergence/FAILURE_RESUME.md",
+    "docs/reviews/2026-09-18-longflow-convergence/RECEIPT.md",
+    "scripts/runtime_endurance_full_campaign.py",
+    "scripts/runtime_endurance_incremental_runner.py",
+    "scripts/runtime_endurance_preflight.py"
+  ],
+  "not_retrieved": [
+    {
+      "path": "target/runtime-endurance-v1/incremental-platform-20260919/full-campaign-receipt.json",
+      "result": "GitHub fetch_file at fixed SHA returned 404; does not prove absent on user machine"
+    }
+  ],
+  "local_environment": {
+    "cargo": false,
+    "rustc": false,
+    "dotnet": false,
+    "python": true,
+    "git": true,
+    "node": true,
+    "checkout": "git remote access failed DNS; no local repository tests"
+  },
+  "external_primary_sources": [
+    {
+      "title": "Python subprocess documentation",
+      "url": "https://docs.python.org/3/library/subprocess.html",
+      "citation": "turn666487view0"
+    },
+    {
+      "title": "OpenAI prompt caching documentation",
+      "url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+      "citation": "turn666487view1"
+    }
+  ]
+}

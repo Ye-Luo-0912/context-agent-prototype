@@ -1,0 +1,19 @@
+{
+  "head": "bcacf41b9104db6ebada7adfc2a95de5e341f49b",
+  "branch": "codex/runtime-endurance-full-plan",
+  "actions_query": {
+    "total_count": 0,
+    "workflow_runs": [],
+    "source": "turn697file0 L2-L2"
+  },
+  "trigger_rule": {
+    "push_branches": [
+      "main"
+    ],
+    "pull_request": true,
+    "source": "turn715file0 L2-L2"
+  },
+  "verdict": "NO_ACTIONS_RUN_OBSERVED_NOT_A_FAILURE_AND_NOT_A_PASS",
+  "parent_green_reused": false,
+  "local_rust_execution_by_reviewer": false
+}

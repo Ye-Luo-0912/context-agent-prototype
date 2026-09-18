@@ -8,6 +8,40 @@
 
 **第十一批（`d3a05d29` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十一批与五份回执；CI 终验 run `35289417269` 首跑全绿）。** 第十批已全部关闭（CI 终验 run `35278745998` 与钉宽后 run `35282364426` 见 CURRENT.md）。条件任务 T8 亦已关闭（2026-09-18，授权付费实验：ENDPOINT_ACCEPTED=PASS／SERVER_HIT=OBSERVED／token 口径全落账、金额 NOT_RUN；`context_manage` 租赁打断供应商前缀复用实测成立，见 NEXT_TASKS T8 节与 [t8 证据](walkthroughs/2026-09-18-t8-kv-live.md)）；host_e2e 起始基线抖动为未定性观察（见 CURRENT.md 已知抖动记录）。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
 
+## 第十二批（`bcacf41b` 续审：耐久分支 BR1–BR7＋E-1 证据分层）——B-1 先行；A-1 组合回归紧随；C 线切片与 A/B 线并行
+
+审查基线 `bcacf41b`（报告：[REVIEW.md](reviews/2026-09-19-review-bcacf41b/REVIEW.md)，任务规格：[NEXT_ACTIONS.md](reviews/2026-09-19-review-bcacf41b/NEXT_ACTIONS.md)，证据口径：[TEST_EVIDENCE.md](reviews/2026-09-19-review-bcacf41b/TEST_EVIDENCE.md)，覆盖表：[COVERAGE.md](reviews/2026-09-19-review-bcacf41b/COVERAGE.md)，机制探针：[MECHANISM_RESULTS.json](reviews/2026-09-19-review-bcacf41b/MECHANISM_RESULTS.json)）。主线：**同一项义务跨时间、分页、失败和恢复保持一致；测试控制器自身不抹掉失败或预算缺口。** 沿现有三线继续修，不重做架构，GUI 后置不变。BR 编号仅属于本报告，不重用旧 H/G/S 编号。耐久分支已有真实进展保留（输出上限失败后同任务恢复、应用负载、T8 真实命中）；COMPLETE_WITH_MANUAL_REPAIR 等分层事实不合并宣称。文件所有权：B-1=context-simple；A-1=actor/{safepoint,lifecycle,maintenance}＋failure_resume 测试；A-2=execution/state.rs＋actor/model.rs＋surface.rs；C 线=scripts（C-1 与 C-2 同文件串行）。
+
+### B-1 — 冷页语义更新义务（BR1，P1，context-simple；先行）
+用户动作：多页历史已外置时，用户明确替代旧要求；之后的新要求不能被更早的替代误伤。
+- 现状：`PendingColdSemanticIntent`（H2 引入）保存可匹配多目标的谓词，但安装时任意 entry 命中即整条 `consumed=true`——首批终结 A、第二批的 B 仍 Live；无创建时点/目录视图绑定，未命中即长期保留，旧意图可终结后来同任务新建的同条件要求；冷路径按输入前 4000 字符截断副本做否定/保留判定，完整消息尾部修订丢失；Verify 形状匹配后即使 `has_matching_verification_evidence` 因证据未加载为 false 仍返回 true。
+- 修复：收敛为有界、持久的**目标视图内更新义务**——绑定目标集合或目录视图/因果上界，逐目标独立结算（处理 A 不清 B）；未解析目标≠无目标，已终态幂等、未解析、证据暂不可验证结果分开；需要全文语义时沿现有来源引用取回或保持未确定，不以有损前缀为终态证明。不全历史 hydration、不无限 pin、不建新记忆库。
+- 回归：两条同条件旧记录分两批安装必须全部更新；旧 intent 无匹配后同任务新建匹配决策不被终结；by 证据暂不可读不消费未结算目标；超 4000 字符、尾部保留修订冷热结果相同；处理中途 checkpoint/restore；跨任务与已终态负对照。
+- 停止：上述反例与现有生命周期定向测试通过；不顺便改评分算法、不引入向量检索/新存储引擎。
+
+### A-1 — 失败检查点的真实捕获结果（BR2，P2，agent-runtime；B-1 后做组合回归）
+用户动作：旧维护/快照在途时，新回合失败仍保住正确继续边界，status/cancel 可响应。
+- 现状：失败回合遇占用 GC 通道 → 增加 `FailedTurnYield` debt → `safe_point_resume_commit()` → 无条件 `captured=true`。capture 返回 `()`，遇在途 `checkpoint_write/checkpoint_prepare` 直接提前返回——调用方无法区分"已创建含新 debt 的快照"与"旧工作在途尚未捕获"。旧 prepare S1 完成只退休自己冻结的旧 debt；续接不再补捕获，durability gate 因剩余 debt 进 RecoveryRequired（可避免的继续执行阻断；持久门禁本身不放宽）。
+- 修复：capture 返回类型化结果（如 `Captured{sequence, debt_basis}`／`Deferred`／`AlreadySatisfied`）；只有对应失败义务确实进入快照才标记已捕获；旧 prepare 完成后按当前义务重新驱动，同一序列只能退休自己的 debt。保持单 lane、取消代际、终态与严格持久门禁，不靠清空 debt 消除围栏。
+- 回归：复用 failure_resume.rs 的 OccupiedBoundaryContext 与 read-first 模型，组合 F10+F12（即 scenario C7）：旧 task GC 占道 → 新 task anchor debt/read-first → 旧 prepare 在途 → Provider 失败 → 释放两门 → 新失败 debt 被真正捕获；不取消应 CheckpointDurable 后 TurnFailed 且无多余 RecoveryRequired；取消只一个 TurnCancelled 不发布迟到 TurnFailed；再次恢复同 TaskId 指令身份与工具结果不重放。
+- 停止：不绕开 durability gate；继续复用现有单通道，不新增调度器。
+
+### A-2 — 收敛诊断与最后文本轮（BR3+BR4，P2，agent-runtime）
+- BR3 现状：`coverage_saturated`（新窗口不在已知集合且覆盖表已满）被并入 `equivalent_observation` → 同版本、current 的未见窗口返回 `Repeated`，下游停滞/前沿提示把首次阅读新区域说成重复已知内容。修复：容量用尽返回不可比较/未追踪（不伪造 covered、不造重复证据）；先尝试不扩大集合的合法区间合并；窗口摘要不直接驱动强制完成。回归用实际生产 cap：新窗口、已知窗口、可桥接窗口、新 revision 的分类与下一次 prompt 核对；不提额、不删正文。
+- BR4 现状：`force_budget_finalization` 清空工具 schema/mandatory 表示最后一轮纯文本，但更早算出的 `unavailable_must` 拒绝分支只豁免 `completion_repair_terminal`，不豁免预算文本收尾——不准备再调用工具仍可能因缺失工具被拒发最后一轮。修复：统一显式 text-only 收尾模式，由模式决定该轮是否还有工具执行义务；普通执行轮 MustSurface 仍严守；文本收尾可解释限制但不调用工具、不加隐式额外轮次、不自动宣布任务验收。回归固定总请求上限＋缺失工具，验证可报告受限结果、Core 权限不放宽；预算强制 final 与模型自然收敛分开统计。
+- 停止：未知覆盖不伪报重复；文本收尾和安全边界都通过；不引入强行自主完成的启发式。
+
+### C-1 — 测试控制器清理、退出与产物保全（BR5+BR7，P2，scripts）
+- BR5 现状：`Popen.communicate(timeout=780)` 超时不杀子进程，finally 只关 relay 写 usage 账；metadata/summary 在 finally 之后被异常跳过；child 非零退出／`protected_unchanged=false` 只 print 不进 runner 退出码，外层编排可能误判阶段成功。修复：一处无条件收尾拥有 child/relay 结束顺序（停新请求→限时请求停止→只终止自己创建的进程树→reap→写清理结果），正常/异常/取消都写终态回执；child 非零、保护文件变化、recovery fence、账目不完整分别有明确退出状态；不杀无关进程，未确认清理独立报告；错误不伪装成应用验收失败，成功也不掩盖保护边界失败。
+- BR7 现状：campaign 路径固定，`setup()` `exist_ok=True` 无条件重写种子 FILES 与 baseline-lock；`l0()` 先调 `setup()`——重跑把已改应用覆盖回 v1、新增模块残留成混合工作区、baseline 重置 PREPARED/0 calls 而旧 segment 回执仍在。修复：新 campaign 排他创建；resume 只验证已有身份不重铺 seed；显式重置单列操作（新目录或明确破坏性操作）。
+- 定向验证（本地进程/fixture，不接真实供应商）：超时、KeyboardInterrupt、启动失败、挂起 relay、正常终态、第二次 setup 拒绝且原应用/baseline/回执哈希不变、child 非零、保护 hash 变化。
+
+### C-2 — campaign 额度与 attempt 账（BR6，P2，scripts；与 C-1 同文件，C-1 后串行）
+现状：每 segment `spend=0` 不读取/继承全 campaign 硬余额；只查已结算 spend 无受理预留（0.99<1.00 仍放行估计 0.10 的请求，并发可同见旧余额）；usage parser 任一计数字段即接受、缺失 input/output/cache 随后 `or 0` 补齐；上游 open/读流的部分异常路径不进 Unknown 结算；$1.04 为 runner 自身估计非独立复算账单。修复：沿现有账目为整个 campaign 持久 committed/reserved/unknown，每个真实 attempt 先预约有限额度、结束统一结算；缺测不补零，拿不到可靠上界停止新付费受理；跨段沿剩余额度继续；usage 字段按实际端点解释（T8 走 Chat、runner 走 Responses，不因模型名共用提取函数）；预算受理校验 CLI 数值有限非负，采样率/时长/轮数等实际配置写入回执；不靠调大额度让测试完成。本地 relay 用合成 usage 测试：完整/部分/无 usage、read 失败、429 重试、并发、跨段重启、临界末次调用。合成用量不得写成真实费用。
+
+### E-1 — 证据分层与 T8 标签修正（文档）——已关闭（本批提交）
+分层记录六项真实状态：自主交付／人工修复后验收／Runtime 故障覆盖／应用负载／KV 命中／费用对照，各自关联实际证据或 NOT_EXERCISED（scenario.json 已有层次基础，不另建报告系统）。已修：t8 walkthrough 的 cross-run first-request hit 标签（首轮 1536；16896 为 11 轮段总）。下一份付费实验前：先定向反例与短同任务轨迹（纠正—工具执行—失败—恢复—交付），应用负载实现相关变更才重跑 soak；KV 布局对照须同任务、同起点、同验收并含缓存读写/主/维护/重试总成本；错误终结约束得到的短上下文与误判重复得到的少轮次不算优化。
+
 ## 第十一批（`d3a05d29` 续审：C0 残余＋H1–H5＋KV 扩展）——已全部关闭（2026-09-18，本地集成回归全绿；CI 终验 run `35289417269` 全绿）
 
 审查基线 `d3a05d29`（报告：[REVIEW.md](reviews/2026-09-18-review-d3a05d29/REVIEW.md)，任务规格：[NEXT_ACTIONS.md](reviews/2026-09-18-review-d3a05d29/NEXT_ACTIONS.md)，覆盖表：[COVERAGE.md](reviews/2026-09-18-review-d3a05d29/COVERAGE.md)，CI 摘录：[CI_OBSERVATION.md](reviews/2026-09-18-review-d3a05d29/CI_OBSERVATION.md)，机制探针：[MECHANISM_RESULTS.json](reviews/2026-09-18-review-d3a05d29/MECHANISM_RESULTS.json)）。主线：**启发式相关性不能直接决定约束失效；冷热驻留位置不能决定语义；字节预算不能代替字符边界；写前拒绝不等同于日志损坏。** 审查环境无 Rust 工具链，红例全部由实施补齐并实测转绿；五个切片文件所有权互不重叠、五 agent 并行实施、按片独立提交；同一 crate 内串行（H1→H2；H3→H5）。第九/第十批修复保留未重开。

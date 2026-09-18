@@ -1,0 +1,50 @@
+{
+  "head": "bcacf41b9104db6ebada7adfc2a95de5e341f49b",
+  "files": [
+    {
+      "path": "CI_OBSERVATION.json",
+      "bytes": 489,
+      "sha256": "39ca04c4f40c012f31e121ddb35248e0754524f62b3ea7672e254ef5c6209221"
+    },
+    {
+      "path": "COVERAGE.md",
+      "bytes": 4007,
+      "sha256": "44c99c4197e1b435ec20962017dddc27717c732c5cfa46ed13a637e71ddd8dc7"
+    },
+    {
+      "path": "MECHANISM_RESULTS.json",
+      "bytes": 3229,
+      "sha256": "6e975971d56defffb349614e5cef380f0e9f2778ce84f9913038bd519d61e15b"
+    },
+    {
+      "path": "NEXT_ACTIONS.md",
+      "bytes": 6500,
+      "sha256": "69e24a95f1ab522c0b6b404a0e6248a50d63801d60c6e7c5744e3b08a2b2f001"
+    },
+    {
+      "path": "README.md",
+      "bytes": 789,
+      "sha256": "9351b8a6f273c839eeacd67cd0dd4dc4ed5234b3f921688ecaabe18c17e67a47"
+    },
+    {
+      "path": "REVIEW.md",
+      "bytes": 14881,
+      "sha256": "e2645e8088990cf8c860db673beebb37e58fd4b3c6a7b6ff3d592fe2d8778b7d"
+    },
+    {
+      "path": "SOURCE_MAP.json",
+      "bytes": 13156,
+      "sha256": "f48a69d90a9192c8dec3fc38cd899e619d3286c9cd6a82880ed7ec9460425d31"
+    },
+    {
+      "path": "TEST_EVIDENCE.md",
+      "bytes": 4061,
+      "sha256": "bfdccfa3f11b6995a496b89065791ccdda9e359051c1808be309de740f51682b"
+    },
+    {
+      "path": "mechanism_probes.py",
+      "bytes": 10619,
+      "sha256": "53e2c9daa1dbc2c750e341a034ba2321b4f9d9369ae9b83f8edbe98905d18652"
+    }
+  ]
+}

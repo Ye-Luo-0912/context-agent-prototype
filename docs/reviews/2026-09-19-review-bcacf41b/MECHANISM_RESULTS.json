@@ -1,0 +1,98 @@
+{
+  "schema": "review-mechanisms/v1",
+  "baseline": "bcacf41b9104db6ebada7adfc2a95de5e341f49b",
+  "python": "3.13.5",
+  "platform": "Linux",
+  "scope": "offline control-flow models and two disposable OS/file API checks; no Rust/.NET/paid-model execution",
+  "provider_calls": 0,
+  "probes": {
+    "checkpoint_capture_flag": {
+      "kind": "CONTROL_FLOW_MODEL_NOT_RUST_REPRO",
+      "source": [
+        "actor/lifecycle.rs::resume_failed_turn_checkpoint",
+        "actor/safepoint.rs::safe_point_resume_commit"
+      ],
+      "precondition": "old checkpoint prepare and GC lane both occupied",
+      "captured_flag": true,
+      "new_snapshot_created": false,
+      "remaining_debt": [
+        "FailedTurnYield"
+      ],
+      "continuation_fenced": true,
+      "production_interleaving_executed": false
+    },
+    "cold_semantic_intents": {
+      "kind": "CONTROL_FLOW_AND_TRUNCATION_MODEL_NOT_RUST_REPRO",
+      "source": "context-simple/gc/reachability.rs::apply_cold_semantic_intents_on_install",
+      "two_batch_states": {
+        "old-A": "Superseded",
+        "old-B": "Live"
+      },
+      "remaining_intents": [],
+      "newer_matching_entry_eligible_without_cutoff": true,
+      "message_chars": 4322,
+      "full_text_negation_protected": true,
+      "copied_prefix_negation_protected": false
+    },
+    "coverage_saturation": {
+      "kind": "PARAMETERIZED_CONTROL_FLOW_MODEL",
+      "source": "execution/state.rs::record_observation_evidence",
+      "probe_cap_not_production_constant": 2,
+      "known": [
+        [
+          1,
+          10
+        ],
+        [
+          21,
+          30
+        ]
+      ],
+      "incoming": [
+        41,
+        50
+      ],
+      "known_covered": false,
+      "result": "Repeated",
+      "drops_source_body": false
+    },
+    "relay_budget_and_partial_usage": {
+      "kind": "RUNNER_LOGIC_PROBE_SYNTHETIC_AMOUNTS",
+      "source": "scripts/runtime_endurance_incremental_runner.py",
+      "new_request_admitted": true,
+      "illustrative_limit": 1.0,
+      "illustrative_spend_after_response": 1.09,
+      "partial_usage": {
+        "input_tokens": 1000
+      },
+      "missing_output_converted_to": 0,
+      "missing_cache_converted_to": 0,
+      "partial_usage_marked_unknown": false,
+      "independent_segments_each_below_limit": true,
+      "illustrative_combined_spend": 1.2,
+      "provider_calls": 0,
+      "actual_user_budget_exceeded": "NOT_DETERMINED"
+    },
+    "popen_timeout": {
+      "kind": "ACTUAL_LOCAL_POPEN_CHECK_NOT_RUNTIME_TEST",
+      "timeout_raised": true,
+      "child_alive_immediately_after_communicate_timeout": true,
+      "probe_cleanup_reaped_child": true,
+      "remaining_probe_child": false,
+      "tests_windows_tree_cleanup": false
+    },
+    "setup_overwrite": {
+      "kind": "ACTUAL_TEMPORARY_FILE_POLICY_CHECK_NOT_USER_CAMPAIGN",
+      "previous_implementation_overwritten": true,
+      "additional_module_left_behind": true,
+      "baseline_replaced": true
+    },
+    "budget_finalization": {
+      "kind": "CONTROL_FLOW_MODEL",
+      "source": "actor/model.rs budget finalization vs unavailable_must",
+      "text_only_finalization_selected": true,
+      "model_still_refused": true,
+      "authorization_relaxed": false
+    }
+  }
+}
