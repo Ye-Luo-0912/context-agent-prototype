@@ -1026,10 +1026,13 @@ def _finalize(cfg: RunnerConfig, state: _RunState, campaign_dir: Path, work_dir:
 def run_segment(cfg: RunnerConfig) -> int:
     """Run one segment and return this process's layered exit code."""
     _validate_config(cfg)
-    campaign_dir = Path(cfg.campaign_dir)
-    work_dir = Path(cfg.work_dir) if cfg.work_dir is not None else campaign_dir / "workspace"
+    # The spawned child runs with cwd=work_dir, so every path handed to it
+    # (grant file, jsonl out, workspace) must be absolute no matter how the
+    # caller spelled --campaign-dir.
+    campaign_dir = Path(cfg.campaign_dir).resolve()
+    work_dir = Path(cfg.work_dir).resolve() if cfg.work_dir is not None else campaign_dir / "workspace"
     out_dir = campaign_dir / cfg.segment
-    ledger_path = Path(cfg.ledger_path) if cfg.ledger_path is not None else campaign_dir / "budget-ledger.json"
+    ledger_path = Path(cfg.ledger_path).resolve() if cfg.ledger_path is not None else campaign_dir / "budget-ledger.json"
     state = _RunState(out_dir=out_dir)
     try:
         mismatch = _verify_campaign_identity(cfg, campaign_dir)
