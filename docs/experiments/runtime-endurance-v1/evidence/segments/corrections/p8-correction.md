@@ -1,0 +1,16 @@
+P8 final delivery phase for the same task. Do not start a new task. Complete the
+remaining application delivery and acceptance work:
+
+- run current-version public and app tests, independent oracle, worker/crash,
+  outbox/receiver and migration checks; record exact commands and receipts;
+- finish README.md, DESIGN.md, migration guide, recovery runbook, benchmark
+  observations and RESULT.json under app/ with status matching real evidence;
+- stop only worker processes owned by this campaign and prove their exit; leave
+  no child or receiver process behind;
+- query final task detail and report ordinary final, TaskCompleted and operator
+  closure as separate facts. Do not call task.complete or claim operator
+  acceptance unless the typed evidence actually permits it.
+
+Keep protected TASK.md, tests, fixtures and oracle unchanged. Use the explicit
+Python executable in argv[0] for process.run. List every unexercised F01–F20 or
+combination honestly instead of manufacturing receipts.

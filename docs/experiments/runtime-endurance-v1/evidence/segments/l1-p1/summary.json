@@ -1,0 +1,28 @@
+{
+  "exit": 1,
+  "elapsed": 3.39,
+  "rounds": 1,
+  "tool_calls": 0,
+  "protected_unchanged": true,
+  "terminals": [
+    {
+      "type": "turn_failed",
+      "turn_id": "fc036d00-84d3-4972-8656-6cbf1c52a4db",
+      "task_id": "4bd3572d-f2d9-4028-8dd7-e77d325fe901",
+      "class": "provider_transport",
+      "retryable": false
+    }
+  ],
+  "session": {
+    "approval_denied": false,
+    "exit": 1,
+    "kind": "session_end",
+    "round_budget": false,
+    "schema": "agent.headless.v1",
+    "status": "failed",
+    "stop": "provider_transport",
+    "task_completed": false,
+    "task_state": "awaiting_operator_review"
+  },
+  "requests": 1
+}

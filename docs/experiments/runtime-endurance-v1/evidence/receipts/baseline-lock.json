@@ -1,0 +1,11 @@
+{
+  "head": "24c354cb1f7507efa990e2b10bfef9b185e75d5d",
+  "fixture_sha256": {
+    "TASK.md": "b08dc82cbb2a1a9ace3a6723e9ec0b6a37028a86084796d27743f1fe4c79737c",
+    "fixtures/input.jsonl": "15541f8cf4a2630d5e4eea960854c27fd510eb5ab85c7db7b5537bdc4a4767c6",
+    "fixtures/plan.json": "1deba8b4b41e7aff55f348b950fd6642e6867654f9c7174c535b7f26ce723a0d"
+  },
+  "runtime_binary_sha256": "ba8fda917603a724e45a5b23ccb02f568351aeed2be1bf7d180d064c874c7389",
+  "provider_attempts": 0,
+  "status": "PREPARED"
+}

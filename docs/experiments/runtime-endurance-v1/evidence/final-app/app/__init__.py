@@ -1,0 +1,1 @@
+"""Incremental data platform fixture."""

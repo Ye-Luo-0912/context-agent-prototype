@@ -1,0 +1,200 @@
+{
+  "cost_cap_usd": 1.2,
+  "estimated_peak_usd": 0.1547802,
+  "usage_known": true,
+  "cap_stopped": false,
+  "rows": [
+    {
+      "request": 1,
+      "input_tokens": 4841,
+      "cached_input_tokens": 0,
+      "output_tokens": 97,
+      "estimated_peak_usd": 0.0015687000000000001,
+      "cumulative_peak_usd": 0.0015687000000000001
+    },
+    {
+      "request": 2,
+      "input_tokens": 5217,
+      "cached_input_tokens": 0,
+      "output_tokens": 72,
+      "estimated_peak_usd": 0.0016515,
+      "cumulative_peak_usd": 0.0032202000000000003
+    },
+    {
+      "request": 3,
+      "input_tokens": 8191,
+      "cached_input_tokens": 0,
+      "output_tokens": 113,
+      "estimated_peak_usd": 0.0025928999999999995,
+      "cumulative_peak_usd": 0.0058131
+    },
+    {
+      "request": 4,
+      "input_tokens": 8459,
+      "cached_input_tokens": 0,
+      "output_tokens": 178,
+      "estimated_peak_usd": 0.0027513,
+      "cumulative_peak_usd": 0.0085644
+    },
+    {
+      "request": 5,
+      "input_tokens": 8318,
+      "cached_input_tokens": 0,
+      "output_tokens": 140,
+      "estimated_peak_usd": 0.0026634000000000002,
+      "cumulative_peak_usd": 0.0112278
+    },
+    {
+      "request": 6,
+      "input_tokens": 9150,
+      "cached_input_tokens": 0,
+      "output_tokens": 106,
+      "estimated_peak_usd": 0.0028721999999999997,
+      "cumulative_peak_usd": 0.0141
+    },
+    {
+      "request": 7,
+      "input_tokens": 13504,
+      "cached_input_tokens": 0,
+      "output_tokens": 136,
+      "estimated_peak_usd": 0.004214399999999999,
+      "cumulative_peak_usd": 0.018314399999999998
+    },
+    {
+      "request": 8,
+      "input_tokens": 21956,
+      "cached_input_tokens": 0,
+      "output_tokens": 72,
+      "estimated_peak_usd": 0.0066732,
+      "cumulative_peak_usd": 0.0249876
+    },
+    {
+      "request": 9,
+      "input_tokens": 22670,
+      "cached_input_tokens": 0,
+      "output_tokens": 70,
+      "estimated_peak_usd": 0.006885,
+      "cumulative_peak_usd": 0.0318726
+    },
+    {
+      "request": 10,
+      "input_tokens": 27667,
+      "cached_input_tokens": 0,
+      "output_tokens": 427,
+      "estimated_peak_usd": 0.0088125,
+      "cumulative_peak_usd": 0.0406851
+    },
+    {
+      "request": 11,
+      "input_tokens": 27773,
+      "cached_input_tokens": 0,
+      "output_tokens": 76,
+      "estimated_peak_usd": 0.008423100000000001,
+      "cumulative_peak_usd": 0.049108200000000005
+    },
+    {
+      "request": 12,
+      "input_tokens": 29801,
+      "cached_input_tokens": 0,
+      "output_tokens": 40,
+      "estimated_peak_usd": 0.0089883,
+      "cumulative_peak_usd": 0.0580965
+    },
+    {
+      "request": 13,
+      "input_tokens": 29288,
+      "cached_input_tokens": 0,
+      "output_tokens": 70,
+      "estimated_peak_usd": 0.008870399999999999,
+      "cumulative_peak_usd": 0.0669669
+    },
+    {
+      "request": 14,
+      "input_tokens": 24643,
+      "cached_input_tokens": 0,
+      "output_tokens": 71,
+      "estimated_peak_usd": 0.0074781,
+      "cumulative_peak_usd": 0.074445
+    },
+    {
+      "request": 15,
+      "input_tokens": 25014,
+      "cached_input_tokens": 0,
+      "output_tokens": 72,
+      "estimated_peak_usd": 0.007590599999999999,
+      "cumulative_peak_usd": 0.0820356
+    },
+    {
+      "request": 16,
+      "input_tokens": 26053,
+      "cached_input_tokens": 0,
+      "output_tokens": 75,
+      "estimated_peak_usd": 0.0079059,
+      "cumulative_peak_usd": 0.08994150000000001
+    },
+    {
+      "request": 17,
+      "input_tokens": 27435,
+      "cached_input_tokens": 0,
+      "output_tokens": 72,
+      "estimated_peak_usd": 0.0083169,
+      "cumulative_peak_usd": 0.09825840000000001
+    },
+    {
+      "request": 18,
+      "input_tokens": 28423,
+      "cached_input_tokens": 0,
+      "output_tokens": 75,
+      "estimated_peak_usd": 0.0086169,
+      "cumulative_peak_usd": 0.1068753
+    },
+    {
+      "request": 19,
+      "input_tokens": 26069,
+      "cached_input_tokens": 0,
+      "output_tokens": 68,
+      "estimated_peak_usd": 0.007902300000000001,
+      "cumulative_peak_usd": 0.11477760000000001
+    },
+    {
+      "request": 20,
+      "input_tokens": 26253,
+      "cached_input_tokens": 0,
+      "output_tokens": 69,
+      "estimated_peak_usd": 0.007958699999999999,
+      "cumulative_peak_usd": 0.1227363
+    },
+    {
+      "request": 21,
+      "input_tokens": 26712,
+      "cached_input_tokens": 0,
+      "output_tokens": 76,
+      "estimated_peak_usd": 0.008104799999999999,
+      "cumulative_peak_usd": 0.13084110000000002
+    },
+    {
+      "request": 22,
+      "input_tokens": 26287,
+      "cached_input_tokens": 0,
+      "output_tokens": 68,
+      "estimated_peak_usd": 0.0079677,
+      "cumulative_peak_usd": 0.1388088
+    },
+    {
+      "request": 23,
+      "input_tokens": 26264,
+      "cached_input_tokens": 0,
+      "output_tokens": 103,
+      "estimated_peak_usd": 0.008002800000000001,
+      "cumulative_peak_usd": 0.14681160000000001
+    },
+    {
+      "request": 24,
+      "input_tokens": 23134,
+      "cached_input_tokens": 0,
+      "output_tokens": 857,
+      "estimated_peak_usd": 0.0079686,
+      "cumulative_peak_usd": 0.1547802
+    }
+  ]
+}

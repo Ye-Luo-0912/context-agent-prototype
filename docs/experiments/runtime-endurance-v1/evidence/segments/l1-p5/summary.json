@@ -1,0 +1,24 @@
+{
+  "exit": 0,
+  "elapsed": 37.89,
+  "rounds": 24,
+  "tool_calls": 56,
+  "protected_unchanged": true,
+  "terminals": [
+    {
+      "type": "turn_completed"
+    }
+  ],
+  "session": {
+    "approval_denied": false,
+    "exit": 0,
+    "kind": "session_end",
+    "round_budget": false,
+    "schema": "agent.headless.v1",
+    "status": "completed",
+    "stop": "turn_completed",
+    "task_completed": false,
+    "task_state": "awaiting_operator_review"
+  },
+  "requests": 24
+}

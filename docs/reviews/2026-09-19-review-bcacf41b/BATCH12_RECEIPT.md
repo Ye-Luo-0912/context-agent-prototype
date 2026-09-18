@@ -68,10 +68,11 @@
 
 **限制**：预留估计保守（按满额输出计），会提前拒请求但不低估账单；价格为常量配置（换 profile 需改 `Pricing`），仍非真实账单；收尾时仍在流式传输的 handler 晚于强制结算的用量按 unknown 保留（保守方向）；"清理未确认"分支（taskkill 失败且 kill 超时）无直接测试，代码路径存在且映射退出码 14。
 
-## E-1 — 证据分层与 T8 标签（文档）——已关闭（`b78a3c94`）
+## E-1 — 证据分层与 T8 标签（文档）——已关闭（标签 `b78a3c94`；证据包随批收口提交）
 
 - t8 walkthrough 标签修正：cross-run 首请求 hit=**1536**；16896 是 11 轮段总（原文把两者混为一谈）。
 - 六项分层状态（自主交付／人工修复后验收／Runtime 故障覆盖／应用负载／KV 命中／费用对照）写入 NEXT_TASKS 第十二批 E-1 节；本批不改变 L1/FULL-PLAN 的 COMPLETE_WITH_MANUAL_REPAIR 分层事实。
+- **脱敏最小证据包已归档**：[docs/experiments/runtime-endurance-v1/evidence/](../../experiments/runtime-endurance-v1/evidence/README.md)——审查环境 404 的本机 `target/` 产物的回执级子集（总回执、final-app 验收、baseline-lock、soak、P3 回执；**5 个测试控制器源码**；8 个 segment 的 metadata/summary/usage 账本与纠正指令；冻结的最终 app+tests+oracle 身份），逐文件 sha256 清单＋[EVIDENCE_MAP.json](../../experiments/runtime-endurance-v1/evidence/EVIDENCE_MAP.json) 将 F01–F20/C1–C8 逐项链接到 campaign 证据、具名仓库回归（含验证过的测试名）或 NOT_EXERCISED。归档前全量扫描凭据模式（唯一命中为 "task-isolation" 误报）。限制如实：人工修复前的应用快照未被捕获；usage 账本为 runner 估计非供应商账单；wire 捕获/SQLite 等大体积原件留在本机 target/，不在包内。
 
 ## 第十二批集成回归（2026-09-19，本地 Windows，全部实际执行）
 

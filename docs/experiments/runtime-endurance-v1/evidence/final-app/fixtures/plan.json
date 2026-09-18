@@ -1,0 +1,1 @@
+[{"id":"select","op":"select","columns":["id","kind","amount"]},{"id":"only-a","op":"filter","input":"select","key":"kind","value":"a"},{"id":"sorted","op":"sort","input":"only-a","key":"amount"},{"id":"export","op":"export","input":"sorted"}]

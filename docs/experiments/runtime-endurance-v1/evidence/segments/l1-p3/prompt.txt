@@ -1,0 +1,22 @@
+P3 phase correction for the same task. Keep all P1/P2 work and current source
+versions. Implement and verify the concurrent-worker boundary now:
+
+- Run 4 independent worker processes against the application queue/database;
+  use transactional claims, expiring leases, fresh opaque tokens, stale-token
+  fencing, bounded retries and dependency blocking. A delayed old worker must
+  not overwrite a newer result.
+- Add an owned-child crash case: terminate one worker after claim and let a new
+  worker recover only after the declared lease boundary. Record process ids,
+  ownership and receipts; clean only children owned by this task.
+- Add a deterministic bounded load driver beginning at this phase. It may run
+  outside the model and application workers must remain separate owners. Use at
+  most 2 batches/second of 10 records for 90 minutes (108000 records maximum),
+  then compare all committed outputs with the independent oracle. Do not spend
+  model calls polling an idle load.
+- The model must run the current public tests and the independent worker/crash
+  checks through the explicit Python executable from its standing grant. For
+  process.run, argv[0] must be the full granted executable path; do not submit
+  an argv beginning with `-m`.
+
+Keep README/DESIGN/RESULT honest. Do not weaken atomicity, fencing, grants or
+immutable fixture protection. This is an in-task P3 correction, not a new task.

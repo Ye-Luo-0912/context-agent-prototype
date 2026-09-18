@@ -1,0 +1,23 @@
+P6 incident-repair correction for the same task. An independent verifier has
+re-run the current version and found any listed failures below (the controller
+will attach its exact receipt after this message). Fix only confirmed defects,
+preserve immutable tests, and do not retry an uncertain publication without
+querying its original receipt.
+
+The following long correction is a directive-preservation test. Keep every
+marker exactly in the task record and in the next cold-resume request:
+
+BEGIN-P6-CORRECTION: retain this exact beginning marker.
+MIDDLE-P6-CORRECTION: do not summarize away the migration, outbox and fencing requirements.
+END-P6-CORRECTION: retain this exact ending marker and list any unresolved gate.
+
+While this phase is running, the controller may return a malformed provider
+tool response after visible text and may leave an older checkpoint operation in
+flight. Treat the actual response as a failed turn, preserve the complete
+latest directive and do not replay a tool call after visible text. A new
+process must restore the current directive from the durable checkpoint before
+continuing. Keep process.run argv[0] equal to the explicit granted executable.
+
+Finish the confirmed application repair, recovery runbook, README/DESIGN and a
+RESULT.json that points to actual receipts. Ordinary final is not operator
+acceptance.

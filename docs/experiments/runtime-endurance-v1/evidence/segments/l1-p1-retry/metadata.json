@@ -1,0 +1,29 @@
+{
+  "head": "24c354cb1f7507efa990e2b10bfef9b185e75d5d",
+  "dirty_diff_sha256": "81af50e513e10628c7720f4f56d2f579dd6d9eebce02e7a715683d8a19394488",
+  "binary_sha256": "ba8fda917603a724e45a5b23ccb02f568351aeed2be1bf7d180d064c874c7389",
+  "protected_before": {
+    "TASK.md": "3f8e29df69bce5b3b13f9bf77275336d775c4b4b34e20e22901e6728cd5a74c6",
+    "tests/test_platform.py": "aacf345c399842a74f96682b94e1bef9d9a6a767047a5d67f6b3bb668bdb1876",
+    "fixtures/input.jsonl": "779bb980ebeae0ba95a6e8d4ab6dd592348df8e8beadf0012138309df0b91826",
+    "fixtures/plan.json": "68b4b3720de24b15b5cfc7a51658e03aad1c298c357ff866ca34978b22f2b262",
+    "oracle.py": "2e75ac224d722095963050b20819456242b09af8430ddd2ca9b0f2ce5dcde33c"
+  },
+  "round_cap": 24,
+  "max_output_tokens": 8192,
+  "cost_cap_usd": 1.5,
+  "model": "deepseek-flash",
+  "mode": "work",
+  "wire_capture": "forwarding relay; credentials omitted",
+  "exit": 0,
+  "elapsed": 108.86,
+  "requests": 24,
+  "protected_after": {
+    "TASK.md": "3f8e29df69bce5b3b13f9bf77275336d775c4b4b34e20e22901e6728cd5a74c6",
+    "tests/test_platform.py": "aacf345c399842a74f96682b94e1bef9d9a6a767047a5d67f6b3bb668bdb1876",
+    "fixtures/input.jsonl": "779bb980ebeae0ba95a6e8d4ab6dd592348df8e8beadf0012138309df0b91826",
+    "fixtures/plan.json": "68b4b3720de24b15b5cfc7a51658e03aad1c298c357ff866ca34978b22f2b262",
+    "oracle.py": "2e75ac224d722095963050b20819456242b09af8430ddd2ca9b0f2ce5dcde33c"
+  },
+  "protected_unchanged": true
+}

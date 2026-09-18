@@ -1,0 +1,3 @@
+{"at": 1789752265.4516096, "attempt": 1, "event": "claim", "job": "crash-job", "pid": 106248, "token": "3c9f6553ae094250ae86a8bb15bc465c", "worker": "crasher"}
+{"at": 1789752266.463746, "attempt": 2, "event": "claim", "job": "crash-job", "pid": 100204, "token": "4e1bca4220e94eb5a309ee76c2d6ba35", "worker": "reclaimer"}
+{"at": 1789752266.4767637, "digest": "6120223191738ba0fb759ad4b296f953c4d6e0ee48629bf90873c1c9d1d0937e", "event": "ack", "job": "crash-job", "pid": 100204, "token": "4e1bca4220e94eb5a309ee76c2d6ba35", "worker": "reclaimer"}

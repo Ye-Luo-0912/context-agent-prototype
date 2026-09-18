@@ -1,0 +1,54 @@
+{
+  "first_claim_observed": true,
+  "crasher_exit": 1,
+  "reclaimer_exit": 0,
+  "final": {
+    "id": "crash-job",
+    "state": "succeeded",
+    "payload": "{\"op\": \"echo\", \"value\": \"recover\"}",
+    "token": null,
+    "worker": "reclaimer",
+    "lease_expiry": null,
+    "attempts": 2,
+    "max_attempts": 3,
+    "last_error": null
+  },
+  "events": [
+    {
+      "seq": 1,
+      "job_id": "crash-job",
+      "kind": "enqueued",
+      "token": null,
+      "worker": null,
+      "detail": null,
+      "at": 1789752265.335124
+    },
+    {
+      "seq": 2,
+      "job_id": "crash-job",
+      "kind": "claimed",
+      "token": "3c9f6553ae094250ae86a8bb15bc465c",
+      "worker": "crasher",
+      "detail": "{\"attempt\": 1}",
+      "at": 1789752265.4516096
+    },
+    {
+      "seq": 3,
+      "job_id": "crash-job",
+      "kind": "claimed",
+      "token": "4e1bca4220e94eb5a309ee76c2d6ba35",
+      "worker": "reclaimer",
+      "detail": "{\"attempt\": 2}",
+      "at": 1789752266.463746
+    },
+    {
+      "seq": 4,
+      "job_id": "crash-job",
+      "kind": "acked",
+      "token": "4e1bca4220e94eb5a309ee76c2d6ba35",
+      "worker": null,
+      "detail": null,
+      "at": 1789752266.4767637
+    }
+  ]
+}

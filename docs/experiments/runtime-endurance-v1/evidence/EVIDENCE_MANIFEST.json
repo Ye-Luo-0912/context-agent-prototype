@@ -1,0 +1,469 @@
+{
+  "schema": "runtime-endurance-evidence/v1",
+  "campaign_root": "target/runtime-endurance-v1/incremental-platform-20260919 (untracked; this package freezes the receipt-level subset)",
+  "files": [
+    {
+      "path": "receipts/full-campaign-receipt.json",
+      "source": "<campaign>/full-campaign-receipt.json",
+      "sha256": "04b56702bfc0f08f0bc6930da8d20ebe349c9c9c5af884c6211b6e27b3b0bff0",
+      "bytes": 2095
+    },
+    {
+      "path": "receipts/final-app-verifier.json",
+      "source": "<campaign>/final-app-verifier.json",
+      "sha256": "e8908b8668a061b227213e330f4a2eea4f54c106a18c8e7e927105b86076e916",
+      "bytes": 769
+    },
+    {
+      "path": "receipts/baseline-lock.json",
+      "source": "<campaign>/baseline-lock.json",
+      "sha256": "8a5a778671f2e8f4a918e1890bbb8cb14f2e88f3d1bc6e3b8bb4091cc0733560",
+      "bytes": 510
+    },
+    {
+      "path": "receipts/l0-receipt.json",
+      "source": "<campaign>/l0-receipt.json",
+      "sha256": "efd78a999bca99668eb06194a943f8fec96998ebf23737ed1adc5fd310a1903a",
+      "bytes": 814
+    },
+    {
+      "path": "receipts/soak-receipt.json",
+      "source": "<campaign>/soak-receipt.json",
+      "sha256": "18c0981a89302030313b5ebe1f97c4779bc96027a9f17d9855876da010fcaae0",
+      "bytes": 787
+    },
+    {
+      "path": "receipts/p3-receipt-v2.json",
+      "source": "<campaign>/p3-receipt-v2.json",
+      "sha256": "e556070055fb0662a96861b321736aa61e53b135de74b8118c6e3f629da2786c",
+      "bytes": 2562
+    },
+    {
+      "path": "receipts/p3-crash-receipt.json",
+      "source": "<campaign>/p3-crash-receipt.json",
+      "sha256": "5658c7bec873183150dfe56492324d94a7f00bf60ec2370cdcf07ab29af4ff5d",
+      "bytes": 1257
+    },
+    {
+      "path": "receipts/crash-receipts.jsonl",
+      "source": "<campaign>/crash-receipts.jsonl",
+      "sha256": "46b3f1357c4186b0f48c86e02f5b83163f940d91f2fa9d13985d62a4482c383a",
+      "bytes": 548
+    },
+    {
+      "path": "controllers/p3_controller.py",
+      "source": "<campaign>/p3_controller.py",
+      "sha256": "3caea0e1d27d0274eb511dd6f31cd831bc70e466a898caa01bbe8efb0f956279",
+      "bytes": 1381
+    },
+    {
+      "path": "controllers/p3_crash_controller.py",
+      "source": "<campaign>/p3_crash_controller.py",
+      "sha256": "114fba2a256f0966dad97d3b96cacac22c791224146935dc2994e903b1b19c87",
+      "bytes": 1995
+    },
+    {
+      "path": "controllers/soak_controller.py",
+      "source": "<campaign>/soak_controller.py",
+      "sha256": "7e90f7addc7e9bfc24821bb349d266893bf817620b960f6d0867385239a53a17",
+      "bytes": 1259
+    },
+    {
+      "path": "controllers/receiver_verifier.py",
+      "source": "<campaign>/receiver_verifier.py",
+      "sha256": "97aaca51be036ffb5e43835a05a79bf11be87c1f8ff3456188d04ecedc91ed47",
+      "bytes": 3012
+    },
+    {
+      "path": "controllers/final_app_verifier.py",
+      "source": "<campaign>/final_app_verifier.py",
+      "sha256": "447023c0cdefa0b071ee102dbb92fd5db9a886c7e9e6e361ee6748bad41583d7",
+      "bytes": 3403
+    },
+    {
+      "path": "segments/l1-p1/metadata.json",
+      "source": "<campaign>/l1-p1/metadata.json",
+      "sha256": "0b426340c32fc6aa07808c319b66f040bc7ec356f6d166a2174f8c01ebe757d6",
+      "bytes": 1486
+    },
+    {
+      "path": "segments/l1-p1/summary.json",
+      "source": "<campaign>/l1-p1/summary.json",
+      "sha256": "71e1fee7a7ac814e9c01068f4e57d882fe610a807dbeed606da37a45ae026e50",
+      "bytes": 668
+    },
+    {
+      "path": "segments/l1-p1/usage-ledger.json",
+      "source": "<campaign>/l1-p1/usage-ledger.json",
+      "sha256": "b0a659066c5d4a1ffed761288192da2daac64161c092727e0dc8178af78fbd3d",
+      "bytes": 122
+    },
+    {
+      "path": "segments/l1-p1/prompt.txt",
+      "source": "<campaign>/l1-p1/prompt.txt",
+      "sha256": "292d8651d046b91da78ad7deb5fb7b5478dcd872807d7731f4d6b7774b965d6e",
+      "bytes": 1127
+    },
+    {
+      "path": "segments/l1-p1-retry/metadata.json",
+      "source": "<campaign>/l1-p1-retry/metadata.json",
+      "sha256": "d4d949e806e3719c33634d23a3147cfd0dc3ed0efcb6a026d8e1cbac70e13016",
+      "bytes": 1489
+    },
+    {
+      "path": "segments/l1-p1-retry/summary.json",
+      "source": "<campaign>/l1-p1-retry/summary.json",
+      "sha256": "c1bbd290c585a16eb7f19a0da529593535960f1de73f1ad160692e67721a6222",
+      "bytes": 494
+    },
+    {
+      "path": "segments/l1-p1-retry/usage-ledger.json",
+      "source": "<campaign>/l1-p1-retry/usage-ledger.json",
+      "sha256": "708c0d5e9b8447cf86a1a5f57981dbf2ebcd328d06f00123c518c5f2e9cd025a",
+      "bytes": 5317
+    },
+    {
+      "path": "segments/l1-p1-retry/prompt.txt",
+      "source": "<campaign>/l1-p1-retry/prompt.txt",
+      "sha256": "292d8651d046b91da78ad7deb5fb7b5478dcd872807d7731f4d6b7774b965d6e",
+      "bytes": 1127
+    },
+    {
+      "path": "segments/l1-p3/metadata.json",
+      "source": "<campaign>/l1-p3/metadata.json",
+      "sha256": "0e7c8fb20d4660e5d4d6d82285181befa71a2221d4da3532c1ae8f4dc7b8d4c1",
+      "bytes": 1492
+    },
+    {
+      "path": "segments/l1-p3/summary.json",
+      "source": "<campaign>/l1-p3/summary.json",
+      "sha256": "ab5b4b2293a66e7f9b9ee972f248cda350647404c71d7d4d89d85cc66812da92",
+      "bytes": 493
+    },
+    {
+      "path": "segments/l1-p3/usage-ledger.json",
+      "source": "<campaign>/l1-p3/usage-ledger.json",
+      "sha256": "155fca8d8cb7628e2d49b0052551cfebe03457af82c7d13affb5df93a0e5ee42",
+      "bytes": 5314
+    },
+    {
+      "path": "segments/l1-p3/prompt.txt",
+      "source": "<campaign>/l1-p3/prompt.txt",
+      "sha256": "80fa92b420100bff48069f6b5c8c8877674157f00d814ce2c3e1d7b8d528e5b4",
+      "bytes": 1433
+    },
+    {
+      "path": "segments/l1-p4/metadata.json",
+      "source": "<campaign>/l1-p4/metadata.json",
+      "sha256": "b5e268d0fdef1b114a375cdf1386768d3b9b6c736cc5872559584cbe4eca1825",
+      "bytes": 1492
+    },
+    {
+      "path": "segments/l1-p4/summary.json",
+      "source": "<campaign>/l1-p4/summary.json",
+      "sha256": "24c575885ed8550d6604af4df225dd404f77bc48cb6882f3acbed7947048060a",
+      "bytes": 493
+    },
+    {
+      "path": "segments/l1-p4/usage-ledger.json",
+      "source": "<campaign>/l1-p4/usage-ledger.json",
+      "sha256": "8f91f89695526b02664bf3c2c289576b9a4dbe27b382413a3c19e56c3afeec53",
+      "bytes": 5342
+    },
+    {
+      "path": "segments/l1-p4/prompt.txt",
+      "source": "<campaign>/l1-p4/prompt.txt",
+      "sha256": "a775aa0c9ed12f6831097db2a6849322c37d16c95b3fcae9549298ae2a2ea2e0",
+      "bytes": 1366
+    },
+    {
+      "path": "segments/l1-p5/metadata.json",
+      "source": "<campaign>/l1-p5/metadata.json",
+      "sha256": "356a703399bea8023a60df57fb44d3c8cad33115eaebd35fd84977dbd3dbbd22",
+      "bytes": 1492
+    },
+    {
+      "path": "segments/l1-p5/summary.json",
+      "source": "<campaign>/l1-p5/summary.json",
+      "sha256": "2b9cc5a0aaa08378d85f8bf981b88a2f9f5a656dcd0635c0e5eaf5906460bdf9",
+      "bytes": 493
+    },
+    {
+      "path": "segments/l1-p5/usage-ledger.json",
+      "source": "<campaign>/l1-p5/usage-ledger.json",
+      "sha256": "df560291483fabd6951b3651d9a6cb1fd9bb53255cb8951fa5a3b416c400fd09",
+      "bytes": 5237
+    },
+    {
+      "path": "segments/l1-p5/prompt.txt",
+      "source": "<campaign>/l1-p5/prompt.txt",
+      "sha256": "44e5f7dd2293fc5612312d9bb2c8ca716eb5c26a85991727cf123cc8993eee6d",
+      "bytes": 1074
+    },
+    {
+      "path": "segments/l1-p6/metadata.json",
+      "source": "<campaign>/l1-p6/metadata.json",
+      "sha256": "77b34bfeb868c6d2ea40e85cfb1ced6ded3f97f094eb342ee7b094f637d345ef",
+      "bytes": 1491
+    },
+    {
+      "path": "segments/l1-p6/summary.json",
+      "source": "<campaign>/l1-p6/summary.json",
+      "sha256": "05d8ca952520cbd7b4ed01276e0fc1a48c031d9c31092bd58287ef33efb15ef2",
+      "bytes": 492
+    },
+    {
+      "path": "segments/l1-p6/usage-ledger.json",
+      "source": "<campaign>/l1-p6/usage-ledger.json",
+      "sha256": "86fc21d37ed6b93eac4f8c046a46645ac5f9c228da7904801c5a7a88af558976",
+      "bytes": 5373
+    },
+    {
+      "path": "segments/l1-p6/prompt.txt",
+      "source": "<campaign>/l1-p6/prompt.txt",
+      "sha256": "d43e64c4902bf295d9755368abc2741b1db7459b53b69ace73fe0f8e275989c6",
+      "bytes": 1371
+    },
+    {
+      "path": "segments/l1-p7/metadata.json",
+      "source": "<campaign>/l1-p7/metadata.json",
+      "sha256": "0cb2ef99f59cc8e91f9d047da98a11b749232946ad29ee09de454181a038129c",
+      "bytes": 1492
+    },
+    {
+      "path": "segments/l1-p7/summary.json",
+      "source": "<campaign>/l1-p7/summary.json",
+      "sha256": "dc3d9228a7850459e7ec509d6cfd04492d2c1d201b6ec9d25e49fa8d3199cf93",
+      "bytes": 493
+    },
+    {
+      "path": "segments/l1-p7/usage-ledger.json",
+      "source": "<campaign>/l1-p7/usage-ledger.json",
+      "sha256": "cf03f470584504984ffd91dca0000dd333767a3d1b1e55c50690131c87aacdb4",
+      "bytes": 2713
+    },
+    {
+      "path": "segments/l1-p7/prompt.txt",
+      "source": "<campaign>/l1-p7/prompt.txt",
+      "sha256": "fbc2ae38d0af99dafb7777c6d8e51a8464574ea9bb0ab7ca979c0aaa86f38bf6",
+      "bytes": 902
+    },
+    {
+      "path": "segments/l1-p8/metadata.json",
+      "source": "<campaign>/l1-p8/metadata.json",
+      "sha256": "2548c9a5dc026c5be22a9ec07a08fea6aef9fa7ce11fa92f9107e2f5fe5c4ff6",
+      "bytes": 1492
+    },
+    {
+      "path": "segments/l1-p8/summary.json",
+      "source": "<campaign>/l1-p8/summary.json",
+      "sha256": "765924a5eefee4093f29984f3eeb90e4449376fb00629370ff63c64ebf60c8e3",
+      "bytes": 493
+    },
+    {
+      "path": "segments/l1-p8/usage-ledger.json",
+      "source": "<campaign>/l1-p8/usage-ledger.json",
+      "sha256": "3f929c2fb8da33352635a7f52d18e2a0fe92aedbec0022ddd8d1b4e09287feb8",
+      "bytes": 5354
+    },
+    {
+      "path": "segments/l1-p8/prompt.txt",
+      "source": "<campaign>/l1-p8/prompt.txt",
+      "sha256": "69a64e94cded729a888c01b6996ead38bcffeafe2a8544c673cfc60755ea323f",
+      "bytes": 1008
+    },
+    {
+      "path": "segments/corrections/p3-correction.md",
+      "source": "<campaign>/p3-correction.md",
+      "sha256": "355499f574d38be8e34e5a0c99a8b942b14e338040a4d595e6bb8ce7be9fc503",
+      "bytes": 1411
+    },
+    {
+      "path": "segments/corrections/p4-correction.md",
+      "source": "<campaign>/p4-correction.md",
+      "sha256": "3c829897932ebf636bde229e616cc3a0e74387957941081938fa0677c846ced0",
+      "bytes": 1346
+    },
+    {
+      "path": "segments/corrections/p5-correction.md",
+      "source": "<campaign>/p5-correction.md",
+      "sha256": "fe011dad23a62ba6af843d067facd5d1029331e8572be70e8a3b79525a633835",
+      "bytes": 1057
+    },
+    {
+      "path": "segments/corrections/p6-correction.md",
+      "source": "<campaign>/p6-correction.md",
+      "sha256": "b5c8ceef15634468701444dc87c33fe0379075d101f790604cb0023ded895380",
+      "bytes": 1348
+    },
+    {
+      "path": "segments/corrections/p7-correction.md",
+      "source": "<campaign>/p7-correction.md",
+      "sha256": "b8c8ef0de51067eaee361cd5cd9d8c10477c20a51b9bc30f44e07eb9ee4eadb4",
+      "bytes": 887
+    },
+    {
+      "path": "segments/corrections/p8-correction.md",
+      "source": "<campaign>/p8-correction.md",
+      "sha256": "97b22acc31b31c2540a459e121549fdfca46d98c4a6fc657b9e59904aa294b61",
+      "bytes": 992
+    },
+    {
+      "path": "final-app/app/__init__.py",
+      "source": "<campaign>/workspace/app/__init__.py",
+      "sha256": "dc24e830c82b082ee90f507af2bc37e201a2239ce496f21cb20cdc2224ff67b9",
+      "bytes": 42
+    },
+    {
+      "path": "final-app/app/cli.py",
+      "source": "<campaign>/workspace/app/cli.py",
+      "sha256": "caa54305fba21ad457758868c1a312df5e0b069ca82615d80c8df75fd71913fb",
+      "bytes": 10501
+    },
+    {
+      "path": "final-app/app/DESIGN.md",
+      "source": "<campaign>/workspace/app/DESIGN.md",
+      "sha256": "3518767a09a36527f81d4715fb102e4028fb0078f30fc4ebc9fabd02ff531ace",
+      "bytes": 2404
+    },
+    {
+      "path": "final-app/app/engine.py",
+      "source": "<campaign>/workspace/app/engine.py",
+      "sha256": "0a373274b0e5e622826ed6dd4fa4ff7dd6b773cc998aea97e7db159ab6c95180",
+      "bytes": 16590
+    },
+    {
+      "path": "final-app/app/fingerprint.py",
+      "source": "<campaign>/workspace/app/fingerprint.py",
+      "sha256": "48ef2e85e49f0c3166c6d07270292bc7a19c76ec2f7c6bed9026cb5f17a7760f",
+      "bytes": 3471
+    },
+    {
+      "path": "final-app/app/load_driver.py",
+      "source": "<campaign>/workspace/app/load_driver.py",
+      "sha256": "fb954784622e3d355d8008e9b2b5ae179836e57acb3c3781440d7b7532562da4",
+      "bytes": 14415
+    },
+    {
+      "path": "final-app/app/migrate.py",
+      "source": "<campaign>/workspace/app/migrate.py",
+      "sha256": "d1d98006a60aaf7f8c9171443c7ea64034dfd1baf7c884d8adc2e40342a051a7",
+      "bytes": 437
+    },
+    {
+      "path": "final-app/app/MIGRATION.md",
+      "source": "<campaign>/workspace/app/MIGRATION.md",
+      "sha256": "1434935c19627bff0d5eba7a7919c1ad99a5c405d1a2e3f7ada15e0760d1725d",
+      "bytes": 629
+    },
+    {
+      "path": "final-app/app/migration.py",
+      "source": "<campaign>/workspace/app/migration.py",
+      "sha256": "f85396fd49775dae6da9ee453317446829980e7fcd9369f57df385985aa806d3",
+      "bytes": 8740
+    },
+    {
+      "path": "final-app/app/outbox.py",
+      "source": "<campaign>/workspace/app/outbox.py",
+      "sha256": "815d4f476e85da5ffbb0cc6890f89b36644a46d06e2c41d8a71efd9e534e63ce",
+      "bytes": 13001
+    },
+    {
+      "path": "final-app/app/publish.py",
+      "source": "<campaign>/workspace/app/publish.py",
+      "sha256": "f915bc9096a17af2a5ec0dc21a1d2bc6c1803eaa3dd272a44000a0329b9f5ff0",
+      "bytes": 940
+    },
+    {
+      "path": "final-app/app/queue.py",
+      "source": "<campaign>/workspace/app/queue.py",
+      "sha256": "d39c708330c17084a9ce3aa771e17e8e51276fa7dcd95ece1c9b8b0bb6aa303b",
+      "bytes": 10588
+    },
+    {
+      "path": "final-app/app/README.md",
+      "source": "<campaign>/workspace/app/README.md",
+      "sha256": "222389affbe50d564789359f4c7ed4fbf90a318331fcec58b6cea102e2658606",
+      "bytes": 1457
+    },
+    {
+      "path": "final-app/app/RECOVERY_RUNBOOK.md",
+      "source": "<campaign>/workspace/app/RECOVERY_RUNBOOK.md",
+      "sha256": "edc4f650ebc282dce1413da479a61ea8e6f46de16338b0562c8f95cd87ada52e",
+      "bytes": 973
+    },
+    {
+      "path": "final-app/app/RESULT.json",
+      "source": "<campaign>/workspace/app/RESULT.json",
+      "sha256": "a85a7a91c7053ed0cb98dfa28a902f812c6b74c3816ffc23660afbc1f873ef20",
+      "bytes": 956
+    },
+    {
+      "path": "final-app/app/schema.py",
+      "source": "<campaign>/workspace/app/schema.py",
+      "sha256": "ac936326fba78bf7521b642d4be4bcea7452424b5c93090c43289a3f47d3ae1a",
+      "bytes": 10184
+    },
+    {
+      "path": "final-app/app/store.py",
+      "source": "<campaign>/workspace/app/store.py",
+      "sha256": "4e3603b3992160a6aff116287fd4fb5bde09fa0232d2481bb0bcaed91b8378c1",
+      "bytes": 12393
+    },
+    {
+      "path": "final-app/app/tests/__init__.py",
+      "source": "<campaign>/workspace/app/tests/__init__.py",
+      "sha256": "931a33d8141e91194d27fb5da320593fefd1035648a3096e0b8ddb1af1534916",
+      "bytes": 333
+    },
+    {
+      "path": "final-app/app/tests/support.py",
+      "source": "<campaign>/workspace/app/tests/support.py",
+      "sha256": "107ee12e4a8d96f6045b9fc40de0589b96a8218c7887517fb59190bb77829f9a",
+      "bytes": 825
+    },
+    {
+      "path": "final-app/app/tests/worker_main.py",
+      "source": "<campaign>/workspace/app/tests/worker_main.py",
+      "sha256": "8b89499ace9b516576bb9b567fc62d1f278fe36efc6a8c2971a39462330be0bd",
+      "bytes": 5019
+    },
+    {
+      "path": "final-app/app/workers.py",
+      "source": "<campaign>/workspace/app/workers.py",
+      "sha256": "6f7dee600b9d12f2ea12ca26b56ff51fc02ba6270d72cc2a76eb87f48e3f0749",
+      "bytes": 10783
+    },
+    {
+      "path": "final-app/fixtures/input.jsonl",
+      "source": "<campaign>/workspace/fixtures/input.jsonl",
+      "sha256": "779bb980ebeae0ba95a6e8d4ab6dd592348df8e8beadf0012138309df0b91826",
+      "bytes": 99
+    },
+    {
+      "path": "final-app/fixtures/plan.json",
+      "source": "<campaign>/workspace/fixtures/plan.json",
+      "sha256": "68b4b3720de24b15b5cfc7a51658e03aad1c298c357ff866ca34978b22f2b262",
+      "bytes": 245
+    },
+    {
+      "path": "final-app/oracle.py",
+      "source": "<campaign>/workspace/oracle.py",
+      "sha256": "2e75ac224d722095963050b20819456242b09af8430ddd2ca9b0f2ce5dcde33c",
+      "bytes": 342
+    },
+    {
+      "path": "final-app/TASK.md",
+      "source": "<campaign>/workspace/TASK.md",
+      "sha256": "3f8e29df69bce5b3b13f9bf77275336d775c4b4b34e20e22901e6728cd5a74c6",
+      "bytes": 523
+    },
+    {
+      "path": "final-app/tests/test_platform.py",
+      "source": "<campaign>/workspace/tests/test_platform.py",
+      "sha256": "aacf345c399842a74f96682b94e1bef9d9a6a767047a5d67f6b3bb668bdb1876",
+      "bytes": 1232
+    }
+  ],
+  "note": "derived __pycache__/*.pyc artifacts excluded"
+}

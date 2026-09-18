@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# evidence package must stay byte-exact (hash manifest integrity)
+docs/experiments/runtime-endurance-v1/evidence/** -text

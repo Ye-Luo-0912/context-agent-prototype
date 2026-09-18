@@ -1,0 +1,27 @@
+{
+  "results": [
+    {
+      "command": [
+        "python",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-v"
+      ],
+      "exit": 0,
+      "stdout_tail": "",
+      "stderr_tail": "test_engine_and_cas_are_deterministic (test_platform.PlatformV1.test_engine_and_cas_are_deterministic) ... ok\ntest_queue_fences_old_token (test_platform.PlatformV1.test_queue_fences_old_token) ... ok\n\n----------------------------------------------------------------------\nRan 2 tests in 0.023s\n\nOK\n"
+    },
+    {
+      "command": [
+        "python",
+        "oracle.py"
+      ],
+      "exit": 0,
+      "stdout_tail": "[{\"amount\": 10, \"id\": 1, \"kind\": \"a\"}, {\"amount\": 30, \"id\": 3, \"kind\": \"a\"}]\n",
+      "stderr_tail": ""
+    }
+  ]
+}

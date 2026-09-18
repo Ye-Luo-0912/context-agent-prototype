@@ -1,0 +1,60 @@
+{
+  "schema": "runtime-endurance-evidence-map/v1",
+  "written": "2026-09-19",
+  "purpose": "Links each scenario.json fault (F01-F20) and combination (C1-C8) to the evidence that actually exists, or NOT_EXERCISED. Written as part of the 2026-09-19 review E-1 item; no existing receipt or report was rewritten.",
+  "status_vocabulary": {
+    "EXERCISED_IN_CAMPAIGN": "the paid campaign trajectory itself triggered and verified this item; pointer given",
+    "REPOSITORY_REGRESSION": "not triggered by the paid campaign, but a deterministic repository regression (red-to-green) covers the exact behavior; test name and commit given",
+    "NOT_EXERCISED": "no campaign trigger and no exact regression; adjacent facilities, if any, are noted and are not equivalent evidence"
+  },
+  "layer_status": {
+    "autonomous_delivery": "NOT_CLAIMED — operator_acceptance=false, task_state=awaiting_operator_review (full-campaign-receipt.json)",
+    "acceptance_after_manual_repair": "PASS — final-app-verifier.json status=PASS; manual repair list in full-campaign-receipt.json; app/tests/oracle frozen under final-app/",
+    "runtime_fault_coverage": "PARTIAL — F12 exercised in campaign; F10+F12 combination covered by deterministic regression; all other faults NOT_EXERCISED",
+    "application_load": "PASS (test controller + app workers) — soak-receipt.json: 108,000 records / 10,800 batches / 0 mismatches; this is not Rust Runtime endurance evidence",
+    "kv_hit": "OBSERVED (T8, Chat protocol) — docs/walkthroughs/2026-09-18-t8-kv-live.md; first cross-run request hit=1536, segment total 16896 over 11 rounds",
+    "cost_comparison": "RUNNER_ESTIMATE_ONLY — peak_cost_estimate_usd=1.0377822 from the relay's own pricing constants; independent recomputation and paired layout comparison NOT_RUN"
+  },
+  "faults": {
+    "F01": { "status": "NOT_EXERCISED", "note": "malformed tool before text; schema-level malformed-argument admission exists in agent-contracts/agent-core (batch-9 F3 receipt), the in-round trigger was not exercised" },
+    "F02": { "status": "NOT_EXERCISED", "note": "malformed tool after visible text" },
+    "F03": { "status": "NOT_EXERCISED", "note": "campaign-level wrong-task steer not injected; same-task steer journey exists in host_t7_journey (T7 record) — adjacent, not the fault trigger" },
+    "F04": { "status": "REPOSITORY_REGRESSION", "tests": ["agent-compose/tests/cancel_late_result_usage.rs::a_late_successful_round_still_settles_its_known_usage", "agent-compose/tests/cancel_late_result_usage.rs::a_late_failed_round_still_settles_its_known_usage"] },
+    "F05": { "status": "NOT_EXERCISED", "note": "partial batch cancel with first effect committed" },
+    "F06": { "status": "NOT_EXERCISED", "note": "consumption-ack machinery exists with regressions (QA slice, batch 7 receipt QA_QB_QC_QD_RECEIPT.md); the fault injection was not exercised" },
+    "F07": { "status": "NOT_EXERCISED", "note": "prepare-before-dispatch Core facility exists; no injection" },
+    "F08": { "status": "NOT_EXERCISED", "note": "torn checkpoint handling exists (agent-runtime checkpoint.rs, context-simple atomic card writes per B2 receipt); no temp-file injection in campaign" },
+    "F09": { "status": "NOT_EXERCISED", "note": "checkpoint store failure; the failed-turn capture machinery it targets is now typed (batch-12 A-1)" },
+    "F10": { "status": "REPOSITORY_REGRESSION", "tests": ["agent-runtime/tests/turn/failure_resume.rs::occupied_gc_with_inflight_prepare_still_captures_failed_turn_debt (combined F10+F12)", "agent-runtime/tests/turn/failure_resume.rs::combined_boundary_failure_restore_keeps_identity_without_replay"], "commit": "d1b75da5" },
+    "F11": { "status": "NOT_EXERCISED", "note": "cancel during real engine ingest/maintenance gate" },
+    "F12": { "status": "EXERCISED_IN_CAMPAIGN", "evidence": ["RUN_2026-09-19-L1-COMPLETE.md (PASS_AFTER_REPAIR)", "receipts/full-campaign-receipt.json runtime.f12_occupied_gc_repair=PASS"], "regressions": ["agent-runtime/tests/turn/failure_resume.rs::occupied_gc_with_inflight_prepare_still_captures_failed_turn_debt", "::occupied_gc_with_inflight_prepare_cancel_publishes_single_terminal", "::combined_boundary_failure_restore_keeps_identity_without_replay"], "commit": "bcacf41b + d1b75da5" },
+    "F13": { "status": "NOT_EXERCISED", "note": "body window pressure; final-body paging/single entry exists (batch-10 G2/G3, tools/page.rs); campaign trigger not exercised" },
+    "F14": { "status": "NOT_EXERCISED", "note": "stale edit after external version change; file-version overwrite step exists in kv_production_sequence (batch-10) — adjacent, not the stale-edit fault" },
+    "F15": { "status": "NOT_EXERCISED", "note": "loaded tool surface pressure/restore; text-only finalization accounting landed in batch-12 A-2 (adjacent)" },
+    "F16": { "status": "NOT_EXERCISED", "note": "grant revocation facilities exist (agent-host/tests/host_e2e.rs::named_pipe_grants_revoke_on_disconnect); revoke-before-effect trigger not exercised" },
+    "F17": { "status": "NOT_EXERCISED", "note": "false or stale verification claim" },
+    "F18": { "status": "NOT_EXERCISED", "note": "untrusted instruction in evidence; architectural rule (external body never becomes system instruction) has no dedicated campaign test" },
+    "F19": { "status": "REPOSITORY_REGRESSION", "tests": ["agent-tui/src/state.rs::resync_recovers_dialogue_events_dropped_by_a_lagged"], "note": "UI-side lag recovery; wire disconnect/reconnect campaign trigger not exercised" },
+    "F20": { "status": "REPOSITORY_REGRESSION", "tests": ["agent-compose/tests/cancel_usage_settlement.rs::cancel_during_backoff_keeps_known_usage", "agent-compose/tests/cancel_late_result_usage.rs::a_late_failed_round_still_settles_its_known_usage"] }
+  },
+  "combinations": {
+    "C1": { "status": "NOT_EXERCISED" },
+    "C2": { "status": "NOT_EXERCISED" },
+    "C3": { "status": "NOT_EXERCISED" },
+    "C4": { "status": "NOT_EXERCISED" },
+    "C5": { "status": "NOT_EXERCISED" },
+    "C6": { "status": "NOT_EXERCISED" },
+    "C7": { "status": "REPOSITORY_REGRESSION", "note": "the exact F10+F12 combination the review flagged as missing; deterministic regression added", "tests": ["agent-runtime/tests/turn/failure_resume.rs::occupied_gc_with_inflight_prepare_still_captures_failed_turn_debt"], "commit": "d1b75da5" },
+    "C8": { "status": "NOT_EXERCISED" }
+  },
+  "cost_evidence": {
+    "runner_estimate": "peak_cost_estimate_usd=1.0377822 (relay's own pricing constants; estimated=true in usage ledgers)",
+    "per_segment": "segments/*/usage-ledger.json in this package (reserved/committed/unknown attempts, estimated values)",
+    "not_run": ["independent recomputation from raw SSE", "paired same-task layout comparison", "dollar normalization against a provider price table"]
+  },
+  "manual_repair_evidence": {
+    "list": "receipts/full-campaign-receipt.json manual_repairs[4]",
+    "final_identity": "final-app/ (frozen app, tests, oracle, fixtures; hashes in EVIDENCE_MANIFEST.json)",
+    "limitation": "pre-repair app snapshots were not captured by the campaign; only the final state and the repair list exist"
+  }
+}

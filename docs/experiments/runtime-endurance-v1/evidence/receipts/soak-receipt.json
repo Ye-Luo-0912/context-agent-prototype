@@ -1,0 +1,33 @@
+{
+  "budget": {
+    "batch_size": 10,
+    "duration_seconds": 5400.0,
+    "interval_seconds": 0.5,
+    "max_batches_per_second": 2,
+    "max_records": 108000
+  },
+  "idle": true,
+  "load": {
+    "batches": 10800,
+    "elapsed": 5400.0,
+    "finished_at": 567857.906,
+    "records": 108000,
+    "started_at": 562457.906,
+    "stop_reason": "max-records"
+  },
+  "verification": {
+    "amount_sum": 53946000,
+    "committed_jobs": 10800,
+    "committed_records": 108000,
+    "committed_without_receipt": [],
+    "failures": [],
+    "final_plan_digest": "21efaf5fba28fe61349223cc194a35d9b22f352d760928682c91bb0081820076",
+    "kind_histogram": {
+      "a": 54000,
+      "b": 54000
+    },
+    "mismatches": [],
+    "ok": true
+  },
+  "worker_log_count": 10800
+}

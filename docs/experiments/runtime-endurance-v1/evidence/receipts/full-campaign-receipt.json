@@ -1,0 +1,52 @@
+{
+  "status": "FULL_PLAN_COMPLETE_WITH_MANUAL_REPAIR",
+  "task_id_scope": "one real model TaskId across P1-P8",
+  "protected_inputs_unchanged": true,
+  "model": {
+    "successful_segments": 7,
+    "requests": 156,
+    "tool_attempts": 382,
+    "peak_cost_estimate_usd": 1.0377822,
+    "provider_profile": "deepseek-flash",
+    "automatic_model_switching": false
+  },
+  "phases": {
+    "P1_P2": {"rounds": 24, "tools": 59, "status": "turn_completed"},
+    "P3": {"rounds": 24, "tools": 70, "status": "turn_completed"},
+    "P4": {"rounds": 24, "tools": 48, "status": "turn_completed"},
+    "P5": {"rounds": 24, "tools": 56, "status": "turn_completed"},
+    "P6": {"rounds": 24, "tools": 57, "status": "turn_completed"},
+    "P7": {"rounds": 12, "tools": 29, "status": "turn_completed"},
+    "P8": {"rounds": 24, "tools": 63, "status": "turn_completed"}
+  },
+  "application": {
+    "fixture_tests": "2/2",
+    "p3_smoke_batches": 12,
+    "p3_smoke_records": 120,
+    "p3_crash_recovery": "PASS",
+    "fingerprint_cas_migration_outbox_verifier": "PASS",
+    "receiver_dropped_response_reconciliation": "PASS",
+    "soak_duration_seconds": 5400,
+    "soak_batches": 10800,
+    "soak_records": 108000,
+    "soak_committed_jobs": 10800,
+    "soak_oracle_mismatches": 0,
+    "soak_failures": 0,
+    "soak_missing_receipts": 0
+  },
+  "runtime": {
+    "f12_occupied_gc_repair": "PASS",
+    "cross_process_host_restore": "PASS",
+    "core_crash_resume": "PASS",
+    "workspace_full_local_suites": "PASS_WITH_WINDOWS_HARNESS_JITTER_RETRY",
+    "provider_paid_ignored_tests": "NOT_REPEATED_FROM_PRIOR_EVIDENCE"
+  },
+  "manual_repairs": [
+    "spawn-safe worker entry replaced a bound supervisor target containing Process weakrefs",
+    "CAS live identity enumeration made recursive for tenant/destination namespaces",
+    "application JSON object-key validation and final delivery documents completed by controller",
+    "P3 smoke controller child residue was explicitly reaped after receipt; soak controller joined cleanly"
+  ],
+  "operator_acceptance": false,
+  "task_state": "awaiting_operator_review"
+}

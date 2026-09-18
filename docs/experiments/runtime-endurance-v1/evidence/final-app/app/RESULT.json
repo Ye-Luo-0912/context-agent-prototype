@@ -1,0 +1,25 @@
+{
+  "status": "ENDURANCE_FIXTURE_VERIFIED_WITH_MANUAL_CONTROLLER_REPAIR",
+  "scope": "incremental-platform-v1-to-v2",
+  "protected_inputs_unchanged": true,
+  "public_fixture_tests": "2/2",
+  "p3_smoke": "PASS",
+  "p3_crash_recovery": "PASS",
+  "independent_verifier": "PASS",
+  "fingerprints": "PASS",
+  "cas_namespaced_gc": "PASS",
+  "outbox_receipt_reconciliation": "PASS",
+  "migration_interrupt_resume": "PASS",
+  "soak_90_minutes": "PASS",
+  "soak_records": 108000,
+  "soak_committed_jobs": 10800,
+  "soak_oracle_mismatches": 0,
+  "soak_missing_receipts": 0,
+  "runtime_task_acceptance": "awaiting_operator_review",
+  "operator_acceptance": false,
+  "notes": [
+    "The model implemented the main application modules across P1-P8.",
+    "The controller repaired a Windows spawn pickling bug in WorkerPool and a CAS live-tree enumeration bug.",
+    "The 90-minute soak receipt is soak-receipt.json; all 108000 records and 10800 jobs reconciled."
+  ]
+}

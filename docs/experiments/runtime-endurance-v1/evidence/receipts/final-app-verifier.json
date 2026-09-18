@@ -1,0 +1,37 @@
+{
+  "checks": {
+    "cas": {
+      "gc": [],
+      "manifest": "0a551bf22bcb06debd9568fa51db846df1d82468b1a7c8465af64d202a371c00",
+      "ok": true
+    },
+    "engine_fingerprint": {
+      "content_changed": true,
+      "ok": true,
+      "terminal": "export"
+    },
+    "migration": {
+      "ok": true,
+      "version": 2
+    },
+    "outbox": {
+      "confirmed": [
+        {
+          "accepted": true,
+          "detail": "r1",
+          "identity": "tenant-a/destination-a/key-1"
+        }
+      ],
+      "ok": true,
+      "sent": [
+        {
+          "code": 201,
+          "id": "tenant-a/destination-a/key-1",
+          "status": "sent"
+        }
+      ]
+    }
+  },
+  "protected_fixtures_untouched": true,
+  "status": "PASS"
+}

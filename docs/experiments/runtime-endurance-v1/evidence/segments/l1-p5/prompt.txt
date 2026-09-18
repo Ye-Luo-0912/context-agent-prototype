@@ -1,0 +1,17 @@
+P5 correction for the same task. Preserve all earlier receipts. Implement a
+versioned v1-to-v2 database migration and prove interruption/restart:
+
+- Change publication idempotency scope to tenant + destination without losing
+  existing v1 receipts. Same textual key in two destinations must not alias;
+  same key/scope with different body remains a conflict.
+- Add an explicit schema epoch/migration record and a fail-closed interrupted
+  migration path. A process killed during migration must reopen in a defined
+  old/new state, never a claimed partial success.
+- Include a new tenant and destination in the independent oracle, a restart
+  during upgrade, and a cross-version compatibility check. Preserve old data
+  fixtures and document the compatibility boundary and recovery procedure.
+- Use only the current grants and the explicit Python executable in argv[0] for
+  process.run. Do not widen authority or modify immutable files.
+
+Keep Runtime task identity, app job identity, outbox identity and receiver
+receipt identity distinct in logs and docs.

@@ -1,0 +1,106 @@
+{
+  "budget": {
+    "batch_size": 10,
+    "duration_seconds": 8,
+    "interval_seconds": 0.5,
+    "max_batches_per_second": 2,
+    "max_records": 160
+  },
+  "idle": true,
+  "load": {
+    "batches": 12,
+    "elapsed": 6.0,
+    "finished_at": 562385.031,
+    "records": 120,
+    "started_at": 562379.031,
+    "stop_reason": "max-batches"
+  },
+  "verification": {
+    "amount_sum": 49980,
+    "committed_jobs": 12,
+    "committed_records": 120,
+    "committed_without_receipt": [],
+    "failures": [],
+    "final_plan_digest": "21efaf5fba28fe61349223cc194a35d9b22f352d760928682c91bb0081820076",
+    "kind_histogram": {
+      "a": 60,
+      "b": 60
+    },
+    "mismatches": [],
+    "ok": true
+  },
+  "worker_logs": [
+    [
+      "ok",
+      "worker-50368-0",
+      "load-00000000",
+      "61ca8992f6bff789765465309817d0d7b9bcaa76ab64514ac747c482680dc5e6"
+    ],
+    [
+      "ok",
+      "worker-50368-0",
+      "load-00000001",
+      "41d5a88437d9c66497a83ffc467f962458f1ecb8f055ec86d393b8799cb66b59"
+    ],
+    [
+      "ok",
+      "worker-50368-2",
+      "load-00000002",
+      "54693ac97f2c2f91868fd5532dfa741cf6655ec022ff8e6acec6e18b714a3b5e"
+    ],
+    [
+      "ok",
+      "worker-50368-0",
+      "load-00000003",
+      "a5eba45c6bbe87ed7e15bd20c81542d53a103dbd63d3150eea6c0a47372bc3b7"
+    ],
+    [
+      "ok",
+      "worker-50368-3",
+      "load-00000004",
+      "36ff8055c6ff7f30074ec6cc9dd7f3a868232731ad95918d1c13f48a98f87049"
+    ],
+    [
+      "ok",
+      "worker-50368-1",
+      "load-00000005",
+      "d35f7d64bf90561310d757253491d12ebb2c4510b35efca37525af889816a50f"
+    ],
+    [
+      "ok",
+      "worker-50368-2",
+      "load-00000006",
+      "138e4e7b3e95581c4711361b93bd3868f4636b77dd8b7467c9196fb064612bcc"
+    ],
+    [
+      "ok",
+      "worker-50368-3",
+      "load-00000008",
+      "96ce1bf6e4894c1bcb1ac2165b036338cc854d79bf2103d102431f8a0de75ff0"
+    ],
+    [
+      "ok",
+      "worker-50368-0",
+      "load-00000007",
+      "e3335c2ebeaec4c698aa7adf475da9682e27e44e5ec1952c7f8baf3b00634f19"
+    ],
+    [
+      "ok",
+      "worker-50368-2",
+      "load-00000010",
+      "5358ee4765727075dd3745fb392442747607aa50c0632db73254b4c3ac5ccce0"
+    ],
+    [
+      "ok",
+      "worker-50368-1",
+      "load-00000009",
+      "7e236b237766ca77ef9e60b919d28c0aa5ac6edd6be8fb20bf3de661c84fe67b"
+    ],
+    [
+      "ok",
+      "worker-50368-3",
+      "load-00000011",
+      "1b5bd5d51bd8414632373c9bf828afc44c199970994a3ce00d2cdda092a50f2e"
+    ]
+  ]
+}
