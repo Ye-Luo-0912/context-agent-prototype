@@ -1,4 +1,18 @@
+use super::safepoint::SafepointCapture;
 use super::*;
+
+/// Whether a safe-point capture actually carried the failed turn's
+/// `FailedTurnYield` obligation. Only a capture whose debt basis froze the
+/// reason may mark the parked tail captured; a deferral (older work still
+/// in flight) keeps the tail un-captured so the settlement point re-drives
+/// the capture, and the durability gate keeps refusing an uncarried debt.
+fn captured_failure_obligation(capture: &SafepointCapture) -> bool {
+    matches!(
+        capture,
+        SafepointCapture::Captured { debt_basis, .. }
+            if debt_basis.contains(&crate::checkpoint::CheckpointDebtReason::FailedTurnYield)
+    )
+}
 
 impl RuntimeActor {
     /// Cross the one-shot startup durability boundary. A failed append or
@@ -649,13 +663,16 @@ impl RuntimeActor {
             // The first entry still has to admit the failed-turn debt and
             // assemble its checkpoint. Do that before parking; otherwise the
             // occupied lane would return without creating the checkpoint the
-            // continuation promises.
+            // continuation promises. A pre-existing snapshot still in flight
+            // defers the capture: the parked tail stays UN-captured and is
+            // re-driven from that work's settlement point, so the failure's
+            // debt lands in its own later snapshot instead of being claimed
+            // by an acknowledgement that never froze it.
             if !captured {
                 self.accrue_checkpoint_debt(
                     crate::checkpoint::CheckpointDebtReason::FailedTurnYield,
                 );
-                self.safe_point_resume_commit().await;
-                captured = true;
+                captured = captured_failure_obligation(&self.safe_point_resume_commit().await);
             }
             if self.state.pending_failed_turn_checkpoint.is_none() {
                 self.state.pending_failed_turn_checkpoint =
@@ -714,7 +731,10 @@ impl RuntimeActor {
         }
         if !captured {
             self.accrue_checkpoint_debt(crate::checkpoint::CheckpointDebtReason::FailedTurnYield);
-            self.safe_point_resume_commit().await;
+            captured = captured_failure_obligation(&self.safe_point_resume_commit().await);
+            // A deferred capture here (older work landed into a new in-flight
+            // write) still parks the tail un-captured behind the relay, so
+            // its settlement re-drives the capture.
             if self.state.checkpoint_prepare.is_some()
                 && let Some(op_tx) = self.op_tx()
                 && self
@@ -722,7 +742,7 @@ impl RuntimeActor {
                         super::maintenance::GcContinuation::SafepointFailure {
                             class,
                             retryable,
-                            captured: true,
+                            captured,
                         },
                         &op_tx,
                     )

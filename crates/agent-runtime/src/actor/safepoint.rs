@@ -20,6 +20,44 @@
 use super::*;
 use crate::checkpoint::{CheckpointDebtReason, CheckpointStore, StoredCheckpoint};
 
+/// Why a safe-point attempt did not freeze a new snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SafepointDeferral {
+    /// A prepared snapshot has not landed yet. It will retire only the debt
+    /// it froze; anything accrued after its freeze stays live.
+    PrepareInFlight,
+    /// A written snapshot has not been acknowledged yet.
+    WriteInFlight,
+    /// No active task can anchor a snapshot.
+    NoActiveTask,
+}
+
+/// Typed outcome of one safe-point capture attempt. The untyped predecessor
+/// returned `()`, so a caller could not tell "this call froze the
+/// outstanding debt (including the failure obligation)" apart from "older
+/// work is still in flight and nothing was captured" or "no capture was
+/// owed" — and a failed turn could be marked captured while its debt stayed
+/// live, only for the durability gate to fence continuation with
+/// RecoveryRequired once the older snapshot retired just its own frozen set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SafepointCapture {
+    /// A snapshot was frozen and scheduled: `sequence` is its identity and
+    /// `debt_basis` the exact reasons moved out of the live set — the
+    /// acknowledgement may retire only these (ACK(S_v) retires only debt
+    /// frozen into S_v).
+    Captured {
+        sequence: u64,
+        debt_basis: Vec<CheckpointDebtReason>,
+    },
+    /// Older work is still in flight; the live debt — including any failure
+    /// obligation — stays outstanding, and the caller must re-drive the
+    /// capture at that work's settlement point instead of claiming it done.
+    Deferred { reason: SafepointDeferral },
+    /// Live checkpoint debt was empty and nothing was in flight: no capture
+    /// was owed (already satisfied by an earlier snapshot).
+    AlreadySatisfied,
+}
+
 /// One background write in flight: its join handle, the snapshot sequence
 /// it acknowledges, and the exact debt set it froze (moved out of the
 /// live debt at freeze time). That frozen set is the ONLY thing this
@@ -295,16 +333,32 @@ impl RuntimeActor {
     /// flight — including a re-accrued reason — stays in the live set for
     /// the very next settled batch to capture as a further snapshot
     /// instead of letting the first acknowledgement silently absorb it.
-    pub(super) async fn safe_point_resume_commit(&mut self) {
+    ///
+    /// The typed outcome lets callers that must promise a durable
+    /// continuation (the failed-turn tail) distinguish a real capture from
+    /// a deferral: only `Captured` whose `debt_basis` carries the caller's
+    /// reason may be treated as captured; `Deferred` keeps the debt live
+    /// and names the in-flight work whose settlement must re-drive this
+    /// capture.
+    pub(super) async fn safe_point_resume_commit(&mut self) -> SafepointCapture {
         let _ = self.take_settled_checkpoint_write().await;
-        if self.state.checkpoint_debt.is_empty()
-            || self.state.checkpoint_write.is_some()
-            || self.state.checkpoint_prepare.is_some()
-        {
-            return;
+        if self.state.checkpoint_prepare.is_some() {
+            return SafepointCapture::Deferred {
+                reason: SafepointDeferral::PrepareInFlight,
+            };
+        }
+        if self.state.checkpoint_write.is_some() {
+            return SafepointCapture::Deferred {
+                reason: SafepointDeferral::WriteInFlight,
+            };
+        }
+        if self.state.checkpoint_debt.is_empty() {
+            return SafepointCapture::AlreadySatisfied;
         }
         let Some(task_id) = self.state.tasks.active() else {
-            return;
+            return SafepointCapture::Deferred {
+                reason: SafepointDeferral::NoActiveTask,
+            };
         };
         let anchor_revision = self
             .state
@@ -358,8 +412,12 @@ impl RuntimeActor {
         // mutation after this point accrues fresh debt that this ack can
         // never clear (ACK(S_v) retires only debt frozen into S_v).
         let captured_debt = std::mem::take(&mut self.state.checkpoint_debt);
-        self.schedule_checkpoint_write(sequence, anchor_revision, captured_debt)
+        self.schedule_checkpoint_write(sequence, anchor_revision, captured_debt.clone())
             .await;
+        SafepointCapture::Captured {
+            sequence,
+            debt_basis: captured_debt,
+        }
     }
 
     /// Capture the current planes under the already-allocated sequence and

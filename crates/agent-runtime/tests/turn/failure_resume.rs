@@ -12,7 +12,7 @@ use agent_runtime::{
 use context_simple::{SimpleContextConfig, SimpleContextEngine};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -109,6 +109,15 @@ async fn instance_with_context(
     } else {
         Arc::new(TestToolDispatcher)
     };
+    instance_with_dispatcher(root, model, context, tools).await
+}
+
+async fn instance_with_dispatcher(
+    root: &std::path::Path,
+    model: Arc<FailingModel>,
+    context: Arc<dyn agent_contracts::ContextEngine>,
+    tools: Arc<dyn agent_contracts::ToolDispatcher>,
+) -> RuntimeInstance {
     let workspace = Arc::new(agent_workspace::Workspace::open(root).await.unwrap());
     let journal = Arc::new(
         agent_storage::FileEventJournal::open(workspace.state_dir().join("traces"))
@@ -791,4 +800,378 @@ async fn occupied_boundary_probe(occupy_gc: bool) {
             .any(|event| matches!(event, RuntimeEvent::TurnFailed { .. })),
         "a cancelled turn must not publish a late failure terminal"
     );
+}
+
+/// A read-only probe that counts executions. Shared across runtime
+/// instances: a resumed continuation must replay the observation from the
+/// restored planes instead of executing the read again.
+#[derive(Debug)]
+struct CountingProbe {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl agent_contracts::ToolDispatcher for CountingProbe {
+    fn specs(&self) -> Vec<agent_contracts::ToolSpec> {
+        vec![agent_contracts::ToolSpec {
+            name: "fs.read".into(),
+            description: "read-only counting fixture".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            risk: agent_contracts::ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: vec![],
+        }]
+    }
+    async fn execute(
+        &self,
+        request: agent_contracts::ToolExecutionRequest,
+    ) -> AgentResult<agent_contracts::ToolOutcome> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(agent_contracts::ToolOutcome::Value(
+            agent_contracts::ToolOutput {
+                call_id: request.call.id,
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "read".into(),
+                model_content: "observed fixture".into(),
+                artifact_ref: None,
+                metadata: serde_json::json!({"path":"probe.txt","revision":"v1"}),
+            },
+        ))
+    }
+}
+
+/// BR2 combined fixture (F10 x F12): the old task's completion-boundary GC
+/// owns the single boundary lane while the new task's anchor debt has
+/// already settled into an in-flight gated prepare S1, and the next model
+/// request fails. Everything is admitted through public APIs; the gates
+/// control engine-call timing only.
+async fn combined_occupied_boundary(
+    probe: Arc<dyn agent_contracts::ToolDispatcher>,
+) -> (
+    tempfile::TempDir,
+    RuntimeInstance,
+    Arc<OccupiedBoundaryContext>,
+    Arc<FailingModel>,
+    tokio::sync::broadcast::Receiver<RuntimeEventEnvelope>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let context = Arc::new(OccupiedBoundaryContext {
+        inner: SimpleContextEngine::new(SimpleContextConfig::default()),
+        gc_entered: Default::default(),
+        gc_release: tokio::sync::Semaphore::new(0),
+        checkpoint_entered: Default::default(),
+        checkpoint_release: tokio::sync::Semaphore::new(0),
+        hold_gc: AtomicBool::new(true),
+        hold_checkpoint: AtomicBool::new(false),
+    });
+    let model = Arc::new(FailingModel {
+        read_first: true,
+        ..Default::default()
+    });
+    model.fail.store(true, Ordering::SeqCst);
+    let runtime = instance_with_dispatcher(dir.path(), model.clone(), context.clone(), probe).await;
+    let handle = runtime.handle();
+    let mut events = handle.subscribe();
+    // F12 half: the old task's completion boundary owns the single lane.
+    handle.set_focus("old completed task".into()).await.unwrap();
+    handle
+        .complete_current_task("operator closes old task".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), context.gc_entered.notified())
+        .await
+        .unwrap();
+    // F10 half: the new task accrues anchor debt, and its first read-only
+    // model round settles that debt into the gated prepare S1 — while the
+    // GC owner still holds the lane.
+    handle
+        .set_focus("new task with failure".into())
+        .await
+        .unwrap();
+    context.hold_checkpoint.store(true, Ordering::SeqCst);
+    let new_task = handle
+        .list_tasks()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|task| task.goal == "new task with failure")
+        .expect("the new task exists");
+    handle
+        .patch_task_anchor(
+            new_task.id,
+            new_task.anchor_revision,
+            agent_runtime::AnchorPatch {
+                next_action: Some("inspect the fixture".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    handle.user_message(NEW.into()).await.unwrap();
+    // The read settles S1's prepare into the gated engine call.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        context.checkpoint_entered.notified(),
+    )
+    .await
+    .unwrap();
+    // The next model request fails while S1 is still in flight.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                RuntimeEvent::Failure { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    (dir, runtime, context, model, events)
+}
+
+fn resume_committed_with_failed_turn_yield(seen: &[RuntimeEvent]) -> bool {
+    seen.iter().any(|event| {
+        matches!(
+            event,
+            RuntimeEvent::TaskResumeCommitted { debt, .. }
+                if debt.iter().any(|reason| reason == "failed_turn_yield")
+        )
+    })
+}
+
+/// BR2 combined counterexample (F10 x F12, no cancellation): the failure's
+/// `FailedTurnYield` debt must be captured by a real snapshot even though an
+/// older prepare S1 was already in flight when the failure parked behind the
+/// GC owner. Before the typed capture result, the capture silently returned
+/// while S1 was in flight, the tail was still marked captured, and the
+/// durability gate fenced continuation with RecoveryRequired.
+#[tokio::test]
+async fn occupied_gc_with_inflight_prepare_still_captures_failed_turn_debt() {
+    let (_dir, runtime, context, model, mut events) =
+        combined_occupied_boundary(Arc::new(ReadOnlyProbe)).await;
+    let handle = runtime.handle();
+    // The parked failed-turn checkpoint blocks mutations until it settles.
+    assert!(
+        handle.set_focus("must not overtake".into()).await.is_err(),
+        "a mutation must not overtake the parked failed-turn checkpoint"
+    );
+    // Release ONLY the checkpoint gate: S1 settles and goes idle, the GC
+    // owner still holds the lane, and no re-drive has happened yet.
+    context.hold_checkpoint.store(false, Ordering::SeqCst);
+    context.checkpoint_release.add_permits(8);
+    tokio::time::timeout(Duration::from_secs(2), handle.status_snapshot())
+        .await
+        .unwrap()
+        .unwrap();
+    // Release the GC owner: the parked tail must re-drive the capture, land
+    // a snapshot that freezes FailedTurnYield, and publish TurnFailed
+    // without fencing continuation.
+    context.hold_gc.store(false, Ordering::SeqCst);
+    context.gc_release.add_permits(8);
+    let seen = terminal(&mut events).await;
+    assert!(
+        resume_committed_with_failed_turn_yield(&seen),
+        "the failed-turn debt must be frozen into a real snapshot: {seen:?}"
+    );
+    let durable_sequences: Vec<_> = seen
+        .iter()
+        .filter_map(|event| match event {
+            RuntimeEvent::CheckpointDurable { sequence, .. } => Some(*sequence),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        durable_sequences.len() >= 2 && durable_sequences[0] < durable_sequences[1],
+        "S1 and the failed-turn snapshot must both land durably: {durable_sequences:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::RecoveryRequired)),
+        "the re-drive must capture the debt instead of fencing it: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnFailed { .. }))
+    );
+    // The task stays continuable in place.
+    model.fail.store(false, Ordering::SeqCst);
+    handle.continue_active_task().await.unwrap();
+    let resumed = terminal(&mut events).await;
+    assert!(
+        model
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .messages
+            .iter()
+            .any(|message| message.content.contains(NEW)),
+        "continuation must carry the accepted directive"
+    );
+    assert!(
+        resumed
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::TurnCompleted))
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+/// BR2 combined counterexample (cancellation variant): cancelling the failed
+/// turn while the combined boundary is parked must publish exactly one
+/// TurnCancelled, and the re-drive after the old prepare and GC owner settle
+/// must not resurrect the cancelled turn with a late failure terminal.
+#[tokio::test]
+async fn occupied_gc_with_inflight_prepare_cancel_publishes_single_terminal() {
+    let (_dir, runtime, context, _model, mut events) =
+        combined_occupied_boundary(Arc::new(ReadOnlyProbe)).await;
+    let handle = runtime.handle();
+    let ack = tokio::time::timeout(Duration::from_secs(10), handle.cancel_turn())
+        .await
+        .expect("cancel must stay serviceable behind the combined boundary")
+        .unwrap();
+    assert!(matches!(
+        ack,
+        agent_contracts::TurnCancelAck::Cancelled { .. }
+    ));
+    // Both gates release: the old prepare lands, the GC owner completes, and
+    // the parked tail re-drives — into a cancelled turn.
+    context.hold_checkpoint.store(false, Ordering::SeqCst);
+    context.checkpoint_release.add_permits(8);
+    context.hold_gc.store(false, Ordering::SeqCst);
+    context.gc_release.add_permits(8);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if matches!(
+                events.recv().await.unwrap().event,
+                RuntimeEvent::TurnCancelled { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the cancelled turn must publish its terminal");
+    // Let the boundary chain finish, then inspect the remaining tail. The
+    // terminal that broke the wait loop counts as the first one.
+    tokio::time::timeout(Duration::from_secs(10), handle.status_snapshot())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut cancelled = 1usize;
+    while let Ok(envelope) = events.try_recv() {
+        assert!(!matches!(
+            envelope.event,
+            RuntimeEvent::TurnFailed { .. }
+                | RuntimeEvent::TurnCompleted
+                | RuntimeEvent::RecoveryRequired
+        ));
+        cancelled += usize::from(matches!(envelope.event, RuntimeEvent::TurnCancelled { .. }));
+    }
+    assert_eq!(cancelled, 1, "exactly one cancellation terminal");
+    runtime.shutdown().await.unwrap();
+}
+
+/// BR2 combined counterexample (cold restore): after the combined boundary
+/// settles, the durable snapshot must carry the accepted directive identity
+/// and the read observation; continuing the same TaskId in a fresh runtime
+/// replays neither the instruction nor the tool result.
+#[tokio::test]
+async fn combined_boundary_failure_restore_keeps_identity_without_replay() {
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    let probe = Arc::new(CountingProbe {
+        calls: probe_calls.clone(),
+    });
+    let (dir, runtime, context, _model, mut events) =
+        combined_occupied_boundary(probe.clone()).await;
+    // Release ONLY the checkpoint gate first: S1 settles while the GC owner
+    // still holds the lane, matching the deterministic ordering of the
+    // non-cancel counterexample.
+    context.hold_checkpoint.store(false, Ordering::SeqCst);
+    context.checkpoint_release.add_permits(8);
+    context.hold_gc.store(false, Ordering::SeqCst);
+    context.gc_release.add_permits(8);
+    let seen = terminal(&mut events).await;
+    assert!(
+        resume_committed_with_failed_turn_yield(&seen),
+        "the failed-turn debt must be frozen into a real snapshot: {seen:?}"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::RecoveryRequired))
+    );
+    assert_eq!(
+        probe_calls.load(Ordering::SeqCst),
+        1,
+        "the probe read ran exactly once before the failure"
+    );
+
+    let store = CheckpointStore::new(dir.path().join(".focus-agent/checkpoints"));
+    let latest = store.list(1).await.unwrap().remove(0);
+    let restored: RuntimeCheckpoint =
+        serde_json::from_slice(&store.load_verified(&latest.artifact).await.unwrap()).unwrap();
+    let task_id = restored.current_task_id.unwrap();
+    let saved = restored
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(
+        saved.current_directive.as_ref().unwrap().input.digest,
+        Some(agent_contracts::ContentDigest::sha256_bytes(NEW.as_bytes()).to_string()),
+        "the durable snapshot must retain the full input identity, not only its preview"
+    );
+    let restored_json = serde_json::to_string(&restored).unwrap();
+    assert!(
+        restored_json.contains("fs.read") && restored_json.contains("probe.txt"),
+        "the durable snapshot must retain the tool observation identity (tool and metadata)"
+    );
+    let directive_epoch = saved.resume.directive_revision;
+    runtime.shutdown().await.unwrap();
+
+    let recorder = Arc::new(FailingModel::default());
+    let second = instance_with_dispatcher(
+        dir.path(),
+        recorder.clone(),
+        Arc::new(SimpleContextEngine::new(SimpleContextConfig::default())),
+        probe,
+    )
+    .await;
+    second.restore(restored).await.unwrap();
+    let mut events = second.handle().subscribe();
+    second.handle().continue_active_task().await.unwrap();
+    let resumed = terminal(&mut events).await;
+    assert!(
+        recorder.requests.lock().unwrap()[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains(NEW)),
+        "the restored continuation must carry the accepted directive"
+    );
+    let checkpoint = second.checkpoint().await.unwrap();
+    assert_eq!(checkpoint.current_task_id, Some(task_id));
+    let task = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(
+        task.resume.directive_revision, directive_epoch,
+        "continuation must not re-admit the feedback"
+    );
+    assert!(!resumed.iter().any(|e| matches!(e, RuntimeEvent::UserMessageAccepted { input } if input.kind == agent_contracts::InputKind::Dialogue)));
+    assert_eq!(
+        probe_calls.load(Ordering::SeqCst),
+        1,
+        "the tool result must not be re-executed on resume"
+    );
+    second.shutdown().await.unwrap();
 }
