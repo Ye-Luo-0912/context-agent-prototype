@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "kind": "v4_real_snapshot_workflow",
+  "created_epoch": 1789899357.9161618,
+  "deadline_epoch": 1789913757.9161618,
+  "main_decisions": 96,
+  "provider_attempts": 128,
+  "tool_attempts": 384,
+  "input_tokens": 4000000,
+  "output_tokens": 250000,
+  "estimated_cost_usd": 1.0,
+  "api_protocol": "chat",
+  "chat_thinking": "disabled",
+  "model": "deepseek-flash"
+}

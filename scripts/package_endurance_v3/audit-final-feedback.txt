@@ -1,0 +1,13 @@
+Final10 decisions of original48 allocation. Independent six-case CLI oracle:
+valid two-generation WAL-mode-but-quiescent repo.sqlite now FAILS with
+"cannot inspect receipts table: unable to open database file". Your in-memory
+deserialize of a WAL-mode SQLite image doesn't make a usable quiescent connection.
+Use a correct read-only quiescent-snapshot open (for example SQLite URI
+mode=ro&immutable=1 only after rejecting sidecars), not a custom DB parser.
+Do not change audited bytes and never ignore a present WAL/journal. The other
+five negative cases currently reject, but they are not sufficient without the
+positive control. Keep fixed historical-pointer matching and orphan DB lookup.
+Only app/audit.py and app/tests/test_audit.py may change. A fs.write was denied
+by the app-only standing grant; respect that boundary, do not widen permissions.
+Use the exact granted Python executable in process.run. Fix this actual blocker,
+run tests plus a real quiescent WAL-mode database fixture, then report honestly.

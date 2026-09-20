@@ -1,0 +1,10 @@
+P2: complete content integrity and atomic deployment. Content and canonical
+configuration determine cache validity, never size/mtime. Verify both source
+and cache hashes. Receipts are scoped by tenant/environment/key and bind the
+original request; replaying an old receipt must NOT switch the active pointer
+back to an older generation. GC preserves all committed receipt and pending
+journal roots and serializes with install. Implement recover and actual
+os._exit hooks before_pointer/after_pointer as specified. Add regressions that
+change source bytes without changing their length/mtime, conflict an idempotency
+key, use a stale generation, and restart after each crash hook. Do not call a
+checkpoint/turn final equivalent to independent application acceptance.

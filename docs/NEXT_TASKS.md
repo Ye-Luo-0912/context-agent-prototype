@@ -4,6 +4,55 @@
 
 ## 接手规则
 
+**2026-09-21 V5 已执行并停止：NOT_ACCEPTED_MODEL_BUDGET_EXHAUSTED。**
+方案中的持久 TaskId、同一 workspace、连续控制器和独立 oracle 已实际运行；
+模型 260 主决策后仍未通过 WAL/历史规模/独立备份验收，120 分钟长负载未达到。
+账本、保护文件、模型段和控制器事件已冻结；没有自动追加预算。结果见
+[V5 执行回执](experiments/package-endurance-v5/RUN_2026-09-21.md)。
+若要继续，必须建立新的预算窗口并重新声明是否允许供应商调用；当前任务不再自动发起请求。
+
+**2026-09-20 当前选定切片 V4：原窗口结束，本地收尾完成。**
+按 [V4 计划](experiments/package-endurance-v4/PLAN.md) 和
+[到期后的本地范围](experiments/package-endurance-v4/LOCAL_CLOSEOUT.md) 收口。
+原模型 8/26，真实供应商取消/恢复未通过；原 93 次请求估算 USD 0.324905076，
+unknown/reserved 均为 0，原 deadline/账本/模型产物保留，新增付费请求 0。
+人工补修 26/26、公开 smoke 4/4，最终 300 秒负载 1176 个循环及两次真实崩溃重试
+通过，本地合成供应商真实 host 7/7；不能合并宣称模型自主交付。
+本次补 fs.read schema 准入红→绿、Windows 原子发布暂时拒绝、跨盘导出、
+控制器构造失败 cleanup 传播；最终检查和证据清单见
+[收尾回执](experiments/package-endurance-v4/CLOSEOUT_2026-09-20.md)。
+不清除原 Core 恢复围栏、不追加付费窗口；未提交/推送，远端 CI 未运行。
+
+**2026-09-20 当前选定切片 PKG-FINAL：优化实现与计划内本地验收全部完成。**
+用户要求继续完成整个优化任务；本次按 [最终验收计划](experiments/package-endurance-v3/FINAL_ACCEPTANCE_PLAN.md)
+已补半批取消失败、启动失败调用方接线、瞬时 Job 快照重采和 Python 解释器可移植性；
+两套 Python 回归已接入双平台 CI。Windows workspace 3066/0、Linux Runtime/host
+822/0、.NET 139/0、两平台 Python 回归、全 workspace clippy/fmt 均通过。
+最终 helper 下完整 30 分钟负载通过 7176 次安装与两次进程故障恢复，同库 host 7/7；
+静止审计确认 7177 条回执、183 文件字节不变，全部进程清理确认。
+新增付费调用 0；首次失败及中止保持原样；未提交/推送、远端 CI 未运行。
+[最终回执与证据](experiments/package-endurance-v3/FINAL_ACCEPTANCE_2026-09-20.md)。
+
+**2026-09-20 选定切片 Package v3：本地收尾完成（未提交，远端 CI 未运行）。**
+接续用户“高难度长流程复杂测试，暴露问题，并优化”，范围按
+[v3 计划](experiments/package-endurance-v3/PLAN.md)，结果见
+[v3 回执](experiments/package-endurance-v3/RUN_2026-09-20.md)。
+Runtime 取消保全、应用人工修复、host 旅程、30 分钟应用负载、真实模型质量分别验收；
+48 次主决策的付费窗口已结束，不自动加额度或重跑。
+续接已核验现有证据、补控制器启动失败后清理未确认的分类与回归、同步文档；
+脚本 52/52、v3 34/34、Runtime 取消组合 5/5，定向 clippy/fmt 通过。
+原模型审计器保持未验收，旧 v2/v3 证据不改写。提交/远端 CI 尚未执行。
+
+**2026-09-20 选定切片 PKG-H1：本地完成（未提交，远端 CI 未运行）。**
+Package v2 实验已按原 240 次主决策额度结束，应用未验收；
+发现与分层证据见 [本轮回执](experiments/package-endurance-v2/RUN_2026-09-20.md)。
+本片修复 host 对合法 submit/steer 正文先按 4096 字节断连的问题：仅调整字符串解码预算，
+保持 1 MiB 帧上限、结构预算、200000 字符/256 KiB 正文校验与 Core 权限。
+现有新任务目标 2000 字符上限保留；更长 submit 返回业务拒绝，长 steer 使用完整指令。
+验收：host 全套 35/0、定向 clippy/fmt 通过，9512 字节纠正在 4 进程合成供应商旅程中
+通过失败/冷恢复/取消检查，新增付费调用 0；[修复回执](experiments/package-endurance-v2/HOST_TEXT_RECEIPT.md)。
+模型生成应用的 PKG-A1/A2/A3 和 90 分钟负载不在本修复片中重跑。
+
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
 **第十二批（`bcacf41b` 续审）已全部关闭（2026-09-19，本地集成回归全绿，回执：[BATCH12_RECEIPT](reviews/2026-09-19-review-bcacf41b/BATCH12_RECEIPT.md)）。第十一批（`d3a05d29` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十一批与五份回执；CI 终验 run `35289417269` 首跑全绿）。** 第十批已全部关闭（CI 终验 run `35278745998` 与钉宽后 run `35282364426` 见 CURRENT.md）。条件任务 T8 亦已关闭（2026-09-18，授权付费实验：ENDPOINT_ACCEPTED=PASS／SERVER_HIT=OBSERVED／token 口径全落账、金额 NOT_RUN；`context_manage` 租赁打断供应商前缀复用实测成立，见 NEXT_TASKS T8 节与 [t8 证据](walkthroughs/2026-09-18-t8-kv-live.md)）；host_e2e 起始基线抖动为未定性观察（见 CURRENT.md 已知抖动记录）。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。

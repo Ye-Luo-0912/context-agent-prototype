@@ -1,0 +1,22 @@
+{
+  "baseline_head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "worktree_uncommitted": true,
+  "files": {
+    ".github/workflows/ci.yml": "e78d7f06d449dcdd94d78b0f604494f7dca857c3b34a3b139e19ee53ea7714cf",
+    "crates/agent-host/src/lib.rs": "2f8138b04c61928e6dbd8f492405a34dc3e94cc06fb07ec129d5362bbb70474a",
+    "crates/agent-host/src/decode_tests.rs": "d878980627e2d152bd5d2a06b122b108071d08103d21ad928057086a8d9ada44",
+    "crates/agent-host/tests/host_e2e.rs": "212d75776c2b690775eb40b77a0800b6de9f63aad74734eb92223e2879f804c1",
+    "crates/agent-runtime/src/actor/turn.rs": "f8ad3af22d5b1e3b76f697c864be97c2af8f8931c63c13a8c8e5052afad85348",
+    "crates/agent-runtime/tests/turn/main.rs": "1ef9d02945c4bf3d284077f5a152ba4594f3cf04927932ae4b462ff94db0ef3e",
+    "crates/agent-runtime/tests/turn/combined_cancel.rs": "7850386680b04aed2c639add5838a2b27f3a41cc2b688a98943485f205ca90ae",
+    "scripts/runtime_endurance_full_campaign.py": "267dc621a4fde014f46d18119118e67db769c00c957b32ca0841ac0be59d8f17",
+    "scripts/runtime_endurance_incremental_runner.py": "59c5fdc68b361e21a0318d74c07153c8cfaa8cb99d9b53659ec0134b1f2db041",
+    "scripts/runner_process_tree.py": "b6830875c8a962bb091b2a5679714c736735d51318e4aeb9eb1723d19df842e7",
+    "scripts/tests/test_campaign_guard.py": "c8f78e319275cee9e47e87b0aa6224f8451de1c62a3fca082e7813cb71cf6e5f",
+    "scripts/tests/test_runner_integrity.py": "359f0f4bb13e372b0df4a873dcea20132de41fa1d07366728697ea68f1ab6ec6",
+    "scripts/tests/test_runner_lifetime.py": "1e58405c57febfa146c25de28f6072e8b5727ce589a7ce4a6452bc0467a7b98d",
+    "scripts/package_endurance_v3/load.py": "6ed9b38c28a615d53857e01dbd25cff1194b010d0a56f8fcd2cb61b0221ead51",
+    "scripts/package_endurance_v3/journey.py": "b77a7271d9971f8cba70c8c7cd64706307370a6981499d04b1e0b4dcbfb24931",
+    "scripts/package_endurance_v3/tests/test_controller_guards.py": "83dc008570c8549bbadeff45f0a621b0b55acb7ccf0fbc49c6fc89f595170744"
+  }
+}

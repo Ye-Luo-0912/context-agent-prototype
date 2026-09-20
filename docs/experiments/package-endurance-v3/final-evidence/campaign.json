@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "kind": "local_validation_only",
+  "created_epoch": 1789894425.0959172,
+  "deadline_epoch": 1789908825.0959172,
+  "main_decisions": 0,
+  "provider_attempts": 0,
+  "tool_attempts": 0,
+  "estimated_cost_usd": 0.0,
+  "load_seconds": 1800,
+  "previous_attempt": "package-optimization-final-20260920",
+  "reason": "Final helper retries only typed transient membership changes"
+}

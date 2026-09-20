@@ -1,0 +1,18 @@
+test_historical_corruption_with_actual_durable_history_is_detected (test_auditor_assisted.AssistedAuditor.test_historical_corruption_with_actual_durable_history_is_detected) ... ok
+test_invalid_directory_cannot_hide_orphan_pointer (test_auditor_assisted.AssistedAuditor.test_invalid_directory_cannot_hide_orphan_pointer) ... ok
+test_invalid_json_number_produces_single_error_document (test_auditor_assisted.AssistedAuditor.test_invalid_json_number_produces_single_error_document) ... ok
+test_manifest_scope_is_bound_to_receipt (test_auditor_assisted.AssistedAuditor.test_manifest_scope_is_bound_to_receipt) ... ok
+test_manifest_scope_shape_is_validated (test_auditor_assisted.AssistedAuditor.test_manifest_scope_shape_is_validated) ... ok
+test_missing_current_authority_is_not_a_pass (test_auditor_assisted.AssistedAuditor.test_missing_current_authority_is_not_a_pass) ... ok
+test_missing_current_pointer_is_not_a_pass (test_auditor_assisted.AssistedAuditor.test_missing_current_pointer_is_not_a_pass) ... ok
+test_noncanonical_pointer_is_rejected (test_auditor_assisted.AssistedAuditor.test_noncanonical_pointer_is_rejected) ... ok
+test_object_directory_link_cannot_escape_snapshot (test_auditor_assisted.AssistedAuditor.test_object_directory_link_cannot_escape_snapshot) ... ok
+test_old_durable_pointer_cannot_override_sqlite_current (test_auditor_assisted.AssistedAuditor.test_old_durable_pointer_cannot_override_sqlite_current) ... ok
+test_uri_special_character_in_root_remains_valid (test_auditor_assisted.AssistedAuditor.test_uri_special_character_in_root_remains_valid) ... ok
+test_valid_historical_receipts_count_two (test_auditor_assisted.AssistedAuditor.test_valid_historical_receipts_count_two) ... ok
+test_wal_sidecar_is_refused_without_modification (test_auditor_assisted.AssistedAuditor.test_wal_sidecar_is_refused_without_modification) ... ok
+
+----------------------------------------------------------------------
+Ran 13 tests in 1.774s
+
+OK

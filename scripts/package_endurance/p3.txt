@@ -1,0 +1,10 @@
+P3: implement app.worker CLI and verify four independent OS workers sharing
+the deployment root. Distinct tenants/environments must be independent. Same
+target concurrent generation-CAS submissions produce exactly one winner.
+Add bounded process tests with observed child startup, real termination and
+joined cleanup. Every installed package byte, manifest and receipt must be
+consistent on disk after recovery. Retain app APIs from SPEC.md, and implement
+durable migration and publication interfaces for the following stages. The
+controller will run the 90-minute load outside model calls once these basic
+deployment gates pass. Worker ownership under Runtime will be tested through
+the public host process/session interfaces separately.

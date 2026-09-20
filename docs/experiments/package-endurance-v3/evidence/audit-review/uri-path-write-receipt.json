@@ -1,0 +1,23 @@
+{
+  "results": [
+    {
+      "candidate": "model",
+      "exit": 1,
+      "stdout": "{\"errors\":[\"receipts table missing required columns: tenant, environment, key, generation, manifest_sha256\",\"pointer tenant-a/prod: missing DB receipt for tenant-a/prod/first\"],\"ok\":false,\"receipts\":0}",
+      "stderr": "",
+      "created_files": [
+        "snapshot"
+      ],
+      "changed_files": []
+    },
+    {
+      "candidate": "assisted",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": "",
+      "created_files": [],
+      "changed_files": []
+    }
+  ],
+  "provider_paid_calls": 0
+}

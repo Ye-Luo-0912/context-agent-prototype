@@ -1,0 +1,13 @@
+{
+  "status": "INTERRUPTED_FOR_CONFIRMED_HELPER_FIX",
+  "recorded_epoch": 1789894077.8860867,
+  "original_receipt_status": "RUNNING",
+  "observed_seconds": 488.63006591796875,
+  "verified_install_receipts": 1924,
+  "reason": "Snapshot membership change permanently stopped lifetime observer; preserve failed host receipt and restart full window after repair.",
+  "controller_session_exit": 1,
+  "matching_processes_after_interrupt": 0,
+  "process_check": "Approved read-only Win32_Process scan for exact validation root; no matching python.exe/agent-host.exe",
+  "cleanup_limit": "Final controller cleanup receipt was not written after session interrupt; this run is not a PASS.",
+  "provider_paid_calls": 0
+}

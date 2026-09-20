@@ -1,0 +1,44 @@
+test_gated_native_member_growth_retains_both_exit_handles (test_runner_lifetime.LifetimeTests.test_gated_native_member_growth_retains_both_exit_handles) ... ERROR
+test_tracking_retries_real_capture_function_after_membership_growth (test_runner_lifetime.LifetimeTests.test_tracking_retries_real_capture_function_after_membership_growth) ... ERROR
+
+======================================================================
+ERROR: test_gated_native_member_growth_retains_both_exit_handles (test_runner_lifetime.LifetimeTests.test_gated_native_member_growth_retains_both_exit_handles)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\tests\test_runner_lifetime.py", line 105, in test_gated_native_member_growth_retains_both_exit_handles
+    self.assertEqual(job._capture_for_tracking(time.monotonic() + 10), 2)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\runner_process_tree.py", line 129, in _capture_for_tracking
+    handles, total = self.capture_member_handles(deadline)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\runner_process_tree.py", line 237, in capture_member_handles
+    raise OSError("Job membership changed before handles could be captured")
+OSError: Job membership changed before handles could be captured
+
+======================================================================
+ERROR: test_tracking_retries_real_capture_function_after_membership_growth (test_runner_lifetime.LifetimeTests.test_tracking_retries_real_capture_function_after_membership_growth)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\tests\test_runner_lifetime.py", line 82, in test_tracking_retries_real_capture_function_after_membership_growth
+    self.assertEqual(job._capture_for_tracking(deadline), 2)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\runner_process_tree.py", line 129, in _capture_for_tracking
+    handles, total = self.capture_member_handles(deadline)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\AppData\Python\Lib\unittest\mock.py", line 1134, in __call__
+    return self._mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\AppData\Python\Lib\unittest\mock.py", line 1138, in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\AppData\Python\Lib\unittest\mock.py", line 1211, in _execute_mock_call
+    return self._mock_wraps(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\runner_process_tree.py", line 237, in capture_member_handles
+    raise OSError("Job membership changed before handles could be captured")
+OSError: Job membership changed before handles could be captured
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.113s
+
+FAILED (errors=2)

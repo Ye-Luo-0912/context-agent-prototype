@@ -1,0 +1,9 @@
+P1: establish the v1 baseline and implement the dependency resolver first.
+Read SPEC.md in full and inspect the 120-package/four-version catalog shape
+using bounded samples. Run the two baseline public tests. Implement resolve
+with genuine backtracking and all root/transitive constraints, deterministic
+highest compatible solution, cycle/missing dependency checks, strict validation
+and focused regressions. Then implement Repository.install/active/receipt for
+verified source blobs and canonical on-disk manifest/receipt files, SQLite
+identity and generation CAS. Retain compatible public behavior. Explain exactly
+what is complete and what remains for worker/crash/outbox/migration stages.

@@ -1,0 +1,68 @@
+{
+  "outcome": "completed",
+  "categories": [
+    "child_nonzero"
+  ],
+  "exit_code": 10,
+  "exit": 1,
+  "child_exit_code": 1,
+  "elapsed": 25.19,
+  "rounds": 12,
+  "tool_calls": 15,
+  "protected_unchanged": true,
+  "terminals": [
+    {
+      "type": "turn_failed",
+      "turn_id": "28adf64c-cb7d-4ac9-bc46-27a5be91b5e2",
+      "task_id": "9be63252-329a-4fd7-81f9-57bffa9f15ea",
+      "class": "model",
+      "retryable": false
+    }
+  ],
+  "session": {
+    "approval_denied": false,
+    "exit": 1,
+    "kind": "session_end",
+    "round_budget": false,
+    "schema": "agent.headless.v1",
+    "status": "failed",
+    "stop": "failure",
+    "task_completed": false,
+    "task_state": "awaiting_operator_review"
+  },
+  "requests": 14,
+  "budget": {
+    "cap_usd": 3.0,
+    "inherited_ledger": true,
+    "cap_stopped": false,
+    "committed_usd": 0.10705738800000003,
+    "reserved_usd": 0.0,
+    "unknown_usd": 0.0,
+    "reserve_policy": {
+      "strategy": "wire_byte_upper_estimate",
+      "input_estimate": "request_body_bytes + 8192 tokens at cache-miss rate",
+      "output_estimate": "max_output_tokens at output rate",
+      "max_output_tokens": 8192,
+      "estimated": true,
+      "attempts_cap": 300,
+      "input_tokens_cap": 9000000,
+      "output_tokens_cap": 300000,
+      "decisions_cap": 240,
+      "tool_attempts_cap": 720,
+      "tool_slots_reserved_per_request": 32,
+      "deadline_epoch": 1789850515.9722717
+    }
+  },
+  "cleanup": {
+    "order": [
+      "relay_accept_stopped",
+      "child_stop:already_exited"
+    ],
+    "child": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "already_exited"
+    },
+    "forced_unknown_attempts": []
+  }
+}

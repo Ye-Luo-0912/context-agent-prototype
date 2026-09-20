@@ -1,0 +1,20 @@
+Continue SAME task. The prior 40 decisions made almost no application progress.
+Stop repeated resolver rewrites driven by a possibly incorrect self-written test.
+The independent oracle (outside your workspace) says the CURRENT solver fails
+the valid graph a1->b1, a2->b2, root a[1,3) AND root b[1,2): expected {a:1,b:1},
+but current code raises "root a dropped". Also a2->b1->a2 cycle with a1 having no
+deps and root a[1,3) must backtrack and return {a:1}, not reject all choices.
+Use immutable per-branch dictionaries in recursion, recheck assigned versions
+against tightened bounds, and reject a cycle at candidate selection so another
+candidate can be explored. Do not restore shared dictionaries on success.
+Your own test expecting a1,b2 when a2,b1 also satisfies all constraints is wrong
+under the SPEC lexicographic version-vector rule; verify its fixtures before
+treating that expected value as the product contract. You may repair app/tests.
+
+Implement persistence NOW in this segment: Repository methods are still stubs,
+worker/docs absent. Reserve at most 6 decisions for resolver and use the rest
+to implement the SQLite journal, install/active/receipt/GC, actual exit hooks,
+worker, migration and publication. Use fs.write small modules, no edit.patch.
+Don't spend repeated reads on unchanged files. Always include path and valid JSON.
+No manual source edits have been applied by the controller. Work must land via
+your Runtime tools and pass actual tests. Do not merely deliver another plan.

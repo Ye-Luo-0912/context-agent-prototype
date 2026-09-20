@@ -1,0 +1,123 @@
+{
+  "status": "REPRODUCED",
+  "defect": "old_idempotency_replay_reactivates_old_deployment",
+  "steps": [
+    {
+      "action": "install_first",
+      "request": {
+        "tenant": "tenant-a",
+        "environment": "prod",
+        "key": "first",
+        "requirements": {
+          "pkg-039": {
+            "min": 2,
+            "max": 3
+          }
+        }
+      },
+      "returned": {
+        "tenant": "tenant-a",
+        "environment": "prod",
+        "key": "first",
+        "generation": 1,
+        "manifest_sha256": "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339"
+      },
+      "actual_pointer": {
+        "environment": "prod",
+        "generation": 1,
+        "key": "first",
+        "manifest_sha256": "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339",
+        "tenant": "tenant-a"
+      },
+      "durable_receipts": [
+        [
+          "first",
+          1,
+          "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339"
+        ]
+      ]
+    },
+    {
+      "action": "install_second",
+      "request": {
+        "tenant": "tenant-a",
+        "environment": "prod",
+        "key": "second",
+        "requirements": {
+          "pkg-039": {
+            "min": 3,
+            "max": 4
+          }
+        },
+        "expected_generation": 1
+      },
+      "returned": {
+        "tenant": "tenant-a",
+        "environment": "prod",
+        "key": "second",
+        "generation": 2,
+        "manifest_sha256": "2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a"
+      },
+      "actual_pointer": {
+        "environment": "prod",
+        "generation": 2,
+        "key": "second",
+        "manifest_sha256": "2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a",
+        "tenant": "tenant-a"
+      },
+      "durable_receipts": [
+        [
+          "first",
+          1,
+          "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339"
+        ],
+        [
+          "second",
+          2,
+          "2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a"
+        ]
+      ]
+    },
+    {
+      "action": "replay_first",
+      "request": {
+        "tenant": "tenant-a",
+        "environment": "prod",
+        "key": "first",
+        "requirements": {
+          "pkg-039": {
+            "min": 2,
+            "max": 3
+          }
+        }
+      },
+      "returned": {
+        "tenant": "tenant-a",
+        "environment": "prod",
+        "key": "first",
+        "generation": 1,
+        "manifest_sha256": "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339"
+      },
+      "actual_pointer": {
+        "environment": "prod",
+        "generation": 1,
+        "key": "first",
+        "manifest_sha256": "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339",
+        "tenant": "tenant-a"
+      },
+      "durable_receipts": [
+        [
+          "first",
+          1,
+          "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339"
+        ],
+        [
+          "second",
+          2,
+          "2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a"
+        ]
+      ]
+    }
+  ],
+  "provider_paid_calls": 0
+}

@@ -1,0 +1,83 @@
+{
+  "status": "FAIL",
+  "results": [
+    {
+      "case": "cycle_in_highest_choice_backtracks_to_valid_lower_choice",
+      "status": "PASS",
+      "detail": {
+        "a": 1
+      },
+      "elapsed_s": 0.141
+    },
+    {
+      "case": "scope_isolation_and_invalid_input_no_mutation",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "noncanonical pointer",
+      "elapsed_s": 0.524
+    },
+    {
+      "case": "real_process_crash_before_pointer",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "noncanonical pointer",
+      "elapsed_s": 0.383
+    },
+    {
+      "case": "real_process_crash_after_pointer",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "noncanonical pointer",
+      "elapsed_s": 0.423
+    },
+    {
+      "case": "four_actual_workers_one_generation_cas_winner",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "('missing worker result', 30712, 1)",
+      "elapsed_s": 0.419
+    },
+    {
+      "case": "migration_real_exit_72_and_original_receipt_preservation",
+      "status": "PASS",
+      "detail": {
+        "crash": {
+          "pid": 27736,
+          "exit": 72,
+          "stdout": "",
+          "stderr": ""
+        },
+        "original_preserved": true
+      },
+      "elapsed_s": 0.381
+    },
+    {
+      "case": "future_schema_refused_without_db_change",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "future DB mutated",
+      "elapsed_s": 0.165
+    },
+    {
+      "case": "receiver_committed_process_killed_query_before_retry",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "[{'method': 'POST', 'body': {'environment': 'prod', 'generation': 1, 'key': 'first', 'manifest_sha256': '14950a6d86141530c33d6ed442a55f4b0d1a1330c6a42250e20162ad3d27c1a9', 'tenant': 'tenant-a'}}, {'method': 'POST', 'body': {'environment': 'prod', 'generation': 1, 'key': 'first', 'manifest_sha256': '14950a6d86141530c33d6ed442a55f4b0d1a1330c6a42250e20162ad3d27c1a9', 'tenant': 'tenant-a'}}, {'method': 'GET', 'query': {'tenant': ['tenant-a'], 'environment': ['prod'], 'key': ['first']}}]",
+      "elapsed_s": 1.114
+    }
+  ],
+  "app_source_sha256": {
+    "app\\catalog.py": "37d305ff0b6b6e10e95c3fbc98a4e202345954daaafd768c37f5b052bc5e6ed9",
+    "app\\deploy.py": "7fe226e61a04d2a2bc43452c52d54575cc7fdafe5b669003a66ef4dc10b2b7a3",
+    "app\\install.py": "77dab7605daf9b804ffb4e1ec18e852f0700652e642fbc94b251e35887370273",
+    "app\\kernel.py": "d106e20dc075a837591543a799b174fc512329f0e1ff033d1a535f968c2942c7",
+    "app\\repository.py": "fbe2160d73f70a1df2547fedb170b12b6162682d6f6cb74b3ce3acfc4fc47861",
+    "app\\resolver.py": "b74a3d55a524c76d65d6e8d29e7ea5fd04c01043641bc3f07f37419c8764f611",
+    "app\\state.py": "cea7215c4f0c049567fc1f931b67a1247f07d7c3bf8aea2cae3a5de812f5cdb2",
+    "app\\util.py": "0240f5613d67e2511dbf1e8f6e5d88c699414316d65522a2e94449b34dc2bcdf",
+    "app\\_search.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "app\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "app\\tests\\test_resolver.py": "191d5c34d0a212b306437bb0a168c5cc7552083d09740211ca50b50f709cd98b"
+  },
+  "provider_paid_calls": 0
+}

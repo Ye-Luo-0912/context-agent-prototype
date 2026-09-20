@@ -1,0 +1,116 @@
+{
+  "provider_paid_calls": 0,
+  "remote_ci_run": null,
+  "checks": [
+    {
+      "platform": "Windows",
+      "scope": "full_workspace",
+      "command": "cargo test -j 2 --workspace -- --test-threads 2",
+      "exit_code": 0,
+      "passed": 3066,
+      "failed": 0,
+      "ignored": 10,
+      "log": "logs/cargo-test-workspace-final.log.gz",
+      "environment": {
+        "AGENT_PYTHON": "D:\\Users\\Ye_Luo\\AppData\\Python\\python.exe"
+      }
+    },
+    {
+      "platform": "Linux/WSL Ubuntu",
+      "scope": "agent-runtime and agent-host",
+      "command": "cargo test --locked -j 2 -p agent-runtime -p agent-host -- --test-threads 2",
+      "exit_code": 0,
+      "passed": 822,
+      "failed": 0,
+      "ignored": 1,
+      "log": "logs/cargo-linux-runtime-host.log.gz",
+      "environment": {
+        "AGENT_PYTHON": "/usr/bin/python3",
+        "CARGO_TARGET_DIR": "/mnt/d/Users/Ye_Luo/APP/context-agent-prototype/target/linux-final-validation-20260920"
+      }
+    },
+    {
+      "platform": "Windows",
+      "scope": "scripts/tests",
+      "command": "python -B -m unittest discover -s scripts/tests -v",
+      "exit_code": 0,
+      "total": 58,
+      "passed": 58,
+      "skipped": 0,
+      "elapsed_seconds": 23.76,
+      "log": "logs/python-windows-runner-final.log.gz"
+    },
+    {
+      "platform": "Linux/WSL Ubuntu",
+      "scope": "scripts/tests",
+      "command": "python3 -B -m unittest discover -s scripts/tests -v",
+      "exit_code": 0,
+      "total": 58,
+      "passed": 39,
+      "skipped": 19,
+      "elapsed_seconds": 19.303,
+      "log": "logs/python-linux-runner-fixed.log.gz"
+    },
+    {
+      "platform": "Windows",
+      "scope": "scripts/package_endurance_v3/tests",
+      "command": "python -B -m unittest discover -s scripts/package_endurance_v3/tests -v",
+      "exit_code": 0,
+      "total": 40,
+      "passed": 40,
+      "skipped": 0,
+      "elapsed_seconds": 14.787,
+      "log": "logs/python-windows-v3-final.log.gz"
+    },
+    {
+      "platform": "Linux/WSL Ubuntu",
+      "scope": "scripts/package_endurance_v3/tests",
+      "command": "python3 -B -m unittest discover -s scripts/package_endurance_v3/tests -v",
+      "exit_code": 0,
+      "total": 40,
+      "passed": 39,
+      "skipped": 1,
+      "elapsed_seconds": 12.348,
+      "log": "logs/python-linux-v3-final.log.gz"
+    },
+    {
+      "platform": "Windows",
+      "command": "cargo build --workspace",
+      "exit_code": 0,
+      "log": "logs/cargo-build.log.gz"
+    },
+    {
+      "platform": "Windows",
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "exit_code": 0,
+      "log": "logs/cargo-clippy-workspace.log.gz"
+    },
+    {
+      "platform": "Windows",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "log": "logs/cargo-fmt.log.gz"
+    },
+    {
+      "platform": "Windows",
+      "command": "dotnet build apps/Agent.Desktop/Agent.Desktop.csproj",
+      "environment": {
+        "AVALONIA_TELEMETRY_OPTOUT": "1"
+      },
+      "exit_code": 0,
+      "log": "logs/dotnet-build-optout.log.gz"
+    },
+    {
+      "platform": "Windows",
+      "command": "dotnet test clients/dotnet/Agent.Client.Tests/Agent.Client.Tests.csproj --no-restore",
+      "environment": {
+        "AVALONIA_TELEMETRY_OPTOUT": "1"
+      },
+      "exit_code": 0,
+      "passed": 139,
+      "failed": 0,
+      "skipped": 0,
+      "log": "logs/dotnet-test-native.log.gz"
+    }
+  ]
+}

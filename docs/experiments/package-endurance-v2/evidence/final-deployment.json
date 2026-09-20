@@ -1,0 +1,117 @@
+{
+  "status": "FAIL",
+  "scope": "deployment_only_publication_stopped",
+  "results": [
+    {
+      "case": "cycle_in_highest_choice_backtracks_to_valid_lower_choice",
+      "status": "PASS",
+      "detail": {
+        "a": 1
+      },
+      "elapsed_s": 0.102
+    },
+    {
+      "case": "scope_isolation_and_invalid_input_no_mutation",
+      "status": "PASS",
+      "detail": {
+        "scopes": 3,
+        "invalid_inputs": 4
+      },
+      "elapsed_s": 1.144
+    },
+    {
+      "case": "real_process_crash_before_pointer",
+      "status": "PASS",
+      "detail": {
+        "child": {
+          "pid": 2880,
+          "exit": 71,
+          "stdout": "",
+          "stderr": ""
+        },
+        "recovered_generation": 1,
+        "final": {
+          "tenant": "tenant-a",
+          "environment": "prod",
+          "key": "crash-next",
+          "generation": 2,
+          "manifest_sha256": "2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a"
+        }
+      },
+      "elapsed_s": 1.334
+    },
+    {
+      "case": "real_process_crash_after_pointer",
+      "status": "PASS",
+      "detail": {
+        "child": {
+          "pid": 28628,
+          "exit": 71,
+          "stdout": "",
+          "stderr": ""
+        },
+        "recovered_generation": 2,
+        "final": {
+          "tenant": "tenant-a",
+          "environment": "prod",
+          "key": "crash-next",
+          "generation": 2,
+          "manifest_sha256": "2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a"
+        }
+      },
+      "elapsed_s": 1.235
+    },
+    {
+      "case": "four_actual_workers_one_generation_cas_winner",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "[{'error': \"TypeError: Repository.install() missing 3 required positional arguments: 'environment', 'key', and 'requirements'\", 'ok': False, 'request': None}, {'error': \"TypeError: Repository.install() missing 3 required positional arguments: 'environment', 'key', and 'requirements'\", 'ok': False, 'request': None}, {'error': \"TypeError: Repository.install() missing 3 required positional arguments: 'environment', 'key', and 'requirements'\", 'ok': False, 'request': None}, {'error': \"TypeError: Repository.install() missing 3 required positional arguments: 'environment', 'key', and 'requirements'\", 'ok': False, 'request': None}]",
+      "elapsed_s": 0.45
+    },
+    {
+      "case": "migration_real_exit_72_and_original_receipt_preservation",
+      "status": "PASS",
+      "detail": {
+        "crash": {
+          "pid": 5068,
+          "exit": 72,
+          "stdout": "",
+          "stderr": ""
+        },
+        "original_preserved": true
+      },
+      "elapsed_s": 0.389
+    },
+    {
+      "case": "future_schema_refused_without_db_change",
+      "status": "PASS",
+      "detail": {
+        "ok": false,
+        "error_type": "ValueError",
+        "message": "unsupported future schema version 99"
+      },
+      "elapsed_s": 0.136
+    },
+    {
+      "case": "receiver_committed_process_killed_query_before_retry",
+      "status": "STOPPED",
+      "fired": false,
+      "reason": "Prior p5-deep receiver audit proved POST,POST,GET; publication branch remains stopped."
+    }
+  ],
+  "app_source_sha256": {
+    "app\\catalog.py": "8b48193b0e01589e047e892a17d7364037bf712dae5ec38403fe634f78f62d58",
+    "app\\deploy.py": "15fa73aeebb36526e5d52c1c55742e30723d37edbeff75b4968651fd23887207",
+    "app\\install.py": "77dab7605daf9b804ffb4e1ec18e852f0700652e642fbc94b251e35887370273",
+    "app\\kernel.py": "d106e20dc075a837591543a799b174fc512329f0e1ff033d1a535f968c2942c7",
+    "app\\repository.py": "fbe2160d73f70a1df2547fedb170b12b6162682d6f6cb74b3ce3acfc4fc47861",
+    "app\\resolver.py": "b74a3d55a524c76d65d6e8d29e7ea5fd04c01043641bc3f07f37419c8764f611",
+    "app\\state.py": "1cc0d8ea2b679175655f69c00c64b94f78c910532e0c8461f5b64eb1e78f23bb",
+    "app\\util.py": "166cdee59700d1075f4ec57fe98571d04fef9a8499e5b53601e58035ce5bf0f9",
+    "app\\worker.py": "4e198725136b9017b878d2ea941ed69a157bca2553e9c25d3863e5176a59acbd",
+    "app\\_search.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "app\\__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "app\\tests\\test_resolver.py": "f91dfd52fe74b99a34c1353391e50cd747339fdda2ce53d68806b9217cdafff3"
+  },
+  "provider_paid_calls": 0
+}

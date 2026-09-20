@@ -1,0 +1,13 @@
+Continue the SAME saved task. Current independent checks found: resolver tests
+run 14 with 5 errors; deps values are dictionaries but solve unpacks them as
+(dlo,dhi), yielding strings instead of integer bounds. Repository is still a
+NotImplementedError stub. That stub must not count as successful corruption
+rejection. Fix the resolver first, then implement install/active/receipt/GC,
+durable crash recovery and the remaining SPEC APIs in small modules.
+
+Use fs.write or fs.edit in bounded writes below 150 lines per response; a prior
+8192-token output was lost. Each step should implement code, not repeat plans.
+Run both public tests/ and your app/tests tests with process.run. Preserve the
+original requirements, exact manifest/receipt fields, and all fixtures. Do not
+read external controller files. The controller independently inspects disk and
+will give feedback; ordinary final must report incomplete features honestly.

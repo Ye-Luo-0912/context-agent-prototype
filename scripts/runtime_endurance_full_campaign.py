@@ -160,7 +160,7 @@ def setup(campaign_dir: Path = CAMPAIGN, reset: bool = False, yes: bool = False,
     _print_json({"status": "prepared", "campaign": str(campaign_dir), "workspace": str(workspace), "files": len(FILES)})
 
 
-def l0(campaign_dir: Path = CAMPAIGN, binary: Path = DEFAULT_BINARY, repo: Path = REPO, python_executable: str = "python") -> None:
+def l0(campaign_dir: Path = CAMPAIGN, binary: Path = DEFAULT_BINARY, repo: Path = REPO, python_executable: str = sys.executable) -> None:
     campaign_dir = Path(campaign_dir)
     workspace = campaign_dir / "workspace"
     lock_path = campaign_dir / "baseline-lock.json"

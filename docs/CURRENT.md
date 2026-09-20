@@ -2,6 +2,51 @@
 
 本页是当前状态入口。执行任务及状态只维护在 [NEXT_TASKS.md](NEXT_TASKS.md)。旧报告中的"当前"只属于其固定基线。
 
+**2026-09-21 V5 执行结束：NOT_ACCEPTED_MODEL_BUDGET_EXHAUSTED。** 同一 TaskId、
+同一工作区和持续负载实际启动；第一段 41 回合因输出上限停止，续接 219 回合后
+因审批拒绝停止。候选生成了在线备份模块，但仍拒绝 live WAL sidecar 和增长后的
+历史 receipt；独立 archive/restore 通过数为 0。实际 260 主决策、262 attempts、
+估算 USD 1.498222068，reserved/unknown 均为 0；496 保护文件未改变。
+持续控制器保留 524 条事件，仓库最终可独立读到 13 scope、218 receipts、91 manifests、
+357 objects、1 outbox，但未达到 120 分钟候选负载。没有人工补修模型候选，
+未追加预算、未提交/推送。[V5 执行回执](experiments/package-endurance-v5/RUN_2026-09-21.md)。
+
+**2026-09-20 V4 实验结束、本地收尾**：原模型独立验收 8/26，真实供应商取消/恢复
+未通过；Core 对缺少持久 wait 记录的进程效果保持恢复围栏。原窗口 93 主决策、
+93 attempts、126 工具调用，估算 USD 0.324905076，未结算用量 0；不延长原时限。
+人工补修版独立验收 26/26、公开 smoke 4/4；最终副本完成 300 秒四进程负载、
+1176 个校验循环及两次真实崩溃重试，清理确认。同版本本地合成供应商 host 7/7。
+本次还修复 fs.read schema 的 unsupported default 准入回归、跨盘导出和 Windows
+目录发布临时拒绝，并补启动失败清理传播。模型、人工与本地/真实供应商证据分开。
+新增付费调用 0，原 510 保护文件不变；未提交/推送，远端 CI 未运行。
+[最终回执](experiments/package-endurance-v4/CLOSEOUT_2026-09-20.md)、
+[原预检回执](experiments/package-endurance-v4/PREFLIGHT_RECEIPT.md)。
+
+**2026-09-20 PKG-FINAL 全部本地验收完成**：host 长正文、取消保全及半批失败围栏、
+进程启动/清理事实传播、瞬时 Job 枚举重采、Python 可移植性和双平台 CI 接线已收口。
+Windows 全 workspace 3066 passed（10 ignored），Linux Runtime/host 822 passed
+（1 ignored），.NET 139 passed；两平台 Python、workspace clippy/fmt 通过。
+最终版本完整 30 分钟窗口完成 7176 次安装校验、两次真实故障恢复；同库 host
+7 场景通过。停止写入后 7177 条回执与 183 文件字节核验通过，所有清理确认。
+本轮付费调用 0，首次失败/中止原样保留；未提交/推送，远端 CI 未运行。
+[完整最终回执](experiments/package-endurance-v3/FINAL_ACCEPTANCE_2026-09-20.md)。
+
+**2026-09-20 Package v3 收尾**：复杂流程暴露的“取消丢失已提交工具观察”已在工作树
+修复，Rolling/Simple 与显式 checkpoint 冷恢复的 5 项组合回归通过。
+人工修复应用完成 30 分钟窗口、7188 次安装校验和两次真实进程故障恢复；
+原模型审计器严格复核只过 3/13，人工修复版 13/13，二者分开记账。
+长负载使用旧进程 helper；HANDLE 退出确认修复另经短负载与公共 host 流程验证。
+续接补齐启动失败后清理未确认的回执与句柄保留，脚本 52/52、v3 34/34；
+该补充版本没有重跑上述负载，冻结证据与新源码摘要分别记录。
+本轮未提交、未推送，远端 CI/Unix 未运行；[完整回执](experiments/package-endurance-v3/RUN_2026-09-20.md)。
+
+**2026-09-20 实验及后续修复**：Package v2 按原 240 次主决策额度收口，应用未验收，
+90 分钟负载未启动；[实验回执](experiments/package-endurance-v2/RUN_2026-09-20.md)。
+其中 PKG-H1 的 host 4096 字节提前断连已在当前工作树修复，host 全套 35/0、
+定向 clippy/fmt 通过，9512 字节纠正的真实 4 进程 host 流程通过（本地合成供应商）。
+新持久任务目标仍限 2000 字符，超限返回明确业务错误；完整纠正走独立正文路径。
+未提交、未运行该改动远端 CI；[修复回执](experiments/package-endurance-v2/HOST_TEXT_RECEIPT.md)。
+
 ## 已核对基线
 
 - **续审基线 `3bdb269c`（2026-09-16，U 批次之后）**：CI run `35107501790`，**attempt 1 success**（勿与父提交 `3d0b114f` 的 attempt-2 回执混淆）。该次续审发现 **U3 引入的回归**：`claim_event(RunId, seq)` 把 `LiveSink` 复用 `ModelStarted` 游标的实时分片（`ModelDelta`／`ModelRetrying`）当成重复持久事件丢弃 → 正常流式显示与重试进度被破坏（**R1，最高优先**）。另开 R2–R8（费用补账终态矩阵、用量误清 in-flight、卡片修订号与全局发布序号混用、遗漏检查的失败计数、普通输入未进有序通道、重放非幂等与附属索引无界、审批滚动仍用宽度除法＋自制 Unicode 表）。报告与范围见 [docs/reviews/2026-09-16-review-3bdb269c/](reviews/2026-09-16-review-3bdb269c/REVIEW.md)；行动见同目录 [NEXT_ACTIONS.md](reviews/2026-09-16-review-3bdb269c/NEXT_ACTIONS.md)。**A 线不能视为全部关闭。** R1–R5 已修复并提交：R1（`bb761547`）real-time 分片不再按日志游标去重（**契约里早有 `RuntimeEvent::is_live_only()` 且 agent-host 已在用**，TUI 未采用；根因之二是折叠 fixture 每次新建 RunId 却固定 seq=1，恰好绕过该身份）；R2＋R3（`8877a4da`）迟到 `ModelOutput`/`Failed` 的已知用量一并结算、用量事实不再清当前操作状态；R4＋R5（`d30f2956`）快照发布序与会话单调而非随任务归零、失败计数在显示裁剪前结算。回执：[R1–R5](reviews/2026-09-16-review-3bdb269c/R1_R5_FIRST_BATCH_RECEIPT.md)。**R6／R7／R8 与 B3 亦已关闭**（`a0f23d72`／`ef8a835c`／`3fe396c9`）：普通输入进入同一保序通道且 session 持有 worker；重放先丢弃事件派生行再重建（同一日志两次渲染一致）；滚动上限与绘制共用 ratatui 的 `Paragraph::line_count`、宽度改用 `unicode-width`；ledger 导出改为「快照→提交→确认消费」，取消不再丢行。回执：[R6/R7/R8/B3](reviews/2026-09-16-review-3bdb269c/R6_R7_R8_B3_SECOND_BATCH_RECEIPT.md)。**仍开放：B1（批量 required 有界解析计划）与 B2（existing card 认领校验）**；`context-simple` 的在飞工作已按归属先提交（`ca6c7254`、`99218532`），基线干净。**B1／B2 亦已关闭**（2026-09-17，`de6bf061`／`2482f3ef`）：解析时捕获版本/范围绑定的卡片条目作为有界计划源（exact ID／实体／前景三处 fallback），批内驱逐不再把已读到的必需正文压成 `Missing`（真实预算不足报 `BudgetExcluded`）；capture 对已存在的卡片路径只在读回字节与计划一致时认领，可读不一致走同一原子写入修复、写失败保持 inline，坏引用不再进入 manifest。回执：[B1/B2](reviews/2026-09-16-review-3bdb269c/B1_B2_THIRD_BATCH_RECEIPT.md)。**至此 R 系列与 B1/B2/B3 全部关闭**，剩余 T8 条件任务与 C（续）实际请求序列的 KV 成本比较。

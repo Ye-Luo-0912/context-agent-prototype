@@ -1,0 +1,9 @@
+Continue the same implementation task from the saved checkpoint. The previous
+response exceeded the 8192-token output cap while writing a large file; that
+failed tool did NOT execute. Inspect the existing app/ files, retain work that
+landed, and split implementation into modules and small writes/patches, normally
+under 200 lines or 2500 output tokens per model response. Do not rewrite the
+entire repository module in one response. Complete P1 resolve and basic verified
+Repository install/active/receipt/GC first, following SPEC.md. Run tests with
+the explicit granted Python executable and use actual results. This segment
+consumes only the remaining 24 decisions of P1's 32-decision allocation.

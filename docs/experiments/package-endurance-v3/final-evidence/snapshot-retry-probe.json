@@ -1,0 +1,84 @@
+{
+  "native_snapshot_growth": {
+    "first_error": "Job membership changed before handles could be captured",
+    "second_snapshot_total": 2,
+    "second_snapshot_handles": 2,
+    "queried_capacities": [
+      1,
+      2,
+      2
+    ]
+  },
+  "current_complete_later": {
+    "observer_captures_before_final": 1,
+    "observed_before_final": 1,
+    "result": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "unconfirmed",
+      "scope": "windows_job",
+      "tree_confirmed": false,
+      "active_processes": 0,
+      "capture_error": "lifetime observer failed: Job membership changed before handles could be captured",
+      "active_before_kill": 0,
+      "final_total_processes": 2,
+      "observed_processes": 2,
+      "retained_members_exited": true
+    }
+  },
+  "bounded_retry_complete": {
+    "observer_captures_before_final": 2,
+    "observed_before_final": 2,
+    "result": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "already_exited",
+      "scope": "windows_job",
+      "tree_confirmed": true,
+      "active_processes": 0,
+      "retained_member_handles": 2,
+      "captured_total_processes": 2,
+      "active_before_kill": 0,
+      "final_total_processes": 2,
+      "observed_processes": 2,
+      "retained_members_exited": true
+    }
+  },
+  "bounded_retry_missing_history": {
+    "observer_captures_before_final": 2,
+    "observed_before_final": 2,
+    "result": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "unconfirmed",
+      "scope": "windows_job",
+      "tree_confirmed": false,
+      "active_processes": 0,
+      "retained_member_handles": 2,
+      "captured_total_processes": 7,
+      "active_before_kill": 0,
+      "final_total_processes": 7,
+      "observed_processes": 2,
+      "detail": "historical Job members lack retained exit-observation handles",
+      "retained_members_exited": true
+    }
+  },
+  "bounded_retry_unsignaled_handle": {
+    "observer_captures_before_final": 2,
+    "observed_before_final": 2,
+    "result": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "unconfirmed",
+      "scope": "windows_job",
+      "tree_confirmed": false,
+      "active_processes": 0,
+      "retained_member_handles": 2,
+      "captured_total_processes": 2,
+      "active_before_kill": 0,
+      "final_total_processes": 2,
+      "observed_processes": 2,
+      "retained_members_exited": false
+    }
+  }
+}

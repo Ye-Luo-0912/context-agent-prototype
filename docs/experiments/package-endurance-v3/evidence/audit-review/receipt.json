@@ -1,0 +1,46 @@
+{
+  "source_sha256": "9b15223d0af1e5d289dd64493402216633ae48ee64bc7e21eea96c5542524227",
+  "source_unchanged": true,
+  "results": [
+    {
+      "case": "positive",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": "",
+      "audited_bytes_unchanged": true
+    },
+    {
+      "case": "wrong_manifest_scope",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": "",
+      "audited_bytes_unchanged": true
+    },
+    {
+      "case": "malformed_manifest_scope",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": "",
+      "audited_bytes_unchanged": true
+    },
+    {
+      "case": "stale_pointer",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":2}",
+      "stderr": "",
+      "audited_bytes_unchanged": true
+    },
+    {
+      "case": "invalid_scope_orphan",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": "",
+      "audited_bytes_unchanged": true
+    },
+    {
+      "case": "symlink_object_outside_root",
+      "status": "NOT_RUN",
+      "error": "[WinError 1314] \u5ba2\u6237\u7aef\u6ca1\u6709\u6240\u9700\u7684\u7279\u6743\u3002: 'D:\\\\Users\\\\Ye_Luo\\\\APP\\\\context-agent-prototype\\\\target\\\\package-endurance-v3-audit-review-1789862366060371400\\\\external-payload' -> 'D:\\\\Users\\\\Ye_Luo\\\\APP\\\\context-agent-prototype\\\\target\\\\package-endurance-v3-audit-review-1789862366060371400\\\\symlink_object_outside_root\\\\objects\\\\dfbb988bfdb710fc6b9c329eb6b7eb1049532b044b0f5c613a25343ed84eac83'"
+    }
+  ]
+}

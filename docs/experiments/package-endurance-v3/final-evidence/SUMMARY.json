@@ -1,0 +1,87 @@
+{
+  "status": "LOCAL_OPTIMIZATION_ACCEPTANCE_COMPLETE",
+  "closed_at_utc": "2026-09-20T09:29:26.580436+00:00",
+  "baseline_head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "uncommitted": true,
+  "remote_ci_run": null,
+  "provider_paid_calls": 0,
+  "implementation": [
+    "host_long_text_decode",
+    "cancelled_turn_accepted_observation_preservation",
+    "partial_ingest_failure_fencing",
+    "protected_origin_integrity",
+    "owned_process_lifetime_cleanup",
+    "launch_cleanup_fact_propagation",
+    "bounded_transient_job_snapshot_retry",
+    "current_interpreter_portability",
+    "python_ci_matrix"
+  ],
+  "validation": {
+    "windows_workspace_rust": {
+      "passed": 3066,
+      "failed": 0,
+      "ignored": 10
+    },
+    "linux_runtime_host": {
+      "passed": 822,
+      "failed": 0,
+      "ignored": 1
+    },
+    "windows_runner": {
+      "passed": 58,
+      "skipped": 0
+    },
+    "linux_runner": {
+      "passed": 39,
+      "skipped": 19
+    },
+    "windows_v3": {
+      "passed": 40,
+      "skipped": 0
+    },
+    "linux_v3": {
+      "passed": 39,
+      "skipped": 1
+    },
+    "dotnet_client": {
+      "passed": 139,
+      "failed": 0
+    },
+    "workspace_build": true,
+    "workspace_clippy": true,
+    "workspace_fmt": true
+  },
+  "final_load": {
+    "target_seconds": 1800,
+    "elapsed_with_sweep_and_cleanup_seconds": 1844.3428173065186,
+    "first_install_to_last_finish_seconds": 1799.0050616264343,
+    "batches": 1794,
+    "verified_installs": 7176,
+    "actual_overlap_batches": 1794,
+    "observed_crashes": 2,
+    "confirmed_worker_cleanups": 7,
+    "confirmed_host_cleanups": 4,
+    "host_cases": 7,
+    "final_durable_receipts": 7177,
+    "audited_files": 183,
+    "audit_unchanged": true,
+    "inputs_unchanged": true,
+    "gc_deleted": {
+      "deleted_objects": 0,
+      "deleted_manifests": 1
+    }
+  },
+  "original_evidence_preserved": true,
+  "model_only_auditor_still_not_accepted": true,
+  "limits": [
+    "Local Windows workspace and WSL Linux affected-crate verification are not a remote GitHub CI run.",
+    "Application load plus a short same-repository host journey is not every Runtime scenario running for 30 minutes.",
+    "Model-only auditor remains failed under strict original review; assisted auditor provenance is unchanged.",
+    "No new provider quality/cost A-B experiment, actual billing claim, commit or push."
+  ],
+  "final_process_scan": {
+    "matching_processes": 0,
+    "scope": "exact final validation root; python.exe and agent-host.exe",
+    "method": "approved read-only Win32_Process after final auditor exit"
+  }
+}

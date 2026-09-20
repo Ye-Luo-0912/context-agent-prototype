@@ -1,0 +1,27 @@
+{
+  "status": "FAIL",
+  "results": [
+    {
+      "case": "backtracking_matches_exhaustive_oracle",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'TypeError', 'message': \"'>' not supported between instances of 'str' and 'int'\"}"
+    },
+    {
+      "case": "disk_install_replay_conflict_cas_gc",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'NotImplementedError', 'message': 'v2 deployment pending'}"
+    },
+    {
+      "case": "corrupted_source_refused",
+      "status": "PASS",
+      "detail": {
+        "ok": false,
+        "error_type": "NotImplementedError",
+        "message": "v2 deployment pending"
+      }
+    }
+  ],
+  "time": 1789843235.93613
+}

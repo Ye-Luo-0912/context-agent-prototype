@@ -1,0 +1,109 @@
+{
+  "schema": 1,
+  "recorded_at_utc": "2026-09-20T08:06:26.345007+00:00",
+  "status": "LOCAL_FOLLOWUP_PASS",
+  "head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "uncommitted_working_tree": true,
+  "provider_paid_calls": 0,
+  "v3_archive": {
+    "files": 60,
+    "mismatches": [],
+    "manifest_sha256": "4732b7cb92edbbb5d032447a25f235bcaa2e6f85cec484cdc3e2fb31305358fa"
+  },
+  "v2_archive": {
+    "files": 58,
+    "mismatches": [],
+    "manifest_sha256": "3f8014ba9add46057364db533eb57ee0dcaf89bdd3d0ade9ba476bf04891bbdc"
+  },
+  "model_protected_files": {
+    "files": 496,
+    "changed": []
+  },
+  "archived_source_identity_initially_matched": true,
+  "source_changes_since_archive": {
+    "scripts/runtime_endurance_incremental_runner.py": {
+      "archived_sha256": "2bbbd11357bde42bf89d66d006cf098eee8cc6063654e30e9a5f45532637b7b4",
+      "followup_sha256": "59c5fdc68b361e21a0318d74c07153c8cfaa8cb99d9b53659ec0134b1f2db041"
+    },
+    "scripts/runner_process_tree.py": {
+      "archived_sha256": "798a8bd51a13990897707a24551111959974459d6bb5d1a24f3768bdb462c4f3",
+      "followup_sha256": "56612ae0175e2dc1ede3e9b5448dfb76ee7e0b63a8908eb44ca60b137c2fd80c"
+    }
+  },
+  "unchanged_archived_source_files": [
+    "crates/agent-runtime/src/actor/turn.rs",
+    "crates/agent-runtime/tests/turn/combined_cancel.rs",
+    "scripts/package_endurance_v3/load.py",
+    "scripts/package_endurance_v3/journey.py"
+  ],
+  "final_source_sha256": {
+    "crates/agent-runtime/src/actor/turn.rs": "f8ad3af22d5b1e3b76f697c864be97c2af8f8931c63c13a8c8e5052afad85348",
+    "crates/agent-runtime/tests/turn/combined_cancel.rs": "898fc1f0ee6ee219984beb76f52abe0cde3da8e681de0e5e79cc79d1b67aa71e",
+    "scripts/runtime_endurance_incremental_runner.py": "59c5fdc68b361e21a0318d74c07153c8cfaa8cb99d9b53659ec0134b1f2db041",
+    "scripts/runner_process_tree.py": "56612ae0175e2dc1ede3e9b5448dfb76ee7e0b63a8908eb44ca60b137c2fd80c",
+    "scripts/package_endurance_v3/load.py": "5dcc837da8b49cad81216f45b29ba12e18f21158990b3512ae45d1ad59054cad",
+    "scripts/package_endurance_v3/journey.py": "94a884baaaa0b2c38a59613095cdccb6432226161dc6e6033a9dff7a14eb0968",
+    "scripts/tests/test_runner_integrity.py": "359f0f4bb13e372b0df4a873dcea20132de41fa1d07366728697ea68f1ab6ec6",
+    "scripts/tests/test_runner_lifetime.py": "913a95f12995cf181ae6d0d48a0a50797dc6e43908a4f8d7a931e9f8f0acbb90"
+  },
+  "followup_regressions": [
+    "test_failed_launch_cleanup_retains_process_and_fences_receipt",
+    "test_close_failure_preserves_native_handles_for_retry",
+    "test_final_cleanup_retries_members_after_job_handle_closed"
+  ],
+  "red_check": {
+    "command": "python -B -m unittest discover -s scripts/tests -p test_runner_integrity.py -k failed_launch_cleanup -v",
+    "observed_failure": "15 != 14",
+    "meaning": "cleanup uncertainty omitted from launch failure receipt"
+  },
+  "executed_validations": [
+    {
+      "command": "python -B -m unittest discover -s scripts/tests -v",
+      "exit_code": 0,
+      "passed": 52,
+      "elapsed_seconds": 22.873,
+      "log": "target/runner-startup-cleanup-20260920-review/scripts-tests.log",
+      "log_sha256": "d52d797b4965d096cb68a8b765b5bfd5c877f6bc57b9ed139d8d892619225da7"
+    },
+    {
+      "command": "python -B -m unittest discover -s scripts/package_endurance_v3/tests -v",
+      "exit_code": 0,
+      "passed": 34,
+      "elapsed_seconds": 14.483,
+      "log": "target/runner-startup-cleanup-20260920-review/v3-tests.log",
+      "log_sha256": "0603bbe0b74c4de7e37d58674e48284afa2f827403c21ef960a3dce91c728a4a"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test turn combined_cancel -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 5
+    },
+    {
+      "command": "cargo clippy -p agent-runtime -p agent-host --all-targets -- -D warnings",
+      "exit_code": 0
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0
+    },
+    {
+      "command": "python scripts/doc_consistency.py",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    },
+    {
+      "check": "RUN_2026-09-20.md relative links",
+      "links": 27,
+      "missing": []
+    }
+  ],
+  "evidence_limits": [
+    "30-minute,20-second and public-host runs were not repeated after this startup-failure followup.",
+    "Frozen evidence remains tied to its original source identities.",
+    "Full Rust suite was executed in the preceding stage; this continuation reran the five cancellation regressions and focused clippy.",
+    "No Unix execution, remote CI, new paid experiment, commit or push."
+  ]
+}

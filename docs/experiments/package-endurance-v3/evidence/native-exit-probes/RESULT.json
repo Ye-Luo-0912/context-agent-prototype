@@ -1,0 +1,119 @@
+{
+  "status": "LIFETIME_CANDIDATE_VALIDATED_NOT_PROMOTED",
+  "production_sha256": "a04aa46e196336732ddcec372fac2d5ce64b58f77477dae2320849b82ddc63bf",
+  "candidate_sha256": "798a8bd51a13990897707a24551111959974459d6bb5d1a24f3768bdb462c4f3",
+  "provider_paid_calls": 0,
+  "observations": [
+    {
+      "label": "frozen-helper",
+      "helper_sha256": "a04aa46e196336732ddcec372fac2d5ce64b58f77477dae2320849b82ddc63bf",
+      "runs": 50,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 50,
+      "premature_confirmations": 50,
+      "confirmed": 50,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "candidate-helper",
+      "helper_sha256": "fb811b57e8d782b9f77d71d15b529d658b5f714893d1df43c7bca42d33e9d2a5",
+      "runs": 50,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 0,
+      "premature_confirmations": 0,
+      "confirmed": 50,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "candidate-preterminated",
+      "helper_sha256": "fb811b57e8d782b9f77d71d15b529d658b5f714893d1df43c7bca42d33e9d2a5",
+      "runs": 50,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 50,
+      "premature_confirmations": 50,
+      "confirmed": 50,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "conservative-helper",
+      "helper_sha256": "be237f6e39fc9c997c509327f8283c77b8fb4dbb99c7835f500752b6e0f36d53",
+      "runs": 20,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 0,
+      "premature_confirmations": 0,
+      "confirmed": 20,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "conservative-preterminated",
+      "helper_sha256": "be237f6e39fc9c997c509327f8283c77b8fb4dbb99c7835f500752b6e0f36d53",
+      "runs": 20,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 20,
+      "premature_confirmations": 0,
+      "confirmed": 0,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "lifetime-helper",
+      "helper_sha256": "eca533f7e092a5a8792aaf80352409f0fc832fa4e127bd0938ebc16dd97d33c6",
+      "runs": 20,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 0,
+      "premature_confirmations": 0,
+      "confirmed": 20,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "lifetime-preterminated",
+      "helper_sha256": "eca533f7e092a5a8792aaf80352409f0fc832fa4e127bd0938ebc16dd97d33c6",
+      "runs": 20,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 2,
+      "premature_confirmations": 0,
+      "confirmed": 18,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "lifetime-final-normal",
+      "helper_sha256": "798a8bd51a13990897707a24551111959974459d6bb5d1a24f3768bdb462c4f3",
+      "runs": 20,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 0,
+      "premature_confirmations": 0,
+      "confirmed": 20,
+      "all_exited_within_bounded_wait": true
+    },
+    {
+      "label": "lifetime-final-preterminated",
+      "helper_sha256": "798a8bd51a13990897707a24551111959974459d6bb5d1a24f3768bdb462c4f3",
+      "runs": 20,
+      "same_retained_handle_owned_before_stop": true,
+      "early_handle_observation_windows": 2,
+      "premature_confirmations": 0,
+      "confirmed": 18,
+      "all_exited_within_bounded_wait": true
+    }
+  ],
+  "candidate_full_suite": {
+    "helper_sha256": "798a8bd51a13990897707a24551111959974459d6bb5d1a24f3768bdb462c4f3",
+    "tests": 44,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "elapsed_s": 21.781000000002678
+  },
+  "additional_lifetime_cases": {
+    "passed": 5,
+    "failed": 0,
+    "script": "test_lifetime_tree.py"
+  },
+  "limits": {
+    "retained_identity_cap": 4096,
+    "observer_interval_seconds": 0.005,
+    "unobserved_or_failed_member_capture": "unconfirmed",
+    "identity": "native PID plus process creation FILETIME, opened handle verified with IsProcessInJob",
+    "production_edit": "forbidden until root releases running load freeze"
+  },
+  "interpretation": "Exit observation gap, not a Job escape. Native process exit code and Job active count can settle before process HANDLE signaling. No unrelated PID termination was used."
+}

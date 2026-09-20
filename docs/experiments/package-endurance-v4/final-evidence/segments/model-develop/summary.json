@@ -1,0 +1,83 @@
+{
+  "api_protocol": "chat",
+  "outcome": "completed",
+  "categories": [
+    "budget_incomplete",
+    "child_nonzero"
+  ],
+  "exit_code": 10,
+  "exit": 1,
+  "child_exit_code": 1,
+  "elapsed": 35.28,
+  "rounds": 7,
+  "tool_calls": 14,
+  "protected_unchanged": true,
+  "terminals": [
+    {
+      "type": "turn_failed",
+      "turn_id": "f2a7e485-9756-49e6-b63f-a183ff854ff8",
+      "task_id": "728242d7-3d0c-4fb1-acc2-335e58eab9c7",
+      "class": "model_output_limit",
+      "retryable": false
+    }
+  ],
+  "session": {
+    "approval_denied": false,
+    "exit": 1,
+    "kind": "session_end",
+    "round_budget": false,
+    "schema": "agent.headless.v1",
+    "status": "failed",
+    "stop": "model_output_limit",
+    "task_completed": false,
+    "task_state": "awaiting_operator_review"
+  },
+  "requests": 7,
+  "budget": {
+    "api_protocol": "chat",
+    "cap_usd": 1.0,
+    "inherited_ledger": false,
+    "cap_stopped": false,
+    "committed_usd": 0.005510915999999999,
+    "reserved_usd": 0.0,
+    "unknown_usd": 0.024923699999999997,
+    "reserve_policy": {
+      "strategy": "wire_bytes_plus_8192_and_full_output",
+      "max_output_tokens": 8192,
+      "schema": 1,
+      "kind": "v4_real_snapshot_workflow",
+      "created_epoch": 1789899357.9161618,
+      "deadline_epoch": 1789913757.9161618,
+      "main_decisions": 96,
+      "provider_attempts": 128,
+      "tool_attempts": 384,
+      "input_tokens": 4000000,
+      "output_tokens": 250000,
+      "estimated_cost_usd": 1.0,
+      "api_protocol": "chat",
+      "chat_thinking": "disabled",
+      "model": "deepseek-flash"
+    }
+  },
+  "cleanup": {
+    "order": [
+      "relay_accept_stopped",
+      "child_stop:already_exited"
+    ],
+    "child": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "already_exited",
+      "scope": "windows_job",
+      "tree_confirmed": true,
+      "active_processes": 0,
+      "retained_member_handles": 9,
+      "captured_total_processes": 9,
+      "active_before_kill": 0,
+      "final_total_processes": 9,
+      "observed_processes": 9,
+      "retained_members_exited": true
+    },
+    "forced_unknown_attempts": []
+  }
+}

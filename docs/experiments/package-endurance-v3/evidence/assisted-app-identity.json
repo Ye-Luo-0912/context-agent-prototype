@@ -1,0 +1,19 @@
+{
+  "source": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\scripts\\package_endurance_v3\\fixture\\app",
+  "provenance": "assisted_repairs_not_autonomous_model",
+  "app_sha256": {
+    "catalog.py": "8b48193b0e01589e047e892a17d7364037bf712dae5ec38403fe634f78f62d58",
+    "deploy.py": "8707a270c383ef7b97b630b39101b68ceb26ca75b1d495c6098d7c03911c6107",
+    "install.py": "77dab7605daf9b804ffb4e1ec18e852f0700652e642fbc94b251e35887370273",
+    "kernel.py": "d106e20dc075a837591543a799b174fc512329f0e1ff033d1a535f968c2942c7",
+    "README.md": "a9ab2c696b3a077bf5ad7d758ff5c3218bb7b7d1331a03f2d8db20ff99410ce2",
+    "repository.py": "37ccb978c960a54e308fe625705a538af6a1560c130c0a8a5c5939b8d32bef81",
+    "resolver.py": "b74a3d55a524c76d65d6e8d29e7ea5fd04c01043641bc3f07f37419c8764f611",
+    "state.py": "21e2e8c415acadf80e5260fce75bf7bfa62508b5de745e1c46f64c7003e3e8e0",
+    "util.py": "f569c3beaeb91ab896fb7adc1eb8b5022c46617e6c1907f2c5a6d7f93ea0759f",
+    "worker.py": "c9b7d5bccbf49cc49514c3f049fc19acd495b20fafe1d18f2c1302408098ccbb",
+    "_search.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests/test_resolver.py": "f91dfd52fe74b99a34c1353391e50cd747339fdda2ce53d68806b9217cdafff3"
+  }
+}

@@ -164,6 +164,9 @@ class CampaignGuardTests(unittest.TestCase):
                 campaign.main(["setup", "--campaign-dir", str(camp), "--binary", str(binary)])
             self.assertEqual(ctx.exception.code, 3)
             self.assertEqual(campaign.main(["l0", "--campaign-dir", str(camp), "--binary", str(binary)]), 0)
+            receipt = support.read_json(camp / "l0-receipt.json")
+            self.assertTrue(receipt["results"])
+            self.assertTrue(all(row["command"][0] == sys.executable for row in receipt["results"]))
 
 
 if __name__ == "__main__":

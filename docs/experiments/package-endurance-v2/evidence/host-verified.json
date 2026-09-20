@@ -1,0 +1,144 @@
+{
+  "status": "PASS",
+  "source": "synthetic_provider_real_host_public_protocol",
+  "cases": [
+    {
+      "case": "T1_T2_T1_wrong_task_refused",
+      "status": "PASS",
+      "detail": {
+        "t1": "71b31541-4204-41d7-9def-cb6cb5b0fd38",
+        "t2": "73cc5ad5-05d0-45fc-b4bd-ac9f455f9dbb",
+        "wrong": {
+          "active_task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38",
+          "disposition": "rejected",
+          "rejection": "expected_task_mismatch"
+        }
+      }
+    },
+    {
+      "case": "running_steer_queue_saturation",
+      "status": "PASS",
+      "detail": {
+        "queued": {
+          "disposition": "queued",
+          "task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38"
+        },
+        "saturated": {
+          "active_task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38",
+          "disposition": "rejected",
+          "rejection": "queue_full"
+        }
+      }
+    },
+    {
+      "case": "visible_malformed_then_cold_restore",
+      "status": "PASS",
+      "detail": {
+        "checkpoint": {
+          "artifact": "checkpoint-1789844499089-165e8652-f87b-4826-9be1-393812ba89b6.json",
+          "checkpoint_version": 4,
+          "payload_bytes": 26378,
+          "run_id": "ce7ba9a1-3612-4cdf-ad43-0ec979f48245",
+          "tasks": 2
+        },
+        "directive_bytes": 2876,
+        "directive_sha256": "73cc361034d80a8333d634a1c34501f2be910785ac223501f1eb0ce2a876a1d1",
+        "task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38"
+      }
+    },
+    {
+      "case": "cancel_held_model_and_late_reply",
+      "status": "PASS",
+      "detail": {
+        "cancel": {
+          "ack": {
+            "cancelled_generation": 16,
+            "effective_generation": 17,
+            "operation_id": "3ed7144b-9211-41f1-ab6c-a5159ddc481b",
+            "status": "cancelled",
+            "task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38",
+            "turn_id": "a8811907-f0a4-42d0-9239-fbc8d5fbc7f3"
+          }
+        },
+        "latency_s": 0.01600000000325963,
+        "snapshot": {
+          "continue_readiness": {
+            "can_continue": true,
+            "reason": "ready"
+          },
+          "effective_config": {
+            "context_policy": "dynamic",
+            "maintenance_max_calls_per_maintain": 0,
+            "max_model_rounds": 8,
+            "max_model_rounds_source": "cli",
+            "prompt_cache_mode": "provider_default",
+            "provider_profile_digest": "ba81daec045fec952d567cffac19ccc720e3fcbab52d584029999c0e70b0f245",
+            "read_only": false
+          },
+          "focus": {
+            "anchor_revision": 0,
+            "goal": "T1 package repository boundary fixture",
+            "task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38"
+          },
+          "pending_approvals": [],
+          "restore_evidence_degraded": [],
+          "resync_required": false,
+          "run_completed": false,
+          "run_id": "2d901e8b-10df-4446-a782-7216581db3b8",
+          "run_started": true,
+          "store_backpressure": {
+            "active": false,
+            "externalize_deferred": 0,
+            "store_io_failures": 0
+          },
+          "tasks": [
+            {
+              "anchor_revision": 0,
+              "goal": "T1 package repository boundary fixture",
+              "status": "active",
+              "task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38",
+              "tool_requirement_count": 1,
+              "tool_requirement_revision": 1
+            },
+            {
+              "anchor_revision": 0,
+              "goal": "T2 isolated read-only fixture",
+              "status": "suspended",
+              "task_id": "73cc5ad5-05d0-45fc-b4bd-ac9f455f9dbb",
+              "tool_requirement_count": 1,
+              "tool_requirement_revision": 1
+            }
+          ],
+          "watermark": 32,
+          "workspace_root": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\package-endurance-v2-20260920\\host-verified\\workspace"
+        },
+        "late_marker": "LATE-CANCEL-REPLY-7875e46105b6487f9a5022c9469088e0",
+        "next_request_excludes_late_content": true
+      }
+    },
+    {
+      "case": "four_actual_host_processes",
+      "status": "PASS",
+      "detail": {
+        "pids": [
+          3312,
+          31336,
+          25696,
+          19548
+        ],
+        "task_id": "71b31541-4204-41d7-9def-cb6cb5b0fd38"
+      }
+    },
+    {
+      "case": "typed_failure_cancel_and_real_text_observed",
+      "status": "PASS",
+      "detail": {
+        "cancelled_turn_id": "a8811907-f0a4-42d0-9239-fbc8d5fbc7f3",
+        "cancel_terminals": 1,
+        "late_assistant_text": false
+      }
+    }
+  ],
+  "provider_paid_calls": 0,
+  "directive_repeats": 36
+}

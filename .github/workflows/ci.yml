@@ -21,6 +21,30 @@ jobs:
       - name: Docs agree with state.json, windows and links
         run: python scripts/doc_consistency.py
 
+  python-tests:
+    name: Python regressions (${{ matrix.os }}, ${{ matrix.suite }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        suite: [scripts/tests, scripts/package_endurance_v3/tests, scripts/package_endurance_v4/tests]
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # These suites use only the standard library, temporary fixtures and
+      # loopback servers. No Rust binary, eval.env or paid model is required.
+      # Native Job/HANDLE checks run on Windows; their existing skip guards
+      # leave the portable runner, transaction and auditor checks on Ubuntu.
+      - name: Run local runner and package regressions
+        run: python -B -m unittest discover -s ${{ matrix.suite }} -v
+
   check:
     name: fmt / clippy / build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

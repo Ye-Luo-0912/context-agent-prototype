@@ -1,0 +1,58 @@
+{
+  "status": "CLEANUP_UNCONFIRMED",
+  "cases": [
+    {
+      "case": "approval_denial_then_committed_effect",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "task_id": "2ff22ae2-de60-42fa-80ed-ecd44d27cd1b",
+        "marker": "V3-189df20b6dca48f69800a050f33ae293"
+      }
+    },
+    {
+      "case": "spoofed_pass_does_not_complete_task",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "task_id": "2ff22ae2-de60-42fa-80ed-ecd44d27cd1b"
+      }
+    },
+    {
+      "case": "runtime_process_executes_verified_deployment",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "receipt": {
+          "environment": "prod",
+          "generation": 1,
+          "key": "final-host-pipe-access",
+          "manifest_sha256": "ebdab014dbc8c613f02fdd82c4a26a1cbf86583570c4ce25d2e1c226770760ad",
+          "tenant": "runtime"
+        }
+      }
+    }
+  ],
+  "error_type": "AssertionError",
+  "error": "{'graceful_signal': None, 'taskkill_exit': None, 'outcome': 'unconfirmed', 'scope': 'windows_job', 'tree_confirmed': False, 'active_processes': 0, 'capture_error': 'lifetime observer failed: Job membership changed before handles could be captured', 'active_before_kill': 1, 'final_total_processes': 7, 'observed_processes': 3, 'detail': 'historical Job members lack retained exit-observation handles', 'retained_members_exited': True}",
+  "provider_errors": [],
+  "provider_paid_calls": 0,
+  "host_cleanup_error": "{'graceful_signal': None, 'taskkill_exit': None, 'outcome': 'unconfirmed', 'scope': 'windows_job', 'tree_confirmed': False, 'active_processes': 0, 'capture_error': 'lifetime observer failed: Job membership changed before handles could be captured', 'active_before_kill': 1, 'final_total_processes': 7, 'observed_processes': 3, 'detail': 'historical Job members lack retained exit-observation handles', 'retained_members_exited': True}",
+  "host_cleanup": {
+    "graceful_signal": null,
+    "taskkill_exit": null,
+    "outcome": "unconfirmed",
+    "scope": "windows_job",
+    "tree_confirmed": false,
+    "active_processes": 0,
+    "capture_error": "lifetime observer failed: Job membership changed before handles could be captured",
+    "active_before_kill": 1,
+    "final_total_processes": 7,
+    "observed_processes": 3,
+    "detail": "historical Job members lack retained exit-observation handles",
+    "retained_members_exited": true
+  }
+}

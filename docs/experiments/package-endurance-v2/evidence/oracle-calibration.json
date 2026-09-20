@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "positive_disk_fixture": true,
+  "rejected": [
+    "blob",
+    "pointer",
+    "receipt"
+  ]
+}

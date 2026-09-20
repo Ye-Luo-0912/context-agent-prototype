@@ -52,6 +52,7 @@ remains opt-in and the default does not send caching extensions.
 | `OPENAI_API_PROTOCOL` | `auto` | `auto` / `responses` / `chat` |
 | `OPENAI_PROMPT_CACHE_MODE` | `provider_default` | `provider_default` / `responses_explicit`; explicit mode requires `OPENAI_API_PROTOCOL=responses` |
 | `OPENAI_RESPONSES_REASONING_EFFORT` | `provider_default` | `provider_default` / `none` / `low` / `high` / `max`; a pinned value requires `OPENAI_API_PROTOCOL=responses` |
+| `OPENAI_CHAT_THINKING` | `provider_default` | `provider_default` / `disabled`; `disabled` requires `OPENAI_API_PROTOCOL=chat` |
 | `OPENAI_CONTEXT_WINDOW` | `128000` | integer ≥ 1024 |
 | `OPENAI_MAX_OUTPUT_TOKENS` | `4096` | integer ≥ 1 |
 | `OPENAI_TEMPERATURE` | unset = provider default | 0.0 – 2.0 |
@@ -66,6 +67,22 @@ field and preserves historical profile digests; a pinned value sends
 values/protocol combinations fail at startup; model-specific support is still
 the endpoint's responsibility. Rust callers can select the same setting with
 `OpenAiProvider::with_responses_reasoning_effort`.
+
+Chat thinking uses a separate, explicit extension: `OPENAI_CHAT_THINKING=disabled`
+sends `thinking: {"type": "disabled"}` on every Chat request. The default sends
+no `thinking` field and preserves the historical wire and profile digest.
+The disabled setting changes the profile digest and appears in the startup
+banner; unsupported values or `auto`/`responses` combinations fail at startup.
+An endpoint rejection remains an error, with no parameter removal or protocol
+fallback. Rust callers use `OpenAiProvider::with_chat_thinking`.
+
+For a DeepSeek Chat tool loop, explicitly select `OPENAI_API_PROTOCOL=chat`
+and `OPENAI_CHAT_THINKING=disabled`, leaving Responses reasoning unset.
+DeepSeek currently enables thinking by default and requires full
+`reasoning_content` history on subsequent requests carrying tools. This adapter
+does not implement that history contract, so an explicit `enabled` setting is
+not offered. Provider-default remains unchanged and does not assert that every
+endpoint's default is compatible. See [DeepSeek's thinking mode documentation](https://api-docs.deepseek.com/guides/thinking_mode/).
 
 For DeepSeek Flash, the currently documented model is `deepseek-flash` at
 `https://api.deepseek.com`, with a native Responses endpoint. The bounded cache
@@ -97,7 +114,7 @@ Every run prints the provider profile banner and persists the digest
 into every checkpoint's run metadata:
 
 ```
-provider profile: <model> @ <base_url> protocol=responses context_window=128000 max_output_tokens=4096 sampling=provider-default prompt_cache=provider_default responses_reasoning=provider_default digest=0123456789abcdef…
+provider profile: <model> @ <base_url> protocol=responses context_window=128000 max_output_tokens=4096 sampling=provider-default prompt_cache=provider_default responses_reasoning=provider_default chat_thinking=provider_default digest=0123456789abcdef…
 ```
 
 Two runs compare operating points by comparing `provider_profile_digest`.

@@ -1,0 +1,369 @@
+{
+  "status": "LOCAL_CLOSEOUT_COMPLETE_REAL_MODEL_NOT_ACCEPTED",
+  "head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "branch": "codex/runtime-endurance-full-plan",
+  "paid_calls_this_closeout": 0,
+  "original_pins": {
+    "target\\package-endurance-v4-20260920\\campaign.json": "871087ae42c09d2d08ff270774b83364c7995f88762199f0a81e964a38fadc65",
+    "target\\package-endurance-v4-20260920\\model\\budget-ledger.json": "e4227c71beedd464b8bfbf85852c08d72508188a31722650cb735b253f097554",
+    "target\\package-endurance-v4-20260920\\model-authored-final\\app\\snapshot.py": "249bdc950715128497baff2f454fae3d1509b41c4b2bb5c746017e42781d7288"
+  },
+  "protected_files_verified": 510,
+  "original_campaign": {
+    "decisions": 93,
+    "tools": 126,
+    "attempts": 93,
+    "input_tokens": 1441891,
+    "output_tokens": 35157,
+    "cached_input_tokens": 509696,
+    "estimated_usd": 0.3249050759999999,
+    "reserved_usd": 0,
+    "unknown_usd": 0,
+    "segments": [
+      {
+        "segment": "model-continue-build",
+        "rounds": 16,
+        "tool_calls": 21,
+        "requests": 16,
+        "categories": [],
+        "outcome": "completed",
+        "exit_code": 0,
+        "terminals": [
+          {
+            "type": "turn_completed"
+          }
+        ]
+      },
+      {
+        "segment": "model-develop",
+        "rounds": 7,
+        "tool_calls": 14,
+        "requests": 7,
+        "categories": [
+          "budget_incomplete",
+          "child_nonzero"
+        ],
+        "outcome": "completed",
+        "exit_code": 10,
+        "terminals": [
+          {
+            "type": "turn_failed",
+            "turn_id": "f2a7e485-9756-49e6-b63f-a183ff854ff8",
+            "task_id": "728242d7-3d0c-4fb1-acc2-335e58eab9c7",
+            "class": "model_output_limit",
+            "retryable": false
+          }
+        ]
+      },
+      {
+        "segment": "model-finish-api",
+        "rounds": 22,
+        "tool_calls": 30,
+        "requests": 22,
+        "categories": [
+          "child_nonzero"
+        ],
+        "outcome": "completed",
+        "exit_code": 10,
+        "terminals": [
+          {
+            "type": "turn_failed",
+            "turn_id": "60866874-529c-4374-8329-3adfac5fa879",
+            "task_id": "728242d7-3d0c-4fb1-acc2-335e58eab9c7",
+            "class": "model",
+            "retryable": false
+          }
+        ]
+      },
+      {
+        "segment": "model-last-app",
+        "rounds": 9,
+        "tool_calls": 13,
+        "requests": 9,
+        "categories": [],
+        "outcome": "completed",
+        "exit_code": 0,
+        "terminals": [
+          {
+            "type": "turn_completed"
+          }
+        ]
+      },
+      {
+        "segment": "model-live-cancel-restore",
+        "rounds": 4,
+        "tool_calls": 3,
+        "requests": 4,
+        "categories": [
+          "child_nonzero"
+        ],
+        "outcome": "completed",
+        "exit_code": 10,
+        "terminals": []
+      },
+      {
+        "segment": "model-live-cancel-restore-final-six",
+        "rounds": 3,
+        "tool_calls": 2,
+        "requests": 3,
+        "categories": [
+          "child_nonzero"
+        ],
+        "outcome": "completed",
+        "exit_code": 10,
+        "terminals": []
+      },
+      {
+        "segment": "model-live-cold-read-only",
+        "rounds": 0,
+        "tool_calls": 0,
+        "requests": 0,
+        "categories": [
+          "child_nonzero"
+        ],
+        "outcome": "completed",
+        "exit_code": 10,
+        "terminals": []
+      },
+      {
+        "segment": "model-repair-and-finish",
+        "rounds": 20,
+        "tool_calls": 22,
+        "requests": 20,
+        "categories": [],
+        "outcome": "completed",
+        "exit_code": 0,
+        "terminals": [
+          {
+            "type": "turn_completed"
+          }
+        ]
+      },
+      {
+        "segment": "model-small-edits",
+        "rounds": 12,
+        "tool_calls": 21,
+        "requests": 12,
+        "categories": [
+          "child_nonzero"
+        ],
+        "outcome": "completed",
+        "exit_code": 10,
+        "terminals": [
+          {
+            "type": "turn_failed",
+            "turn_id": "fcc3901c-4c80-4876-87f1-838ec7c17c42",
+            "task_id": "728242d7-3d0c-4fb1-acc2-335e58eab9c7",
+            "class": "model",
+            "retryable": false
+          }
+        ]
+      }
+    ]
+  },
+  "model_only": {
+    "status": "FAIL",
+    "passed": 8,
+    "total": 26
+  },
+  "assisted": {
+    "accepted": 26,
+    "load_seconds": 300.00044298171997,
+    "worker_cycles": 1176,
+    "batches": 294,
+    "real_crashes": 2,
+    "cleanup_confirmed": true
+  },
+  "real_paid_cancel_restore": "FAILED_CONTROLLER_ROUTE_THEN_CORE_RECOVERY_FENCE",
+  "synthetic_provider_real_host_cases": 7,
+  "runtime_authority": "preserved; ambiguous process effect was not cleared or replayed",
+  "remote_ci": "NOT_RUN",
+  "submitted": false,
+  "checks": [
+    {
+      "log": "logs/acceptance-final.log.gz"
+    },
+    {
+      "log": "logs/acceptance-r2.log.gz"
+    },
+    {
+      "log": "logs/acceptance.log.gz"
+    },
+    {
+      "log": "logs/clippy-final.log.gz"
+    },
+    {
+      "log": "logs/controller-tests-final.log.gz",
+      "python_total": 31,
+      "elapsed_seconds": 10.487,
+      "skipped": 0
+    },
+    {
+      "log": "logs/controller-tests-r2.log.gz",
+      "python_total": 30,
+      "elapsed_seconds": 1.27,
+      "skipped": 0
+    },
+    {
+      "log": "logs/controller-tests.log.gz",
+      "python_total": 27,
+      "elapsed_seconds": 1.687,
+      "skipped": 0
+    },
+    {
+      "log": "logs/e1-diagnostic.log.gz",
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0
+    },
+    {
+      "log": "logs/e1-green.log.gz",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "logs/e1-rebuilt-fixture.log.gz",
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0
+    },
+    {
+      "log": "logs/e1-rerun.log.gz",
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0
+    },
+    {
+      "log": "logs/fmt-final.log.gz"
+    },
+    {
+      "log": "logs/fs-schema-green.log.gz",
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "log": "logs/fs-schema-red.log.gz",
+      "passed": 0,
+      "failed": 1,
+      "ignored": 0
+    },
+    {
+      "log": "logs/host-journey-final.log.gz"
+    },
+    {
+      "log": "logs/linux-runner-tests.log.gz",
+      "python_total": 2,
+      "elapsed_seconds": 0.029,
+      "skipped": 19
+    },
+    {
+      "log": "logs/linux-rust-tests.log.gz",
+      "passed": 557,
+      "failed": 0,
+      "ignored": 8
+    },
+    {
+      "log": "logs/linux-v4-tests-final.log.gz",
+      "python_total": 31,
+      "elapsed_seconds": 6.511,
+      "skipped": 0
+    },
+    {
+      "log": "logs/linux-v4-tests.log.gz",
+      "python_total": 30,
+      "elapsed_seconds": 1.233,
+      "skipped": 0
+    },
+    {
+      "log": "logs/load-diagnostic.log.gz"
+    },
+    {
+      "log": "logs/load-final.log.gz"
+    },
+    {
+      "log": "logs/load-guards.log.gz",
+      "python_total": 6,
+      "elapsed_seconds": 0.12,
+      "skipped": 0
+    },
+    {
+      "log": "logs/load-r2.log.gz"
+    },
+    {
+      "log": "logs/load.log.gz"
+    },
+    {
+      "log": "logs/process-fixtures-build.log.gz"
+    },
+    {
+      "log": "logs/public-tests-final.log.gz",
+      "python_total": 4,
+      "elapsed_seconds": 0.242,
+      "skipped": 0
+    },
+    {
+      "log": "logs/public-tests-r2.log.gz",
+      "python_total": 4,
+      "elapsed_seconds": 0.004,
+      "skipped": 0
+    },
+    {
+      "log": "logs/runner-tests-final.log.gz",
+      "python_total": 2,
+      "elapsed_seconds": 0.037,
+      "skipped": 0
+    },
+    {
+      "log": "logs/v3-tests.log.gz",
+      "python_total": 40,
+      "elapsed_seconds": 15.24,
+      "skipped": 0
+    },
+    {
+      "log": "logs/workspace-tests-final.log.gz",
+      "passed": 3074,
+      "failed": 0,
+      "ignored": 10
+    },
+    {
+      "log": "logs/v4-close-runner-tests.log.gz",
+      "python_total": 2,
+      "elapsed_seconds": 0.038,
+      "skipped": 0
+    },
+    {
+      "log": "logs/v4-close-workspace-tests.log.gz",
+      "passed": 57,
+      "failed": 1,
+      "ignored": 0
+    }
+  ],
+  "source_identity": {
+    "scripts/package_endurance_v4/live_host.py": "818de5fbb92fb265c45fd1e5f06686044260f4b776f8b3740935ac7307546bf0",
+    "scripts/package_endurance_v4/load.py": "433f2e9fc690bbffe6d7be1680d6202a25687d1bc6f47c43fd23e385b8167101",
+    "scripts/package_endurance_v4/prepare.py": "87b6de0e1c3725084914a9beb4b0b723cfde9324b88002c8b4ea90cf4a0816fa",
+    "scripts/package_endurance_v4/reconcile_usage.py": "44fd019528bed8eaa337a21ce00727a625c1be16be911d4fcdc631aa70299ae7",
+    "scripts/package_endurance_v4/run.py": "a0488993d8f47daa14cb2a192bd6b854fc4a30cd60c9355c401c0e1f1c15a7ba",
+    "scripts/package_endurance_v4/SPEC.md": "0d6c40bbe90e18d8911900fc8c4b1edff9f4d356f3938bca7f84c9c26371e2e9",
+    "scripts/package_endurance_v4/verify.py": "9f659b33347b486a4779a6bcb622d070ea96da9b38f38621e49fbb3fb9029a66",
+    "scripts/package_endurance_v4/assisted/README.md": "33386eb25d737b419fdbfe8184ec686d3201c51717db3aee13f2a1c738e555c5",
+    "scripts/package_endurance_v4/tests/test_assisted.py": "e18adca94c8c63d6dbfd722f5c7a2ea8d9d6fc875502a51f4e6412bec93a1f25",
+    "scripts/package_endurance_v4/tests/test_limits.py": "a6f8a47eb442badcb78f91b9c938d6acc076f6cd34a68425b70f56f8ad0eb198",
+    "scripts/package_endurance_v4/tests/test_live_host.py": "ba20a0c908e4dd1309dcb661fcbced1b567d8a907a2e554d98896d953123bb71",
+    "scripts/package_endurance_v4/tests/test_load.py": "15fb71d21279155b895cb975165c46cd4a1404827067e0e7af9550d1219db707",
+    "scripts/package_endurance_v4/tests/test_oracle.py": "50b32145a0ec1448e3bb177b1132e470817bb6cc09c4579dfef37e233b55f7c3",
+    "scripts/package_endurance_v4/assisted/app/snapshot.py": "43d10f18f4f23cdf589b9ccc5d35a3843a2a5df1422ae1be8f93a1100c517933",
+    "scripts/package_endurance_v4/assisted/app/__init__.py": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b",
+    "crates/tool-runtime/src/tools/fs.rs": "83fafd01d09292625dc6bcd80e36d4be5aa437878916121c53c46fd93016d1b6",
+    "crates/provider-openai/src/lib.rs": "3fc2807c65f9cad6eba711bdc5a069bdda7c4f53ddadf97178646833e91f1544",
+    "crates/provider-openai/src/chat_thinking.rs": "00dc47b3510894631df5687c3b7cb9f40c8c589252500b1c63228a6bf650e2b3",
+    "crates/agent-compose/src/lib.rs": "4619aab6c20f3a3fedfda7a2b2d128ec44cff8fd1c6a3d74a59ac601bf828862",
+    "crates/agent-host/src/lib.rs": "2f8138b04c61928e6dbd8f492405a34dc3e94cc06fb07ec129d5362bbb70474a",
+    "crates/agent-runtime/src/actor/turn.rs": "f8ad3af22d5b1e3b76f697c864be97c2af8f8931c63c13a8c8e5052afad85348",
+    "scripts/runtime_endurance_incremental_runner.py": "5d069936f03d190ef36b6cf43d9442c615ba58d164f3b27ca9fe55a1a57e5171",
+    "scripts/runner_process_tree.py": "b6830875c8a962bb091b2a5679714c736735d51318e4aeb9eb1723d19df842e7",
+    "crates/agent-capability-process/tests/e1_mcp_loop.rs": "426b8d11945d55e391b48e13817ec4f2da5ccd9e0e357c017c238eb532b594c3"
+  }
+}

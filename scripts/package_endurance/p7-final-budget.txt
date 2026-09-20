@@ -1,0 +1,19 @@
+FINAL 37 DECISIONS OF THIS SAME CAMPAIGN. No budget will be added.
+Last 32 decisions used only reads and produced ZERO source changes despite
+pinpointed fixes. Required next action is IMPLEMENTATION, not another audit.
+Your FIRST action should WRITE app/worker.py. It is a new small file: argparse
+--root --catalog --jobs --result, load each JSONL request, call Repository.install,
+write and flush one JSONL {request,ok,receipt|error} per job, real process/DB.
+Then fix app/util.py canonical_bytes: no appended newline; ensure_ascii=False;
+keep all other existing helper exports intact. Then fix state.connect and
+ensure_schema to reject unknown future user_version before journal_mode or DDL.
+Use a small precise edit via a real tool if whole-file replacement is too risky.
+Do not read the resolver, catalog, tests/public, SPEC or unchanged directories
+again. They have already been read repeatedly; independent resolver cases pass.
+After these writes, run the actual tests/40-node deployment smoke and fix only
+concrete failures. The controller handles independent crash/CAS/GC assertions.
+Write honest short app/README.md, DESIGN.md, RECOVERY.md and RESULT.json last.
+Publication remains STOPPED after blind replay; do not invoke or modify publish.
+This is an implementation request and sufficient authorization within app/.
+If all changes are complete earlier, finish; never spend remaining rounds on
+repeated reading or a plan-only answer. Report exact remaining defects honestly.

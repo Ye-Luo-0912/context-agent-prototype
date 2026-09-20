@@ -1,0 +1,43 @@
+{
+  "status": "AWAITING_EXPLICIT_LIVE_APPROVAL",
+  "recorded_at_utc": "2026-09-20T10:25:58.541077+00:00",
+  "provider_requests": 0,
+  "estimated_spend_usd": 0,
+  "model_segments": 0,
+  "candidate_present": false,
+  "protected_files": 510,
+  "protected_changed": [],
+  "approval": {
+    "blocker": "automatic approval review rejected live provider execution",
+    "required_scope": "Send isolated synthetic SPEC, example application source, test fixtures and execution results to api.deepseek.com using existing credentials; at most 96 model decisions and estimated USD1",
+    "request_pending": true
+  },
+  "local_checks": {
+    "runner_tests_passed": 65,
+    "provider_tests_passed": 172,
+    "compose_tests_passed": 72,
+    "paid_tests_ignored": 7,
+    "workspace_all_targets_check": true,
+    "focused_clippy": true,
+    "fmt": true,
+    "document_gate": true,
+    "snapshot_budget_and_oracle_tests_passed": 6
+  },
+  "binary_sha256": {
+    "agent-host.exe": "8fe08822dc9208e5bf4a40af3d8d276c07c574a9e6c27e3c59b29211a0f9f923",
+    "agent-tui.exe": "7213b5989599a8daf016fa363f8eafa933658741b6c7a2274c1c16b6688ddbe8"
+  },
+  "oracle_named_cases": 26,
+  "source_sha256": {
+    "crates/provider-openai/src/chat_thinking.rs": "00dc47b3510894631df5687c3b7cb9f40c8c589252500b1c63228a6bf650e2b3",
+    "crates/provider-openai/src/lib.rs": "3fc2807c65f9cad6eba711bdc5a069bdda7c4f53ddadf97178646833e91f1544",
+    "crates/agent-compose/src/lib.rs": "4619aab6c20f3a3fedfda7a2b2d128ec44cff8fd1c6a3d74a59ac601bf828862",
+    "scripts/runtime_endurance_incremental_runner.py": "abb4315562a01c7bfde5471fadec694a1e64aa91d3ba59b21857601e05e079eb",
+    "scripts/package_endurance/run.py": "fcab158ad88fd5fb7a3d128bc38194103c6125e2002dc7571674ff758fb9e449",
+    "scripts/package_endurance_v3/run_model.py": "19f1a3f7e5e98ea4d9c193ac1f8238e1ce10a2105b88264b7b74819ec608a3d1",
+    "scripts/package_endurance_v4/run.py": "a0488993d8f47daa14cb2a192bd6b854fc4a30cd60c9355c401c0e1f1c15a7ba",
+    "scripts/package_endurance_v4/prepare.py": "87b6de0e1c3725084914a9beb4b0b723cfde9324b88002c8b4ea90cf4a0816fa",
+    "scripts/package_endurance_v4/verify.py": "bf9105317e41e8313efa135960f348c85d47b2371eccd655f74a3b8b6a7e4009",
+    "scripts/package_endurance_v4/SPEC.md": "0d6c40bbe90e18d8911900fc8c4b1edff9f4d356f3938bca7f84c9c26371e2e9"
+  }
+}
