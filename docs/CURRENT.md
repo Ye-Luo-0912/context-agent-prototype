@@ -2,6 +2,30 @@
 
 本页是当前状态入口。执行任务及状态只维护在 [NEXT_TASKS.md](NEXT_TASKS.md)。旧报告中的"当前"只属于其固定基线。
 
+**2026-09-21 V5 根因审查（固定提交 `7224a7b`）顺序 1–5 本地关闭，全部零供应商。**
+合同与裁判统一为"受控静止切点 + percent-encoded `?mode=ro`"（`immutable=1` 明确不得使用，调用前后各取源指纹，
+不合格批次**拒绝**而非计为候选失败）；归档成员上限按冻结负载的计算闭包由 256 调整为 1024（字节类上限不变：
+单成员 2 MiB、展开 8 MiB、归档 9 MiB），`prepare` 开窗前产出容量计划、`preflight` 比对 SPEC 文本与裁判常量并
+绑定 `contract-identity.json`；裁判补齐 generation 连续性/最大性、outbox 义务、重复发布身份、跨 scope manifest、
+journal 资源闭包与恢复目标完整字节映射；控制器改为 4 写者 barrier 并发＋独立 reader/GC＋独立 verify，
+验收窗口按 `candidate_digest` 绑定且早期失败不再阻断新版本窗口，未决失败有界投影不可被普通批次覆盖，
+故障按 planned/fired/observed/verdict 记账（未见 `exit 74` 记 `NOT_TRIGGERED`），续跑从权威库恢复 generation
+与最大序号；账本的预约说明与算法同一来源，跨段主决策/工具受理/尝试数由材料机械导出并拒绝超额，
+授权按冻结 campaign 生成并在开窗前做相容性检查，`finalize` 全量从材料派生（缺材料即 `INCOMPLETE`）。
+本地实测：`scripts/tests` 124 项、v3 40 项、v4 31 项全绿；不变量探针退出 0（O1–O10 全部拒绝、正对照接受）；
+顺序 5 的 Runtime 改动后 `agent-runtime` lib 451、actor 101、turn 165(1 ignored)、contracts 198、conformance 35、
+compose 43＋kv_cache_walk 5 全绿，fmt/clippy 干净。
+**顺序 5（报告 5.2）已实施**：知识前沿与交付推进分开记账——只读知识更新（含反复读到被外部控制器改写的
+外部反馈文件）只推进知识前沿，不再清零交付停滞；交付停滞以独立有界行进入任务进度投影并叙述当前 blocker，
+仍是 advisory（不阻断、不是完成声明、不是权限来源）；交付债以 additive 字段进入 `ExecutionFrontier` 事件，
+并在 agent-eval 指标/bundle/bench 与 agent-replay 的 trace 重建中可见（旧 journal 读作 0）。
+工具受理的 `tool_attempts` 也已从段边界升级为**在飞**强制（runner 增量读子进程 journal，基线由材料导出，
+未配置时行为不变，触发给出 `EXIT_TOOL_BUDGET=21`）。合同身份已改变，下一次真实窗口必须按新合同另开，
+不改原 V5 窗口的预算或验收标准；原 `NOT_ACCEPTED_MODEL_BUDGET_EXHAUSTED` 与冻结证据一行未改。
+本次未提交、未推送，该基线无 workflow run。
+[审查报告](reviews/2026-09-21-review-7224a7b/REVIEW.md)、[实施任务](reviews/2026-09-21-review-7224a7b/NEXT_ACTIONS.md)、
+[实施回执](reviews/2026-09-21-review-7224a7b/BATCH13_RECEIPT.md)。
+
 **2026-09-21 V5 执行结束：NOT_ACCEPTED_MODEL_BUDGET_EXHAUSTED。** 同一 TaskId、
 同一工作区和持续负载实际启动；第一段 41 回合因输出上限停止，续接 219 回合后
 因审批拒绝停止。候选生成了在线备份模块，但仍拒绝 live WAL sidecar 和增长后的

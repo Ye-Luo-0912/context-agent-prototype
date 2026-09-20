@@ -4,6 +4,21 @@
 
 ## 接手规则
 
+**2026-09-21 V5 根因审查（`7224a7b`）的顺序 1–5 已在本地关闭**：合同与裁判统一为受控静止切点下的
+`mode=ro` 读取、成员上限按计算闭包由 256 调整为 1024、裁判补齐 generation/outbox/跨 scope/journal/字节映射不变量、
+控制器改为真实并发＋按候选摘要绑定的验收窗口＋故障台账＋权威库续跑、授权与跨段预算机械受限、汇总从材料派生；
+顺序 5 把"知识更新"与"交付推进"分开记账，外部反馈心跳不再解除任务级停滞，工具预算升级为在飞强制。
+全部零供应商：`scripts/tests` 124 项、v3 40 项、v4 31 项本地全绿，探针退出 0；
+Runtime 侧 `agent-runtime` lib 451、turn 165(1 ignored)、contracts 198、conformance 35、compose 43、
+replay 63、eval 196（排除 2 项本机夹具/握手类失败，见回执）全绿，
+fmt/clippy 干净；`prepare`/`preflight` 在临时 campaign 上分别产出 `capacity_satisfiable=true` 与 `READY`。
+合同身份已改变（SPEC/裁判/控制器哈希见
+[实施回执](reviews/2026-09-21-review-7224a7b/BATCH13_RECEIPT.md)），因此**下一次真实窗口必须按新合同另开**，
+不得改原 V5 窗口的预算或验收标准；[原始失败](experiments/package-endurance-v5/RUN_2026-09-21.md)一行未改。
+未提交、未推送；该基线无 workflow run（workflow 只触发 main push/PR）。
+剩余（非阻塞）：真实供应商重跑与 .NET 未执行；本机 `agent-eval::platform_closure_m13`（bare-host 夹具握手）
+与 `agent-process --test host` 单项时序断言在本会话沙箱下持续失败，属环境限制而非本批改动（回执第 7 节第 7 条）。
+
 **2026-09-21 V5 已执行并停止：NOT_ACCEPTED_MODEL_BUDGET_EXHAUSTED。**
 方案中的持久 TaskId、同一 workspace、连续控制器和独立 oracle 已实际运行；
 模型 260 主决策后仍未通过 WAL/历史规模/独立备份验收，120 分钟长负载未达到。
@@ -56,6 +71,49 @@ Package v2 实验已按原 240 次主决策额度结束，应用未验收；
 先核对当前分支、HEAD 和未提交 diff（并行分支在飞）。MERGED 只说明代码进入目标分支，不代表 CI 或真实供应商验收通过。本轮 A=执行核心/工具，B=上下文/GC/搜索，C=平台/供应商 KV。共享 contracts/ModelInput/缓存契约由单一集成人维护。
 
 **第十二批（`bcacf41b` 续审）已全部关闭（2026-09-19，本地集成回归全绿，回执：[BATCH12_RECEIPT](reviews/2026-09-19-review-bcacf41b/BATCH12_RECEIPT.md)）。第十一批（`d3a05d29` 续审）已全部关闭（2026-09-18，本地集成回归全绿，见下方第十一批与五份回执；CI 终验 run `35289417269` 首跑全绿）。** 第十批已全部关闭（CI 终验 run `35278745998` 与钉宽后 run `35282364426` 见 CURRENT.md）。条件任务 T8 亦已关闭（2026-09-18，授权付费实验：ENDPOINT_ACCEPTED=PASS／SERVER_HIT=OBSERVED／token 口径全落账、金额 NOT_RUN；`context_manage` 租赁打断供应商前缀复用实测成立，见 NEXT_TASKS T8 节与 [t8 证据](walkthroughs/2026-09-18-t8-kv-live.md)）；host_e2e 起始基线抖动为未定性观察（见 CURRENT.md 已知抖动记录）。历史顺序（已关闭）：T1/T2/T3 并行（第一批）；T4/T6 并行（第二批）；T5 随组合点接入；T7 收尾。每片先写用户动作与目标反例，再做实现；可维护性边界（见审查报告「四个责任边界」节）随片交付，不另起全仓重写；同一 crate 内多个切片按文件所有权串行，不并行互踩。
+
+## 第十三批（`7224a7b` V5 根因审查：顺序 1–5）——已关闭（2026-09-21，本地零供应商）
+
+审查基线 `7224a7baa8910881b9efaa77f14013781137ff49`（分支 `codex/runtime-endurance-full-plan`；报告：[REVIEW.md](reviews/2026-09-21-review-7224a7b/REVIEW.md)，任务规格：[NEXT_ACTIONS.md](reviews/2026-09-21-review-7224a7b/NEXT_ACTIONS.md)，实施回执：[BATCH13_RECEIPT.md](reviews/2026-09-21-review-7224a7b/BATCH13_RECEIPT.md)）。主线：**先让冻结的测试可满足、裁判与合同一致、控制器不抹掉失败，再谈模型归因。** V5 原始 `NOT_ACCEPTED_MODEL_BUDGET_EXHAUSTED` 与冻结证据不改写；本次全部为本地零供应商改动，未提交、未推送，该基线无 workflow run。文件所有权：C 线＝`scripts/package_endurance_v5/{SPEC.md,prepare.py,preflight.py}`；O 线＝同目录 `oracle.py`＋探针；L 线＝同目录 `continuous_load.py`＋`run.py`；R 线＝同目录 `{run.py,finalize.py,runner_grants.py,campaign_accounting.py}`＋`scripts/runtime_endurance_incremental_runner.py`。
+
+### C-1/C-2/C-3/C-4 — 合同自洽与容量可满足（F01＋F02）——已关闭
+用户动作：候选按受保护 SPEC 实现 immutable 读取，却被以 `mode=ro` 读取的裁判判失败；且"完整保留历史对象"与 256 成员上限在冻结负载下不能同时成立。
+- 修复：SPEC 冻结为**受控静止切点**（控制器在调用期间静止写者/GC，调用前后各取源指纹；显式读事务；percent-encoded `?mode=ro`；明确 `immutable=1` 不得使用）；成员上限按计算闭包由 256 调整为 1024（字节类上限不变）；`workload.py` 为冻结负载唯一来源，`prepare` 产出 `capacity-plan.json`，不可满足即拒绝准备；`preflight` 比对 SPEC 文本与裁判常量、重算容量计划、绑定 `contract-identity.json`，任一不符 `NOT_READY`。
+- 回归：`scripts/tests/test_package_endurance_v5_contract.py`（合同文本=裁判常量、不再要求 immutable、超预算负载被拒、窗口预算累积且有界、计划漂移被拒）。
+- 停止：不重开格式分片策略、不放宽字节上限；容量变化必须重新走 prepare/preflight。
+
+### O-1…O-5 — 裁判不变量（F06＋F07）——已关闭
+用户动作：合成反例可绕过 generator 连续性、current 最大性、恢复目录多余文件和成员上限。
+- 修复：`repository_cut` 使用显式读事务；强制 generation 连续且 current 为最大；outbox/journal 身份唯一；manifest 限同 scope；journal 资源闭包；`check_archive` 强制成员/单成员/展开/归档四上限；`check_restored` 改为完整字节映射比较（多余文件/链接/缺失全部拒绝）；新增 `source_fingerprint` 作为切点区间证据。
+- 回归：`probe_oracle_invariants.py`（O1–O10 全部拒绝、正对照接受、退出码 0）＋`test_package_endurance_v5_oracle.py`。审计原探针复跑：O1–O3 由红转绿，O4 期望按 F02 被正式调整取代（两条结论分开记录）。
+- 停止：不继续扩大不变量集合到未定义语义；新不变量必须同时有正对照。
+
+### L-1…L-6 — 真实并发、独立验收窗口、故障台账与续跑（F03/F04/F05/F08）——已关闭
+用户动作：所谓并发负载是串行循环；早期失败让同一持续运行永远无法 PASS；resume 复用旧 key/generation；`latest.json` 覆盖未决失败。
+- 修复：写者以 barrier 同步轮次真实并发、reader/GC 与 verify 各自独立执行者并记录区间证据（写者×写者重叠为 PASS 前置条件）；验收窗口按 `candidate_digest` 绑定、历史失败永不删除；有界 `unresolved_failures` 只由同义务成功解除；故障 planned/fired/observed/verdict 台账，未见 `exit 74` 记 `NOT_TRIGGERED` 且边界未触发本身记为未决失败；续跑从权威库恢复 generation 与最大序号、只以新 key 继续；`run.py` 不再因模型段结束即终止纯本地负载。
+- 附带修两处真实缺陷：发布身份取自非原子 `max()` 可能指向在飞槽位；控制器接收者未实现应用文档化的 `GET receipt?…` 身份查询，导致合法重试无法对账。
+- 回归：`test_package_endurance_v5_controller.py`（并发重叠、静止切点证据、失败持续可见、故障门、续跑身份）。
+- 停止：不引入第二个 orchestrator；等待状态不得算作完成。
+
+### R-1…R-4 — 授权、预算与汇总（F09/F10/F11）——已关闭
+用户动作：长流程沿用 48 次/30 分钟短测试授权；V5 账本声明 `wire_bytes_plus_8192` 但实际按 `bytes/4+256` 预约；finalize 结论硬编码、只覆盖固定两段与固定路径。
+- 修复：`BudgetLedger` 的说明与算法同一来源（子类只改参数）；`campaign_accounting.py` 从账本与各段 summary 导出跨段主决策/工具受理/尝试数并拒绝超额，不信任调用方传入的 rounds；`runner_grants.py` 按冻结 campaign 生成授权并在开窗前做相容性检查（`RunnerConfig.grants` 覆盖短测试默认值）；`finalize.py` 全量从材料派生，缺材料 `INCOMPLETE`，仅控制器阶段不得派生成 ACCEPTED。
+- 回归：`test_package_endurance_v5_budget.py`、`test_runner_tool_budget.py`（在飞工具预算）。
+- 剩余：`tool_attempts` 通过 runner 在飞 watcher 强制（上限跨段由材料导出，粒度约 100 ms 轮询窗口）；
+  报表口径的逐步 token 计数仍归 T8 线。
+
+### L7 — 交付推进口径与外部反馈心跳（报告 5.2、§7"进展分类"）——已关闭（2026-09-21）
+用户动作：控制器每轮改写 `runtime-feedback/latest.json` 的时间/批次，模型反复重读它；每读一次都算"新证据"，
+于是"任务没有交付进展"的提示被无限推后，模型可以一直读监控而不改产物。
+- 修复：`ConvergenceState` 增加交付债（只有产物变更/通过的验证/义务解除清零），新增
+  `FrontierProgress{None,Knowledge,Delivery}` 分类；`delivery_warning()` 作为独立有界 advisory 行进入
+  `TaskProgressView` 与提示（含当前 blocker 与未解失败数）；交付债以 additive 字段进入 `ExecutionFrontier` 事件，
+  并在 agent-eval 指标/bundle/bench 与 agent-replay 的 trace 重建中可见（旧 journal 读作 0）。
+  知识前沿语义不变；该行不是验收、不是权限来源。
+- 回归：`execution/tests.rs` 4 项（心跳不清交付停滞／产物变更清／验证通过清／未知足迹既不交付也不冒充重复）
+  ＋`prompt.rs` 1 项（渲染与硬上限）＋`agent-eval` metrics 1 项（事件聚合交付峰值）＋`agent-replay` 1 项（trace 重放）。
+- 剩余：无（本机 `agent-eval::platform_closure_m13` 与 `agent-process --test host` 的夹具握手/时序失败属环境限制，
+  所在 crate 未被本批修改，见回执第 7 节第 7 条）。
 
 ## 第十二批（`bcacf41b` 续审：耐久分支 BR1–BR7＋E-1 证据分层）——已全部关闭（2026-09-19，本地集成回归全绿；回执：[BATCH12_RECEIPT](reviews/2026-09-19-review-bcacf41b/BATCH12_RECEIPT.md)）
 
