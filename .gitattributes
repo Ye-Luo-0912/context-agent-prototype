@@ -2,3 +2,12 @@
 
 # evidence package must stay byte-exact (hash manifest integrity)
 docs/experiments/runtime-endurance-v1/evidence/** -text
+# archived external reviews carry their own sha256 list; a checkout must not
+# renormalize them (the delivered files are already LF, so this only protects
+# future ingestions from silently invalidating a manifest)
+docs/reviews/**/REVIEW.md -text
+docs/reviews/**/audit_manifest.json -text
+docs/reviews/**/probe_results_baseline.json -text
+docs/reviews/**/probe_stdout_baseline.log -text
+docs/reviews/**/sources/** -text
+docs/reviews/**/probes/** -text
