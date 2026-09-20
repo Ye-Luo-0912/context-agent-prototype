@@ -227,6 +227,7 @@ class FrozenToolBudgetWiring(unittest.TestCase):
         captured = {}
         original_popen = v5_run.subprocess.Popen
         original_segment = v5_run.run_segment
+        original_build_env = v5_run.build_env
 
         class FakeLoader:
             def __init__(self, *args, **kwargs):
@@ -247,11 +248,16 @@ class FrozenToolBudgetWiring(unittest.TestCase):
 
         v5_run.subprocess.Popen = lambda *args, **kwargs: FakeLoader()
         v5_run.run_segment = lambda config: captured.setdefault("config", config) and 0
+        # The runner's real environment builder reads the repository's
+        # credentials file, which exists in a developer checkout but not in CI.
+        # This test is about the campaign wiring, so it supplies a text-only env.
+        v5_run.build_env = lambda _repo: {"OPENAI_MODEL": "deepseek-flash"}
         try:
             self.assertEqual(v5_run.run(self.stage, rounds=1, load_wait_seconds=0), 0)
         finally:
             v5_run.subprocess.Popen = original_popen
             v5_run.run_segment = original_segment
+            v5_run.build_env = original_build_env
         config = captured["config"]
         self.assertEqual(config.tool_budget, self.caps["tool_attempts"])
         self.assertEqual(config.tool_budget_baseline, 700,
