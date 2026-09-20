@@ -9,10 +9,28 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import oracle  # noqa: E402
+import workload  # noqa: E402
+
+CONTRACT_FILES = ("SPEC.md", "oracle.py", "workload.py", "continuous_load.py", "invoke.py",
+                  "prepare.py", "preflight.py", "finalize.py", "run.py")
 
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def contract_identity(head, workspace_digests):
+    """Bind the contract text, the judge and the controller into one identity."""
+    here = Path(__file__).resolve().parent
+    files = {name: digest(here / name) for name in CONTRACT_FILES}
+    return dict(schema=1, head=head, files=files, workspace=workspace_digests,
+                bounds=dict(members=oracle.ARCHIVE_MEMBER_BOUND,
+                            member_bytes=oracle.MEMBER_BYTE_BOUND,
+                            uncompressed_bytes=oracle.TOTAL_UNCOMPRESSED_BOUND,
+                            archive_bytes=oracle.ARCHIVE_BYTE_BOUND))
 
 
 def prepare(campaign):
@@ -26,18 +44,29 @@ def prepare(campaign):
                 output_tokens=220_000, estimated_cost_usd=2.0,
                 api_protocol="chat", chat_thinking="disabled",
                 model="deepseek-flash", target_load_seconds=7200,
-                final_candidate_load_seconds=7200)
+                final_candidate_load_seconds=7200,
+                install_budget=workload.INSTALL_BUDGET,
+                writer_workers=workload.WRITER_WORKERS,
+                backup_every=workload.BACKUP_EVERY)
     (campaign / "campaign.json").write_text(json.dumps(caps, indent=2) + "\n", encoding="utf-8")
+
+    # The capacity plan is proven before the workspace exists: if the frozen
+    # workload cannot be encoded inside the frozen archive bounds, no window may
+    # open at all.
+    plan = workload.closure_plan(install_budget=caps["install_budget"],
+                                 writer_workers=caps["writer_workers"])
+    workload.assert_satisfiable(plan)
+    (campaign / "capacity-plan.json").write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     work = campaign / "workspace"
     work.mkdir()
     catalog = {}
-    for index in range(120):
+    for index in range(workload.CATALOG_PACKAGES):
         name = f"pkg-{index:03d}"
         catalog[name] = []
-        for version in range(1, 5):
-            payload = (f"package={name};version={version};\n" +
-                       "data-package-line\n" * 40).encode("utf-8")
+        for version in range(1, workload.CATALOG_VERSIONS + 1):
+            payload = workload.payload_bytes(name, version)
             blob = hashlib.sha256(payload).hexdigest()
             dependencies = {} if index == 0 else {
                 f"pkg-{index - 1:03d}": {"min": version, "max": version + 1}
@@ -85,7 +114,11 @@ def prepare(campaign):
         json.dumps(baseline, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     (campaign / "v3-source-identity.json").write_text(
         json.dumps(dict(source=str(source), app_files=files), indent=2) + "\n", encoding="utf-8")
-    return dict(campaign=str(campaign), workspace=str(work), protected_files=len(files), **caps)
+    (campaign / "contract-identity.json").write_text(
+        json.dumps(contract_identity(head, files), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8")
+    return dict(campaign=str(campaign), workspace=str(work), protected_files=len(files),
+                capacity_satisfiable=plan["satisfiable"], **caps)
 
 
 if __name__ == "__main__":

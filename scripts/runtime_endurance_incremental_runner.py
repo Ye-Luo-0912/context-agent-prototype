@@ -85,6 +85,7 @@ EXIT_INTERRUPTED = 17
 EXIT_SEGMENT_EXISTS = 18
 EXIT_CHILD_TIMEOUT = 19
 EXIT_INTERNAL_ERROR = 20
+EXIT_TOOL_BUDGET = 21
 
 _EXIT_PRIORITY = (
     ("invalid_config", EXIT_USAGE),
@@ -96,6 +97,7 @@ _EXIT_PRIORITY = (
     ("child_nonzero", EXIT_CHILD_FAILED),
     ("protected_modified", EXIT_PROTECTED_MODIFIED),
     ("recovery_required", EXIT_RECOVERY_REQUIRED),
+    ("tool_budget_exhausted", EXIT_TOOL_BUDGET),
     ("budget_incomplete", EXIT_BUDGET_INCOMPLETE),
     ("budget_ledger_unreadable", EXIT_BUDGET_INCOMPLETE),
     ("child_launch_failed", EXIT_LAUNCH_FAILED),
@@ -463,6 +465,14 @@ class RunnerConfig:
     upstream_url: str | None = None
     ledger_class: type | None = None
     api_protocol: str | None = None
+    grants: list | None = None
+    # Campaign-level tool-call budget. `None` keeps the previous behaviour: the
+    # segment only records how many tool calls it made. When set, the runner
+    # stops the child as soon as `tool_budget_baseline` plus this segment's
+    # finished tool calls reaches the bound, so a long task cannot spend an
+    # unbounded tool budget just because the model keeps accepting rounds.
+    tool_budget: int | None = None
+    tool_budget_baseline: int = 0
 
 
 def _validate_config(cfg: RunnerConfig) -> None:
@@ -503,6 +513,14 @@ class BudgetLedger:
 
     SCHEMA = 1
 
+    # The declared reservation strategy and the executed reservation are the
+    # same source: the policy text is generated from these two numbers, so a
+    # subclass that changes the algorithm cannot leave a stale description
+    # behind (review F10).
+    reserve_strategy = "conservative_upper_bound"
+    reserve_input_tokens_per_byte = 0.25
+    reserve_input_padding_tokens = 256
+
     def __init__(self, path: Path, data: dict, pricing: Pricing, max_output_tokens: int, cap_usd: float):
         self.path = Path(path)
         self.data = data
@@ -522,11 +540,33 @@ class BudgetLedger:
         data["pricing"] = asdict(pricing)
         data["reserve_policy"] = self._reserve_policy()
 
+    def input_estimate_text(self) -> str:
+        per_byte = self.reserve_input_tokens_per_byte
+        if per_byte == 1:
+            base = "request_body_bytes"
+        elif per_byte == 0.25:
+            base = "request_body_bytes/4"
+        else:
+            base = f"{per_byte} * request_body_bytes"
+        return (f"{base} + {self.reserve_input_padding_tokens} tokens, "
+                "priced as cache-miss input")
+
+    def estimate_reserve_usd(self, request_body_bytes: int) -> float:
+        """The one function that both the amount and its description come from."""
+        input_tokens_estimate = (
+            request_body_bytes * self.reserve_input_tokens_per_byte
+            + self.reserve_input_padding_tokens
+        )
+        return (
+            input_tokens_estimate * self.pricing.input_per_mtoken_usd
+            + self.max_output_tokens * self.pricing.output_per_mtoken_usd
+        ) / 1_000_000
+
     def _reserve_policy(self) -> dict:
         return {
-            "strategy": "conservative_upper_bound",
-            "input_estimate": "request_body_bytes/4 + 256 tokens, priced as cache-miss input",
-            "output_estimate": "max_output_tokens priced at output rate",
+            "strategy": self.reserve_strategy,
+            "input_estimate": self.input_estimate_text(),
+            "output_estimate": f"max_output_tokens ({self.max_output_tokens}) priced at output rate",
             "max_output_tokens": self.max_output_tokens,
             "estimated": True,
         }
@@ -987,13 +1027,16 @@ def _stop_child(process: subprocess.Popen, graceful_timeout_s: float, kill_timeo
     return result
 
 
-def _wait_for_child(process: subprocess.Popen, prompt, timeout_s: float, interrupt_event, poll_s: float = 0.1) -> str:
-    """Feed the prompt and wait, checking for timeout and interrupts.
+def _wait_for_child(process: subprocess.Popen, prompt, timeout_s: float, interrupt_event, poll_s: float = 0.1,
+                    budget=None) -> str:
+    """Feed the prompt and wait, checking for timeout, interrupts and budget.
 
     Popen.communicate(timeout=...) never kills the child on timeout, so the
     wait is owned here: on timeout the caller performs the bounded graceful
     stop and tree kill itself. KeyboardInterrupt (real SIGINT or the injected
-    event) propagates into the shared finalization.
+    event) propagates into the shared finalization. `budget` is polled each
+    iteration and, when it returns a reason, the wait ends with that reason so
+    the caller can stop the child the same way a timeout does.
     """
     if prompt is not None:
         def _feed():
@@ -1020,7 +1063,87 @@ def _wait_for_child(process: subprocess.Popen, prompt, timeout_s: float, interru
             process.wait(timeout=min(poll_s, remaining))
             return "completed"
         except subprocess.TimeoutExpired:
+            if budget is not None:
+                reason = budget()
+                if reason:
+                    return reason
             continue
+
+
+def _child_event_rows(path: Path) -> list:
+    """Child events, unwrapping the headless journal envelope.
+
+    The journal wraps each event in `{"run_id", "seq", "event": {...}}`; the
+    counting views work on the unwrapped events.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    try:
+        raw_rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError):
+        return []
+    return [
+        row["event"] if isinstance(row, dict) and isinstance(row.get("event"), dict) else row
+        for row in raw_rows
+    ]
+
+
+class _ToolBudgetWatcher:
+    """Counts this segment's finished tool calls from its own event journal.
+
+    Incremental (byte offset plus a carried partial line), so a long segment
+    does not re-read its journal on every poll, and the accounting is the same
+    event vocabulary the receipts already use (`tool_finished`).
+    """
+
+    def __init__(self, path: Path, budget: int, baseline: int = 0):
+        self.path = Path(path)
+        self.budget = int(budget)
+        self.used = int(baseline)
+        self.baseline = int(baseline)
+        self._offset = 0
+        self._partial = ""
+
+    def poll(self):
+        if not self.path.exists():
+            # No journal yet: an already-spent campaign budget still stops the
+            # child, but there is nothing new to count.
+            return "tool_budget_exhausted" if self.used >= self.budget else None
+        try:
+            with self.path.open("rb") as handle:
+                handle.seek(self._offset)
+                chunk = handle.read()
+                self._offset = handle.tell()
+        except OSError:
+            return None
+        text = self._partial + chunk.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        self._partial = lines.pop()
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = row.get("event") if isinstance(row, dict) and isinstance(row.get("event"), dict) else row
+            if isinstance(event, dict) and event.get("type") == "tool_finished":
+                self.used += 1
+        return "tool_budget_exhausted" if self.used >= self.budget else None
+
+    def snapshot(self) -> dict:
+        return dict(budget=self.budget, baseline=self.baseline, used=self.used,
+                    segment_used=max(self.used - self.baseline, 0),
+                    exhausted=self.used >= self.budget)
+
+
+def _tool_budget_watcher(cfg: RunnerConfig, out_dir: Path):
+    """`None` when the campaign did not set a tool budget (previous behaviour)."""
+    if cfg.tool_budget is None:
+        return None
+    return _ToolBudgetWatcher(out_dir / "events.jsonl", cfg.tool_budget, cfg.tool_budget_baseline)
 
 
 @dataclass
@@ -1040,6 +1163,7 @@ class _RunState:
     segment_created: bool = False
     child_exit_code: int | None = None
     child_command: list | None = None
+    tool_budget: object | None = None
     protected_before: dict | None = None
     metadata_initial: dict = field(default_factory=dict)
     cleanup: dict = field(default_factory=dict)
@@ -1050,22 +1174,27 @@ class _RunState:
 def _prepare_segment_files(cfg: RunnerConfig, state: _RunState, campaign_dir: Path, work_dir: Path, env: dict) -> None:
     out_dir = state.out_dir
     py = (env.get("AGENT_PYTHON") if env else None) or sys.executable
-    grants = [
-        {
-            "id": "app-write",
-            "risk": "WorkspaceWrite",
-            "target": {"workspace_path_prefix": "app"},
-            "constraint": {"max_content_bytes": 160000},
-            "expires_at_ms": int((time.time() + 1800) * 1000),
-        },
-        {
-            "id": "python-tests",
-            "risk": "ProcessExecution",
-            "target": {"exec_argv_prefix": [py]},
-            "constraint": {"max_runs": 48},
-            "expires_at_ms": int((time.time() + 1800) * 1000),
-        },
-    ]
+    if cfg.grants:
+        # A caller that owns the frozen campaign budget supplies the grants; the
+        # short-test defaults below are not sized for a multi-hour task (F09).
+        grants = copy.deepcopy(cfg.grants)
+    else:
+        grants = [
+            {
+                "id": "app-write",
+                "risk": "WorkspaceWrite",
+                "target": {"workspace_path_prefix": "app"},
+                "constraint": {"max_content_bytes": 160000},
+                "expires_at_ms": int((time.time() + 1800) * 1000),
+            },
+            {
+                "id": "python-tests",
+                "risk": "ProcessExecution",
+                "target": {"exec_argv_prefix": [py]},
+                "constraint": {"max_runs": 48},
+                "expires_at_ms": int((time.time() + 1800) * 1000),
+            },
+        ]
     (out_dir / "grants.json").write_text(json.dumps(grants), encoding="utf-8")
     prompt = _resolve_prompt(cfg, campaign_dir, py)
     (out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
@@ -1136,6 +1265,7 @@ def _finalize(cfg: RunnerConfig, state: _RunState, campaign_dir: Path, work_dir:
         "launch_failed": "child_launch_failed",
         "interrupted": "interrupted",
         "child_wait_timeout": "child_wait_timeout",
+        "tool_budget_exhausted": "tool_budget_exhausted",
         "internal_error": "internal_error",
         "budget_ledger_unreadable": "budget_ledger_unreadable",
         "invalid_config": "invalid_config",
@@ -1153,20 +1283,7 @@ def _finalize(cfg: RunnerConfig, state: _RunState, campaign_dir: Path, work_dir:
         protected_unchanged = False
     if not protected_unchanged and state.segment_created:
         categories.add("protected_modified")
-    event_rows = []
-    events_path = state.out_dir / "events.jsonl"
-    if events_path.exists():
-        try:
-            raw_rows = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-            # The headless journal wraps each event in an envelope row
-            # ({"run_id", "seq", "event": {...}}); summary counting works on
-            # the unwrapped events.
-            event_rows = [
-                row["event"] if isinstance(row, dict) and isinstance(row.get("event"), dict) else row
-                for row in raw_rows
-            ]
-        except (OSError, json.JSONDecodeError):
-            event_rows = []
+    event_rows = _child_event_rows(state.out_dir / "events.jsonl")
     terminals = [row for row in event_rows if isinstance(row, dict) and row.get("type") in ("turn_failed", "turn_completed", "recovery_required")]
     if any(row.get("type") == "recovery_required" for row in terminals):
         categories.add("recovery_required")
@@ -1243,6 +1360,8 @@ def _finalize(cfg: RunnerConfig, state: _RunState, campaign_dir: Path, work_dir:
         metadata["launch_error"] = state.error
     if state.child_command is not None:
         metadata["child_command"] = state.child_command
+    if state.tool_budget is not None:
+        metadata["tool_budget"] = state.tool_budget.snapshot()
     summary = {
         "api_protocol": state.api_protocol,
         "outcome": outcome,
@@ -1258,6 +1377,7 @@ def _finalize(cfg: RunnerConfig, state: _RunState, campaign_dir: Path, work_dir:
         "session": event_rows[-1] if event_rows else None,
         "requests": requests,
         "budget": budget_receipt,
+        "tool_budget": state.tool_budget.snapshot() if state.tool_budget is not None else None,
         "cleanup": cleanup,
     }
     # receipts land in this order so at least one complete terminal record
@@ -1348,10 +1468,17 @@ def run_segment(cfg: RunnerConfig) -> int:
         with (out_dir / "stderr.log").open("w", encoding="utf-8") as error_handle, (out_dir / "stdout.log").open("w", encoding="utf-8") as stdout_handle:
             state.process = _spawn_child(command, work_dir, env, stdout_handle, error_handle)
         (out_dir / "pid.txt").write_text(str(state.process.pid), encoding="utf-8")
-        wait_outcome = _wait_for_child(state.process, prompt, cfg.child_wait_timeout_s, cfg.interrupt_event)
+        state.tool_budget = _tool_budget_watcher(cfg, out_dir)
+        wait_outcome = _wait_for_child(state.process, prompt, cfg.child_wait_timeout_s, cfg.interrupt_event,
+                                       budget=state.tool_budget.poll if state.tool_budget is not None else None)
         if state.process.returncode is not None:
             state.child_exit_code = state.process.returncode
-        state.outcome = "completed" if wait_outcome == "completed" else "child_wait_timeout"
+        if wait_outcome == "completed":
+            state.outcome = "completed"
+        elif wait_outcome == "tool_budget_exhausted":
+            state.outcome = "tool_budget_exhausted"
+        else:
+            state.outcome = "child_wait_timeout"
     except KeyboardInterrupt:
         state.outcome = "interrupted"
     except ChildLaunchError as error:
