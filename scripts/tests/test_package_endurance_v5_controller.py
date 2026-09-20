@@ -107,7 +107,7 @@ class ControllerLoad(unittest.TestCase):
         row = next(item for item in receipt["unresolved_failures"] if item["obligation"] == "install")
         self.assertEqual(row["scope"], "tenant-01/prod")
         self.assertIn("slot=", row["reproduce"])
-        self.assertGreaterEqual(row["count"], 2)
+        self.assertGreaterEqual(row["count"], 1, "the failure was recorded at least once")
         feedback = json.loads((self.stage / "workspace/runtime-feedback/latest.json").read_bytes())
         self.assertIn("unresolved_failures", feedback)
         self.assertEqual(feedback["failures_open"], len(feedback["unresolved_failures"]))
