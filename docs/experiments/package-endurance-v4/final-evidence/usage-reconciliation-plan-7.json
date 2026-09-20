@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "operation": "reconcile_captured_usage",
+  "stage": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\package-endurance-v4-20260920\\model",
+  "segment": "model-develop",
+  "attempt_id": 7,
+  "request": 7,
+  "api_protocol": "chat",
+  "bindings": {
+    "budget-ledger.json": "71a12b81adb6956416fded679e19431ad1a312e549208592e4b12c5e65d7c679",
+    "model-develop/metadata.json": "4d39314f48f57e70808af2a2165b901ce50e821623ad16161b931930cac145fb",
+    "model-develop/summary.json": "d8c9b010b406d2250bad2712336e4aced57c0b026566612b9a9ca4408fc81800",
+    "model-develop/usage-ledger.json": "6dce38efb5a57db45341553705af2c85f8459de991e1cbe3bbf46c7e3538d86d",
+    "model-develop/request-007.json": "66ba174a0107f149092381e645a2b910083d73e4de7a3abe0f39b2dfb614509a",
+    "model-develop/response-007.sse": "86e5d4820fcadcc1792f520cdc0125b9fd68637594ccc9168c6e4499eceb30b0"
+  },
+  "response_bytes": 2706497,
+  "usage": {
+    "input_tokens": 11254,
+    "output_tokens": 8192,
+    "cached_input_tokens": 8192,
+    "usage_shape": "prompt_cache_hit_tokens"
+  },
+  "prior_unknown_usd": 0.024923699999999997,
+  "settled_usd": 0.010798152,
+  "amounts_are_estimates": true,
+  "plan_id": "1d09022c3e398d6360130f2f8f3987c5c36cabfb09bb16a2a287f30a79d7c041"
+}

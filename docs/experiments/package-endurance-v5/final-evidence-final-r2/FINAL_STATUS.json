@@ -1,0 +1,319 @@
+{
+  "status": "NOT_ACCEPTED_MODEL_BUDGET_EXHAUSTED",
+  "campaign": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\package-endurance-v5-20260921-r3",
+  "head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "provider_paid_calls": 262,
+  "main_decisions": 260,
+  "estimated_committed_usd": 1.4982220679999996,
+  "reserved_usd": 0.0,
+  "unknown_usd": 0.0,
+  "cap_stopped": false,
+  "preflight": {
+    "status": "READY",
+    "campaign_kind": "v5_online_backup_continuous",
+    "protected_files": 496,
+    "oracle_calibration": {
+      "summary": {
+        "cut_id": "475c187d0239cc6550d4de06f79c0d41c3717c7f8e56c5c92125682577a092b9",
+        "scopes": 1,
+        "receipts": 1,
+        "manifests": 1,
+        "objects": 1,
+        "outbox": 0
+      },
+      "rejected_mutations": [
+        "object",
+        "pointer",
+        "receipt"
+      ]
+    },
+    "public_test_stdout": "",
+    "provider_paid_calls": 0
+  },
+  "segments": [
+    {
+      "api_protocol": "chat",
+      "outcome": "completed",
+      "categories": [
+        "child_nonzero"
+      ],
+      "exit_code": 10,
+      "exit": 1,
+      "child_exit_code": 1,
+      "elapsed": 87.3,
+      "rounds": 41,
+      "tool_calls": 76,
+      "protected_unchanged": true,
+      "terminals": [
+        {
+          "type": "turn_failed",
+          "turn_id": "3eb45b0f-c8ac-4a4d-8e86-07987a055067",
+          "task_id": "f9b1e916-3575-40e8-b7c5-c2ff1a73ecf9",
+          "class": "model_output_limit",
+          "retryable": false
+        }
+      ],
+      "session": {
+        "approval_denied": false,
+        "exit": 1,
+        "kind": "session_end",
+        "round_budget": false,
+        "schema": "agent.headless.v1",
+        "status": "failed",
+        "stop": "model_output_limit",
+        "task_completed": false,
+        "task_state": "awaiting_operator_review"
+      },
+      "requests": 41,
+      "budget": {
+        "api_protocol": "chat",
+        "cap_usd": 2.0,
+        "inherited_ledger": false,
+        "cap_stopped": false,
+        "committed_usd": 0.2502674760000001,
+        "reserved_usd": 0.0,
+        "unknown_usd": 0.0,
+        "reserve_policy": {
+          "strategy": "wire_bytes_plus_8192_and_full_output",
+          "max_output_tokens": 8192,
+          "schema": 1,
+          "kind": "v5_online_backup_continuous",
+          "created_epoch": 1789920881.7043028,
+          "deadline_epoch": 1789942481.7043028,
+          "main_decisions": 260,
+          "provider_attempts": 300,
+          "tool_attempts": 900,
+          "input_tokens": 8000000,
+          "output_tokens": 220000,
+          "estimated_cost_usd": 2.0,
+          "api_protocol": "chat",
+          "chat_thinking": "disabled",
+          "model": "deepseek-flash",
+          "target_load_seconds": 7200,
+          "final_candidate_load_seconds": 7200
+        }
+      },
+      "cleanup": {
+        "order": [
+          "relay_accept_stopped",
+          "child_stop:already_exited"
+        ],
+        "child": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "retained_member_handles": 15,
+          "captured_total_processes": 15,
+          "active_before_kill": 0,
+          "final_total_processes": 15,
+          "observed_processes": 15,
+          "retained_members_exited": true
+        },
+        "forced_unknown_attempts": []
+      }
+    },
+    {
+      "api_protocol": "chat",
+      "outcome": "completed",
+      "categories": [
+        "child_nonzero"
+      ],
+      "exit_code": 10,
+      "exit": 3,
+      "child_exit_code": 3,
+      "elapsed": 384.17,
+      "rounds": 219,
+      "tool_calls": 319,
+      "protected_unchanged": true,
+      "terminals": [
+        {
+          "type": "turn_completed"
+        }
+      ],
+      "session": {
+        "approval_denied": true,
+        "exit": 3,
+        "kind": "session_end",
+        "round_budget": false,
+        "schema": "agent.headless.v1",
+        "status": "approval_denied",
+        "stop": "approval_denied",
+        "task_completed": false,
+        "task_state": "awaiting_operator_review"
+      },
+      "requests": 221,
+      "budget": {
+        "api_protocol": "chat",
+        "cap_usd": 2.0,
+        "inherited_ledger": true,
+        "cap_stopped": false,
+        "committed_usd": 1.4982220679999996,
+        "reserved_usd": 0.0,
+        "unknown_usd": 0.0,
+        "reserve_policy": {
+          "strategy": "wire_bytes_plus_8192_and_full_output",
+          "max_output_tokens": 8192,
+          "schema": 1,
+          "kind": "v5_online_backup_continuous",
+          "created_epoch": 1789920881.7043028,
+          "deadline_epoch": 1789942481.7043028,
+          "main_decisions": 260,
+          "provider_attempts": 300,
+          "tool_attempts": 900,
+          "input_tokens": 8000000,
+          "output_tokens": 220000,
+          "estimated_cost_usd": 2.0,
+          "api_protocol": "chat",
+          "chat_thinking": "disabled",
+          "model": "deepseek-flash",
+          "target_load_seconds": 7200,
+          "final_candidate_load_seconds": 7200
+        }
+      },
+      "cleanup": {
+        "order": [
+          "relay_accept_stopped",
+          "child_stop:already_exited"
+        ],
+        "child": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "retained_member_handles": 54,
+          "captured_total_processes": 54,
+          "active_before_kill": 0,
+          "final_total_processes": 54,
+          "observed_processes": 54,
+          "retained_members_exited": true
+        },
+        "forced_unknown_attempts": []
+      }
+    }
+  ],
+  "task_ids": [
+    "f9b1e916-3575-40e8-b7c5-c2ff1a73ecf9"
+  ],
+  "protected_files": 496,
+  "protected_unchanged": true,
+  "candidate_sha256": "0c5153a532c79764d7cfad27134edb7b685b7890bbda60ec191ca920c8bb366a",
+  "candidate_present": true,
+  "candidate_local_tests": {
+    "total": 27,
+    "errors": 9,
+    "exit_code": 1
+  },
+  "continuous_load": {
+    "feedback": {
+      "archives": 0,
+      "batch": 97,
+      "crashes": [
+        {
+          "crash": {
+            "returncode": 0,
+            "stderr": "",
+            "value": {
+              "error": "receipt bound",
+              "error_type": "ValueError",
+              "expected_error": true,
+              "ok": false
+            }
+          },
+          "destination_present": false,
+          "index": 5
+        }
+      ],
+      "failed": 48,
+      "instruction": "Inspect this report, preserve prior behavior, and repair the next concrete failure.",
+      "latest": {
+        "archives": 0,
+        "batch": 97,
+        "candidate": {
+          "returncode": 0,
+          "stderr": "",
+          "value": {
+            "ok": true,
+            "value": {
+              "environment": "prod",
+              "generation": 9,
+              "key": "release-000097",
+              "manifest_sha256": "7b255c3fbe5b7d66a4c3fcdd3c0f15a2246ebb05ca7e9dbbd49f5cc8f3eb7408",
+              "tenant": "tenant-01"
+            }
+          }
+        },
+        "elapsed": 187.626,
+        "failed": 48,
+        "operation": "install",
+        "passed": 0,
+        "scope": [
+          "tenant-01",
+          "prod"
+        ]
+      },
+      "passed": 0,
+      "status": "RUNNING"
+    },
+    "event_records": 524,
+    "source_summary": {
+      "cut_id": "2f8ccf883de58e844144550e92a38f1ff735e5227379e0f66eefe080962cbddd",
+      "scopes": 13,
+      "receipts": 218,
+      "manifests": 91,
+      "objects": 357,
+      "outbox": 1
+    },
+    "controller_outputs": [
+      "continuous-load",
+      "continuous-load-resume-01",
+      "continuous-load-resume-02",
+      "continuous-load-resume-03"
+    ]
+  },
+  "independent_oracle": {
+    "calibration": {
+      "summary": {
+        "cut_id": "475c187d0239cc6550d4de06f79c0d41c3717c7f8e56c5c92125682577a092b9",
+        "scopes": 1,
+        "receipts": 1,
+        "manifests": 1,
+        "objects": 1,
+        "outbox": 0
+      },
+      "rejected_mutations": [
+        "object",
+        "pointer",
+        "receipt"
+      ]
+    },
+    "final_source_summary": {
+      "cut_id": "2f8ccf883de58e844144550e92a38f1ff735e5227379e0f66eefe080962cbddd",
+      "scopes": 13,
+      "receipts": 218,
+      "manifests": 91,
+      "objects": 357,
+      "outbox": 1
+    }
+  },
+  "limits": {
+    "main_decisions": 260,
+    "provider_attempts": 300,
+    "tool_attempts": 900,
+    "estimated_cost_usd": 2.0,
+    "target_load_seconds": 7200
+  },
+  "remote_ci": "NOT_RUN",
+  "submitted": false,
+  "notes": [
+    "First model segment stopped at model_output_limit after 41 rounds; no candidate file existed.",
+    "Same TaskId/workspace repair segment used 219 rounds and stopped with approval_denied after turn_completed.",
+    "Candidate still refused live SQLite WAL sidecars and initially capped historical receipts.",
+    "Continuous load was stopped after the model budget ended; it never reached a passing archive cycle.",
+    "No manual edits were applied to the candidate workspace after model termination."
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "status": "REPRODUCED",
+  "defect": "public_work_text_vs_host_decoder_budget",
+  "cases": [
+    {
+      "family": "ascii",
+      "chars": 4096,
+      "utf8_bytes": 4096,
+      "sha256": "a2e659dacb4691e887ac0139f8893d04764ee197d70fb73d3190d56113d18e3e",
+      "within_public_200000_char_contract": true,
+      "outcome": "accepted",
+      "receipt": {
+        "disposition": "applied",
+        "task_id": "2e333b76-31b6-4ca3-8f03-60fb77fc3f04"
+      }
+    },
+    {
+      "family": "ascii",
+      "chars": 4097,
+      "utf8_bytes": 4097,
+      "sha256": "3e97197f4b8d46a893067c94ab15e195e3d97fb5f24eede5ef047b571240d92b",
+      "within_public_200000_char_contract": true,
+      "outcome": "connection_closed",
+      "error": "host closed mid-frame",
+      "host_still_alive": true
+    },
+    {
+      "family": "utf8",
+      "chars": 1365,
+      "utf8_bytes": 4095,
+      "sha256": "b708e99b48f323615ed05fe212f71f3bf066feed10da37322406e87846ba5a87",
+      "within_public_200000_char_contract": true,
+      "outcome": "accepted",
+      "receipt": {
+        "disposition": "applied",
+        "task_id": "540a6fd5-e337-440b-9441-2d979d1b9c51"
+      }
+    },
+    {
+      "family": "utf8",
+      "chars": 1366,
+      "utf8_bytes": 4098,
+      "sha256": "1171652625e7e04ebe33dfd7c15addfbc5cca24ddacbb0bc8f514d48b7409107",
+      "within_public_200000_char_contract": true,
+      "outcome": "connection_closed",
+      "error": "host closed mid-frame",
+      "host_still_alive": true
+    }
+  ],
+  "provider_paid_calls": 0
+}

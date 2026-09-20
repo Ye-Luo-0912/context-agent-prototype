@@ -1,0 +1,170 @@
+{
+  "status": "FAIL",
+  "results": [
+    {
+      "case": "valid_history",
+      "status": "FAIL",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt\"],\"ok\":false,\"receipts\":2}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt"
+          ],
+          "ok": false,
+          "receipts": 2
+        },
+        "error_type": "AssertionError",
+        "error": "('valid_history', True, {'errors': ['receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt'], 'ok': False, 'receipts': 2})",
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "corrupt_blob",
+      "status": "FAIL",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"receipt tenant-a/prod/first: corrupt blob object 0153a4b906066456df4a593b3f1eb45dac845c4d49b6b47831062dd9ca550c6a (SHA256 mismatch)\",\"receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt\"],\"ok\":false,\"receipts\":2}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "receipt tenant-a/prod/first: corrupt blob object 0153a4b906066456df4a593b3f1eb45dac845c4d49b6b47831062dd9ca550c6a (SHA256 mismatch)",
+            "receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt"
+          ],
+          "ok": false,
+          "receipts": 2
+        },
+        "error_type": "AssertionError",
+        "error": "auditor mutated its repository",
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "corrupt_manifest",
+      "status": "FAIL",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt\",\"receipt tenant-a/prod/second: corrupt manifest 2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a (SHA256 mismatch)\"],\"ok\":false,\"receipts\":2}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt",
+            "receipt tenant-a/prod/second: corrupt manifest 2c227114c18b0921f3b670e7d31bb60cae871ab9efd90a9964adbb5b2ad2976a (SHA256 mismatch)"
+          ],
+          "ok": false,
+          "receipts": 2
+        },
+        "error_type": "AssertionError",
+        "error": "auditor mutated its repository",
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "orphan_pointer_no_receipts",
+      "status": "FAIL",
+      "detail": {
+        "exit": 0,
+        "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":0}\n",
+        "stderr": "",
+        "output": {
+          "errors": [],
+          "ok": true,
+          "receipts": 0
+        },
+        "error_type": "AssertionError",
+        "error": "('orphan_pointer_no_receipts', False, {'errors': [], 'ok': True, 'receipts': 0})",
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "pointer_mismatch",
+      "status": "FAIL",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt\",\"receipt tenant-a/prod/second: pointer tenant-a/prod does not match durable receipt\"],\"ok\":false,\"receipts\":2}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "receipt tenant-a/prod/first: pointer tenant-a/prod does not match durable receipt",
+            "receipt tenant-a/prod/second: pointer tenant-a/prod does not match durable receipt"
+          ],
+          "ok": false,
+          "receipts": 2
+        },
+        "error_type": "AssertionError",
+        "error": "auditor mutated its repository",
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "unsafe_digest",
+      "status": "FAIL",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"receipt[0]: unsafe manifest digest name '../../outside'\",\"receipt[1]: unsafe manifest digest name '../../outside'\"],\"ok\":false,\"receipts\":2}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "receipt[0]: unsafe manifest digest name '../../outside'",
+            "receipt[1]: unsafe manifest digest name '../../outside'"
+          ],
+          "ok": false,
+          "receipts": 2
+        },
+        "error_type": "AssertionError",
+        "error": "auditor mutated its repository",
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    }
+  ],
+  "audit_source_sha256": "50ceaf45318ad18a7acd3f7c1f891900f47dd12f289f07cd5fad16f3abd634c2"
+}

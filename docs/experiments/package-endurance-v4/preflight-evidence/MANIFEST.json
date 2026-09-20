@@ -1,0 +1,18 @@
+{
+  "algorithm": "sha256",
+  "files": {
+    "campaign.json": "871087ae42c09d2d08ff270774b83364c7995f88762199f0a81e964a38fadc65",
+    "chat-thinking-binaries.log.gz": "66071b0a980b0199b74c18cb2a13f9179b1242b20b2df461709f15f9804f46ac",
+    "chat-thinking-clippy.log.gz": "b07f8ef1883787a86e8ac778d51d60a0e6460808aeec19c9d67b0bf89c694dcd",
+    "chat-thinking-compose-green.log.gz": "badc2777e87e061f2bdabfa0ae9a1d0d7bb88c49813dfe3c15465c8489086488",
+    "chat-thinking-compose-red.log.gz": "27dda8d25b142ede358a9eaadc3dcef33220c8536c91479f82eee120f83c02d4",
+    "chat-thinking-provider-focused.log.gz": "a2899347d737db6fd04aca200a8e86008c5d7697c5066d88e55be013dc21b2d8",
+    "chat-thinking-two-crate-tests.log.gz": "7c1c457f93c198fac8238b1d34eed75d29bea0a656c84c01cde53fdc60fd059b",
+    "oracle-absent-candidate.json": "af6cebd860dc782aaae5146e00a1f66503856e734a8fbb774218de87b2ab8796",
+    "public-baseline-red.log": "fdc81193550082ba5a4846da71d791c108314ac274f74469c3b23dded7665b45",
+    "runner-tests.log.gz": "961e9d296cea47e683d6d902df4c0d5573366ddf812f6ec070ccb0243c5fcf9b",
+    "STATUS.json": "ac3c7e4dcede2aebec0fde905e846095286551319d7e401256cc6b5f6716a6c2",
+    "v4-local-tests.log.gz": "327c536c775329b4bc3ce582feb160db5ae18f18ab249b4c5a7ac868a644892e",
+    "workspace-check.log.gz": "da32771d45628cabcea94707f168c4bcf31cdcd1aa7bb507c625fcda4c2d3578"
+  }
+}

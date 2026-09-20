@@ -1,0 +1,61 @@
+{
+  "outcome": "completed",
+  "categories": [
+    "child_nonzero"
+  ],
+  "exit_code": 10,
+  "exit": 1,
+  "child_exit_code": 1,
+  "elapsed": 38.34,
+  "rounds": 8,
+  "tool_calls": 15,
+  "protected_unchanged": true,
+  "terminals": [
+    {
+      "type": "turn_failed",
+      "turn_id": "b480d2a2-4f68-4d48-83ca-d2b6452197dd",
+      "task_id": "9be63252-329a-4fd7-81f9-57bffa9f15ea",
+      "class": "model_output_limit",
+      "retryable": false
+    }
+  ],
+  "session": {
+    "approval_denied": false,
+    "exit": 1,
+    "kind": "session_end",
+    "round_budget": false,
+    "schema": "agent.headless.v1",
+    "status": "failed",
+    "stop": "model_output_limit",
+    "task_completed": false,
+    "task_state": "awaiting_operator_review"
+  },
+  "requests": 8,
+  "budget": {
+    "cap_usd": 3.0,
+    "inherited_ledger": false,
+    "cap_stopped": false,
+    "committed_usd": 0.019981812,
+    "reserved_usd": 0.0,
+    "unknown_usd": 0.0,
+    "reserve_policy": {
+      "strategy": "conservative_upper_bound",
+      "input_estimate": "request_body_bytes/4 + 256 tokens, priced as cache-miss input",
+      "output_estimate": "max_output_tokens priced at output rate",
+      "max_output_tokens": 8192,
+      "estimated": true
+    }
+  },
+  "cleanup": {
+    "order": [
+      "relay_accept_stopped",
+      "child_stop:already_exited"
+    ],
+    "child": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "already_exited"
+    },
+    "forced_unknown_attempts": []
+  }
+}

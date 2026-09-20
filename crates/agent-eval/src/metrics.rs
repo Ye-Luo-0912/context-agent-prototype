@@ -115,6 +115,10 @@ pub struct RunMetrics {
     pub reconfirmed_evidence_calls: u64,
     /// 无前沿推进动作的连击峰值（advisory 阈值为 5）。
     pub frontier_no_advance_peak: u64,
+    /// 无**交付**推进动作的连击峰值：只有产物变更、通过的验证或义务解除
+    /// 会解除它，反复读到被外部控制器改写的外部反馈文件不会
+    /// （advisory 阈值同为 5）。与知识前沿分开，用于观测"读监控不算进展"。
+    pub frontier_delivery_no_advance_peak: u64,
     /// 因 world revision 推进而失效的前沿证据条数。
     pub evidence_invalidations: u64,
     /// 结算 episode 会计：进入 `SettledCandidate` 即开一笔 episode，
@@ -753,11 +757,13 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
             RuntimeEvent::ExecutionFrontier {
                 delta,
                 actions_since_frontier_advance,
+                actions_since_delivery_advance,
                 invalidated,
                 ..
             } => {
                 // 收敛指标：可证明推进数、冗余证据调用、
-                // 无推进连击峰值与证据失效数，全部来自事件流。
+                // 无推进连击峰值、无**交付**推进连击峰值与证据失效数，
+                // 全部来自事件流。
                 if delta.advances_frontier() {
                     metrics.frontier_advances += 1;
                 }
@@ -770,6 +776,9 @@ pub fn aggregate_metrics(events: &[RuntimeEventEnvelope]) -> RunMetrics {
                 metrics.frontier_no_advance_peak = metrics
                     .frontier_no_advance_peak
                     .max(u64::from(*actions_since_frontier_advance));
+                metrics.frontier_delivery_no_advance_peak = metrics
+                    .frontier_delivery_no_advance_peak
+                    .max(u64::from(*actions_since_delivery_advance));
                 metrics.evidence_invalidations += *invalidated;
             }
             RuntimeEvent::ExecutionBatchSettled {
@@ -3433,10 +3442,59 @@ mod tests {
         RuntimeEvent::ExecutionFrontier {
             delta: FrontierDelta::EvidenceAdvanced,
             actions_since_frontier_advance: 0,
+            actions_since_delivery_advance: 0,
             evidence_revision: 1,
             invalidated: 0,
             settlement: Some(SettlementLabel::SettledCandidate),
         }
+    }
+
+    #[test]
+    fn delivery_debt_stays_visible_while_knowledge_keeps_advancing() {
+        // 外部控制器反复改写反馈文件：每轮都是新的知识（知识前沿推进），
+        // 但没有产物变更或验收推进。交付连击必须持续累计，且与知识连击分开。
+        let run = RunId::new();
+        let knowledge_advance = |seq: u64, delivery_debt: u32| {
+            envelope(
+                run,
+                seq,
+                RuntimeEvent::ExecutionFrontier {
+                    delta: FrontierDelta::EvidenceAdvanced,
+                    actions_since_frontier_advance: 0,
+                    actions_since_delivery_advance: delivery_debt,
+                    evidence_revision: u64::from(delivery_debt),
+                    invalidated: 0,
+                    settlement: None,
+                },
+            )
+        };
+        let events = vec![
+            knowledge_advance(1, 1),
+            knowledge_advance(2, 2),
+            knowledge_advance(3, 6),
+            envelope(
+                run,
+                4,
+                RuntimeEvent::ExecutionFrontier {
+                    delta: FrontierDelta::ObservedWorldChange,
+                    actions_since_frontier_advance: 0,
+                    actions_since_delivery_advance: 0,
+                    evidence_revision: 9,
+                    invalidated: 0,
+                    settlement: None,
+                },
+            ),
+        ];
+        let metrics = aggregate_metrics(&events);
+        assert_eq!(
+            metrics.frontier_delivery_no_advance_peak, 6,
+            "reading an externally updated file is knowledge, not delivery"
+        );
+        assert_eq!(
+            metrics.frontier_no_advance_peak, 0,
+            "the knowledge frontier did keep advancing"
+        );
+        assert_eq!(metrics.frontier_advances, 4);
     }
 
     #[test]
@@ -3487,6 +3545,7 @@ mod tests {
         let reopened = || RuntimeEvent::ExecutionFrontier {
             delta: FrontierDelta::ObservedWorldChange,
             actions_since_frontier_advance: 0,
+            actions_since_delivery_advance: 0,
             evidence_revision: 2,
             invalidated: 1,
             settlement: Some(SettlementLabel::Working),
@@ -3562,6 +3621,7 @@ mod tests {
                 RuntimeEvent::ExecutionFrontier {
                     delta: FrontierDelta::NoProgress,
                     actions_since_frontier_advance: 0,
+                    actions_since_delivery_advance: 0,
                     evidence_revision: 1,
                     invalidated: 0,
                     settlement: None,
@@ -3589,6 +3649,7 @@ mod tests {
                 RuntimeEvent::ExecutionFrontier {
                     delta: FrontierDelta::ObservedWorldChange,
                     actions_since_frontier_advance: 0,
+                    actions_since_delivery_advance: 0,
                     evidence_revision: 2,
                     invalidated: 1,
                     settlement: None,
@@ -3666,6 +3727,7 @@ mod tests {
         let reopened = RuntimeEvent::ExecutionFrontier {
             delta: FrontierDelta::ObservedWorldChange,
             actions_since_frontier_advance: 0,
+            actions_since_delivery_advance: 0,
             evidence_revision: 2,
             invalidated: 1,
             settlement: Some(SettlementLabel::Working),

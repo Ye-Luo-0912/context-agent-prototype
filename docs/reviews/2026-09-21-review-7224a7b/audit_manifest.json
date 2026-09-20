@@ -1,0 +1,31 @@
+{
+  "schema": 1,
+  "repository": "Ye-Luo-0912/context-agent-prototype",
+  "branch": "codex/runtime-endurance-full-plan",
+  "source_commit": "7224a7baa8910881b9efaa77f14013781137ff49",
+  "campaign_receipt_head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "oracle_git_blob": "b459e27152c6b2ea8cb8416ce25cc5002eebe3ab",
+  "review_scope": "V5 full-source root-cause audit plus selected shared-runner and Runtime execution paths; not a full-repository line-by-line review",
+  "executed": [
+    "4 synthetic oracle counterexamples against hash-verified source",
+    "SQLite WAL read visibility microprobe"
+  ],
+  "not_executed": [
+    "Rust compilation",
+    "cargo test",
+    "dotnet build/test",
+    "live provider calls",
+    "candidate application replay",
+    "concurrency/soak rerun"
+  ],
+  "probe_exit_code": 1,
+  "oracle_invariant_failures": 4,
+  "files_sha256": {
+    "README.md": "d742f103f3ac6e78c72c43e13d5fc1b3639f7989d53267a14cc3800f47dfcbba",
+    "REVIEW_7224a7b.md": "407064a405a931be7ab6fa24acf891f46a67f249ac2efa32a2f727f9ec03517a",
+    "probe_results.json": "5ec5de8836c3a2549a05c2dc9d69db003e2a8a35314c79d1e0bf825104c36f1b",
+    "probe_stdout.log": "5ec5de8836c3a2549a05c2dc9d69db003e2a8a35314c79d1e0bf825104c36f1b",
+    "probes/probe_v5_oracle.py": "57791989262126c754be0b11d626da14cfa3ee43a8e19d2442a0f1389754267f",
+    "sources/scripts/package_endurance_v5/oracle.py": "230bae621934f7a17ec01e9207358c02d811cd0c4d94fbea09db50d4ef4d7b28"
+  }
+}

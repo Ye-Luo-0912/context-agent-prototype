@@ -1136,6 +1136,9 @@ fn render_task_anchor(task: &TaskAnchorView) -> String {
 const PRIO_STALL: u8 = 100;
 const PRIO_BLOCKER: u8 = 95;
 const PRIO_FRONTIER: u8 = 90;
+/// 交付停滞行：与前沿提示同源但口径不同（只读知识更新不解除它），
+/// 因此和 stall 行一样排在最高优先组里，避免被裁剪掉。
+const PRIO_DELIVERY: u8 = 100;
 const PRIO_REPAIR: u8 = 85;
 const PRIO_COMMIT_FAILURE: u8 = 80;
 const PRIO_SETTLEMENT: u8 = 70;
@@ -1216,6 +1219,9 @@ fn progress_fixed_blocks(progress: &TaskProgressView) -> Vec<(u8, String)> {
     }
     if let Some(line) = progress.frontier_warning.as_deref() {
         blocks.push((PRIO_FRONTIER, format!("{line}\n")));
+    }
+    if let Some(line) = progress.delivery_warning.as_deref() {
+        blocks.push((PRIO_DELIVERY, format!("{line}\n")));
     }
     if let Some(line) = progress.completion_commit_failure.as_deref() {
         blocks.push((PRIO_COMMIT_FAILURE, format!("{line}\n")));
@@ -4092,6 +4098,38 @@ stale={stale_bytes:?}"
         // Overflowing lists are trimmed away; the deterministic stall
         // signal is the one line that must survive.
         assert!(rendered.chars().count() <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn delivery_warning_renders_and_names_its_blocker() {
+        let warning = "EXECUTION DELIVERY STALL: 6 action(s) without artifact or acceptance progress (unresolved failed operations: 2, last blocker: stale_revision on src/a.rs). New observations, including an externally updated feedback file, only update knowledge: change the artifact, resolve the blocker, or finish with the current state.";
+        let progress = TaskProgressView {
+            delivery_warning: Some(warning.into()),
+            // Both hints can be present at once: knowledge keeps advancing
+            // while the artifact does not.
+            frontier_warning: Some("EXECUTION FRONTIER UNCHANGED: 0 action(s)".into()),
+            failed_commands: (0..12)
+                .map(|i| format!("shell.exec cargo test --long-argument-{i}"))
+                .collect(),
+            ..Default::default()
+        };
+        let rendered = render_task_progress(&progress);
+        assert!(
+            rendered.contains("EXECUTION DELIVERY STALL"),
+            "the delivery signal must render: {rendered}"
+        );
+        assert!(
+            rendered.contains("without artifact or acceptance progress"),
+            "the delivery signal states its own criterion: {rendered}"
+        );
+        assert!(
+            rendered.contains("stale_revision"),
+            "the delivery signal names its current blocker: {rendered}"
+        );
+        assert!(
+            rendered.chars().count() <= agent_contracts::MAX_TASK_PROGRESS_PROMPT_CHARS,
+            "the delivery signal lives inside the same hard cap"
+        );
     }
 
     #[test]

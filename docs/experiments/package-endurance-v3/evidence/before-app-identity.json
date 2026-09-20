@@ -1,0 +1,18 @@
+{
+  "source": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\docs\\experiments\\package-endurance-v2\\evidence\\final-app",
+  "provenance": "frozen_v2_model_output",
+  "app_sha256": {
+    "catalog.py": "8b48193b0e01589e047e892a17d7364037bf712dae5ec38403fe634f78f62d58",
+    "deploy.py": "15fa73aeebb36526e5d52c1c55742e30723d37edbeff75b4968651fd23887207",
+    "install.py": "77dab7605daf9b804ffb4e1ec18e852f0700652e642fbc94b251e35887370273",
+    "kernel.py": "d106e20dc075a837591543a799b174fc512329f0e1ff033d1a535f968c2942c7",
+    "repository.py": "fbe2160d73f70a1df2547fedb170b12b6162682d6f6cb74b3ce3acfc4fc47861",
+    "resolver.py": "b74a3d55a524c76d65d6e8d29e7ea5fd04c01043641bc3f07f37419c8764f611",
+    "state.py": "1cc0d8ea2b679175655f69c00c64b94f78c910532e0c8461f5b64eb1e78f23bb",
+    "util.py": "166cdee59700d1075f4ec57fe98571d04fef9a8499e5b53601e58035ce5bf0f9",
+    "worker.py": "4e198725136b9017b878d2ea941ed69a157bca2553e9c25d3863e5176a59acbd",
+    "_search.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "tests/test_resolver.py": "f91dfd52fe74b99a34c1353391e50cd747339fdda2ce53d68806b9217cdafff3"
+  }
+}

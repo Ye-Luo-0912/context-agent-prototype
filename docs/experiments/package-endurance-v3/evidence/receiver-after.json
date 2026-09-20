@@ -1,0 +1,42 @@
+[
+  {
+    "method": "GET",
+    "query": {
+      "tenant": [
+        "tenant-a"
+      ],
+      "environment": [
+        "prod"
+      ],
+      "key": [
+        "first"
+      ]
+    },
+    "status": 404
+  },
+  {
+    "method": "POST",
+    "body": {
+      "environment": "prod",
+      "generation": 1,
+      "key": "first",
+      "manifest_sha256": "18e5c2feaba31647e4ffdcc337fe7694897ef3c1c1b127a45641e21b33ee7339",
+      "tenant": "tenant-a"
+    }
+  },
+  {
+    "method": "GET",
+    "query": {
+      "tenant": [
+        "tenant-a"
+      ],
+      "environment": [
+        "prod"
+      ],
+      "key": [
+        "first"
+      ]
+    },
+    "status": 200
+  }
+]

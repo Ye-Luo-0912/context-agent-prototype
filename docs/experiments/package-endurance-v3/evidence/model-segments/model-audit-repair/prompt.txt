@@ -1,0 +1,20 @@
+Add a read-only repository auditor as app/audit.py. Use Python stdlib only. Discover/load process.run and use argv[0]=C:/Users/Ye_Luo/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe. Only create app/audit.py and app/tests/test_audit.py; existing application, fixtures, SPEC and public tests are protected. The existing assisted app handles deployment; do not redesign it. CLI: python -m app.audit --root PATH. It prints one JSON object {ok:bool,errors:list[str],receipts:int}, exits0 on sound data and exits1 on corruption. Open repo.sqlite read-only, enumerate all committed receipts, verify each corresponding canonical manifest SHA256, each referenced blob SHA256, and each deployments/tenant/environment/current.json against its matching durable receipt. Detect missing/corrupt blobs, manifests, missing DB receipts and pointer mismatch. Never repair or write the repository. Reject unsafe manifest paths/digest names and malformed shapes. Do not execute payloads or access network. Add tests with real temporary SQLite/files. Use small writes with valid JSON tool arguments, then run actual tests. Report exact test results; ordinary final is not operator acceptance.
+Continue SAME task. Your previous attempt failed because edit_patch arguments
+were malformed JSON (missing closing list). Avoid edit.patch. Use fs.write or
+small, valid process.run Python edits only for app/audit.py and app/tests/test_audit.py.
+Core files remain protected. Independent real CLI checks found:
+1. A sound repository with historical receipt first/gen1 and current second/gen2
+is falsely rejected because you compare current.json to EVERY historical receipt.
+Verify each historical manifest/blob, but match current pointer only to its own
+identity and durable receipt. This valid case must report ok=true, receipts=2.
+2. DELETE ALL receipts while keeping current.json currently reports ok=true,
+receipts=0. audit_orphan_pointers never actually checks DB membership. Fix it.
+3. Opening SQLite mode=ro creates repo.sqlite-wal / repo.sqlite-shm in otherwise
+quiescent snapshots, violating the no-write requirement. This CLI is explicitly
+for QUIESCENT snapshots: use an approach that never creates/modifies repository
+files; refuse existing WAL/journal sidecars with an honest needs-quiescent error,
+do not silently ignore possibly committed WAL data or return stale PASS.
+4. Preserve unsafe-path and malformed-shape rejection, corruption detection and
+single-JSON output with correct0/1 exit status. Do not repair audited data.
+Fix these concrete failures, add tests and run them. Avoid rereading unchanged
+repository source. Only24 more decisions in this segment, within original48 cap.

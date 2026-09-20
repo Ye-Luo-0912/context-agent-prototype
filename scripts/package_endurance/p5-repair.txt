@@ -1,0 +1,19 @@
+Same task, repair the actual integration failure from last segment before
+anything else: importing app.repository now fails "cannot import name
+'atomic_write' from app.util". Your LAST fs.write replaced app/util.py with only
+check_name and removed helpers needed by deploy/state/install. Inspect all
+`from app.util import` callers and restore a coherent shared module, preserving
+required helpers when changing one definition. Its legal names MUST match
+[a-z][a-z0-9-]{0,63}; your last NAME_RE incorrectly accepts dot, underscore and
+numeric starts. Run import and all tests after the repair, before more rewrites.
+
+Complete app.worker accepting --root --catalog --jobs --result; one independent
+Repository per process; sequential JSONL requests and flushed outcomes.
+Then exercise install/active/receipt/GC on the real 40-node fixture, recovery
+exit hooks, v1 migration exit 72 and localhost publication as SPEC requires.
+Keep ORIGINAL API signatures and request identity. A small helper edit must
+not discard the rest of a module. Use fs.write carefully and read existing
+contents when needed; edit.patch malformed JSON repeatedly failed previously.
+Independent acceptance currently cannot reach ANY application feature because
+of that ImportError. Budget for this segment 40 model decisions. Deliver actual
+working files and tests, plus honest app/README.md DESIGN.md RECOVERY.md RESULT.json.

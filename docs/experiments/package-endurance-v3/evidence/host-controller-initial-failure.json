@@ -1,0 +1,75 @@
+{
+  "status": "FAIL",
+  "cases": [
+    {
+      "case": "approval_denial_then_committed_effect",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "task_id": "1e61a5be-b7f2-4664-9548-f7d557e8763b",
+        "marker": "V3-a833d241cb93411b9584ed1827f438db"
+      }
+    },
+    {
+      "case": "spoofed_pass_does_not_complete_task",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "task_id": "1e61a5be-b7f2-4664-9548-f7d557e8763b"
+      }
+    },
+    {
+      "case": "runtime_process_executes_verified_deployment",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "receipt": {
+          "environment": "prod",
+          "generation": 1,
+          "key": "live",
+          "manifest_sha256": "ebdab014dbc8c613f02fdd82c4a26a1cbf86583570c4ce25d2e1c226770760ad",
+          "tenant": "runtime"
+        }
+      }
+    },
+    {
+      "case": "visible_failure_then_cold_restore_full_directive",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "bytes": 10476,
+        "task_id": "1e61a5be-b7f2-4664-9548-f7d557e8763b"
+      }
+    },
+    {
+      "case": "cancel_running_os_process_confirms_exit",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "pid": 3416,
+        "latency_s": 0.014999999999417923,
+        "ack": {
+          "ack": {
+            "cancelled_generation": 12,
+            "effective_generation": 13,
+            "operation_id": "9477c0d9-5f16-4be7-bd4a-3b01ed725d1e",
+            "status": "cancelled",
+            "task_id": "1e61a5be-b7f2-4664-9548-f7d557e8763b",
+            "turn_id": "95023d5f-b4d9-451f-8f87-5aa215c8160c"
+          }
+        },
+        "exited_at_ack_observation": false,
+        "exit_wait_seconds": 0.4850000000005821
+      }
+    }
+  ],
+  "error_type": "RuntimeError",
+  "error": "{'error': {'class': 'domain', 'code': 'work.rejected', 'effect_state': 'not_applied', 'message': 'agent is finishing explicit cleanup for cancelled tool operation 9477c0d9-5f16-4be7-bd4a-3b01ed725d1e', 'retry': 'never'}, 'status': 'error'}",
+  "provider_errors": [],
+  "provider_paid_calls": 0
+}

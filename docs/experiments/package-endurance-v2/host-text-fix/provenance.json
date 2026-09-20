@@ -1,0 +1,17 @@
+{
+  "baseline_head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "working_tree_patch": true,
+  "host_binary_sha256": "7e8e7fb1bcb4b955480b2c6b5f3c8096f7e29a01f78a4d90ba41e7f1a41c6b70",
+  "sources_sha256": {
+    "crates/agent-host/src/lib.rs": "2f8138b04c61928e6dbd8f492405a34dc3e94cc06fb07ec129d5362bbb70474a",
+    "crates/agent-host/src/decode_tests.rs": "d878980627e2d152bd5d2a06b122b108071d08103d21ad928057086a8d9ada44",
+    "crates/agent-host/tests/host_e2e.rs": "212d75776c2b690775eb40b77a0800b6de9f63aad74734eb92223e2879f804c1"
+  },
+  "provider_paid_calls": 0,
+  "host_package_tests": {
+    "passed": 35,
+    "failed": 0,
+    "platform": "Windows"
+  },
+  "historical_evidence_unchanged": true
+}

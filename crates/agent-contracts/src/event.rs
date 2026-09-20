@@ -363,6 +363,11 @@ pub enum RuntimeEvent {
         delta: crate::FrontierDelta,
         #[serde(default)]
         actions_since_frontier_advance: u32,
+        /// 无交付推进的动作连击（只读知识更新——包括反复读到被外部控制器
+        /// 改写的外部反馈文件——不解除）。0 也表示旧 journal 或未启用该
+        /// 口径的生产者；它只用于观测与评测，不改变任何执行决定。
+        #[serde(default)]
+        actions_since_delivery_advance: u32,
         #[serde(default)]
         evidence_revision: u64,
         /// 本轮因 world revision 推进而失效的前沿证据条数。

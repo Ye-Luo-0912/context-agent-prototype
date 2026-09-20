@@ -1,0 +1,25 @@
+Continue SAME task; current independent facts override your stale last report:
+BOTH small-graph backtracking oracle and cycle-highest-choice fallback now PASS.
+Do NOT weaken digest validation or rewrite the resolver. Keep it frozen.
+Migration actual os._exit(72) then retry preserved original receipt exactly: PASS.
+
+CRITICAL: receiver publication committed, controller killed the client, then
+the resumed publish sent POST again before GET (audit POST,POST,GET). The
+publication branch is STOPPED under the experiment's unknown-effect rule.
+Do not call publish, edit its implementation, or claim publication passed.
+
+Finish the independent DEPLOYMENT branch only:
+1. current.json contains a trailing newline (or formatting differences): oracle
+requires exact canonical JSON bytes with no newline; read actual current.json.
+2. app.worker is missing; implement -m app.worker --root --catalog --jobs --result
+with each job {tenant,environment,key,requirements,expected_generation?}; create
+a Repository connection in each independent process, flush per-job result
+{request,ok,receipt} or {request,ok:false,error}. No fake results.
+3. Future database PRAGMA user_version=99 is rejected but its actual bytes are
+mutated first (possibly connect PRAGMA journal_mode=WAL before version check).
+Inspect schema version before any DB mutation, reject without changing data.
+4. Run real 40-package install, idempotent replay, generation conflict and GC;
+exercise crash_at='before_pointer'/'after_pointer' exit=71 and recover/retry.
+Leave correct functions intact. Write the bounded docs and RESULT.json honestly,
+including publication STOPPED and unfinished features. 32 decisions; use them
+for these concrete defects, not another parser redesign or repeated same reads.

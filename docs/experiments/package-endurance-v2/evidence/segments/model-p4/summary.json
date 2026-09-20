@@ -1,0 +1,62 @@
+{
+  "outcome": "completed",
+  "categories": [],
+  "exit_code": 0,
+  "exit": 0,
+  "child_exit_code": 0,
+  "elapsed": 148.38,
+  "rounds": 48,
+  "tool_calls": 66,
+  "protected_unchanged": true,
+  "terminals": [
+    {
+      "type": "turn_completed"
+    }
+  ],
+  "session": {
+    "approval_denied": false,
+    "exit": 0,
+    "kind": "session_end",
+    "round_budget": false,
+    "schema": "agent.headless.v1",
+    "status": "completed",
+    "stop": "turn_completed",
+    "task_completed": false,
+    "task_state": "awaiting_operator_review"
+  },
+  "requests": 48,
+  "budget": {
+    "cap_usd": 3.0,
+    "inherited_ledger": true,
+    "cap_stopped": false,
+    "committed_usd": 0.4487486159999998,
+    "reserved_usd": 0.0,
+    "unknown_usd": 0.0,
+    "reserve_policy": {
+      "strategy": "wire_byte_upper_estimate",
+      "input_estimate": "request_body_bytes + 8192 tokens at cache-miss rate",
+      "output_estimate": "max_output_tokens at output rate",
+      "max_output_tokens": 8192,
+      "estimated": true,
+      "attempts_cap": 300,
+      "input_tokens_cap": 9000000,
+      "output_tokens_cap": 300000,
+      "decisions_cap": 240,
+      "tool_attempts_cap": 720,
+      "tool_slots_reserved_per_request": 32,
+      "deadline_epoch": 1789850515.9722717
+    }
+  },
+  "cleanup": {
+    "order": [
+      "relay_accept_stopped",
+      "child_stop:already_exited"
+    ],
+    "child": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "already_exited"
+    },
+    "forced_unknown_attempts": []
+  }
+}

@@ -2,6 +2,7 @@
 //! model input, the execution stack (Turn Frame) versus the long-term
 //! working set (Context Frame), and cancellation of a hanging model round.
 
+mod combined_cancel;
 mod completion;
 mod directive;
 mod effects;

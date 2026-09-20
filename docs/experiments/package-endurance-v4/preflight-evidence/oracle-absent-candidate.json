@@ -1,0 +1,11 @@
+{
+  "status": "FAIL",
+  "results": [
+    {
+      "case": "candidate_available",
+      "status": "FAIL",
+      "error": "app/snapshot.py is absent; no functional case was executed"
+    }
+  ],
+  "provider_paid_calls": 0
+}

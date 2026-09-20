@@ -1,0 +1,75 @@
+{
+  "status": "FAIL",
+  "cases": [
+    {
+      "case": "approval_denial_then_committed_effect",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "task_id": "6b4d3cf4-efcc-4030-a1ec-e521769f4bca",
+        "marker": "V3-dfbc90cd93ad4fff92f4cd293a7a2deb"
+      }
+    },
+    {
+      "case": "spoofed_pass_does_not_complete_task",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "task_id": "6b4d3cf4-efcc-4030-a1ec-e521769f4bca"
+      }
+    },
+    {
+      "case": "runtime_process_executes_verified_deployment",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "receipt": {
+          "environment": "prod",
+          "generation": 3,
+          "key": "committed-prefix",
+          "manifest_sha256": "ebdab014dbc8c613f02fdd82c4a26a1cbf86583570c4ce25d2e1c226770760ad",
+          "tenant": "runtime"
+        }
+      }
+    },
+    {
+      "case": "visible_failure_then_cold_restore_full_directive",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "bytes": 10476,
+        "task_id": "6b4d3cf4-efcc-4030-a1ec-e521769f4bca"
+      }
+    },
+    {
+      "case": "cancel_running_os_process_confirms_exit",
+      "fired": true,
+      "observed": true,
+      "verdict": "PASS",
+      "detail": {
+        "pid": 31780,
+        "latency_s": 0.0,
+        "ack": {
+          "ack": {
+            "cancelled_generation": 45,
+            "effective_generation": 46,
+            "operation_id": "cbbd202f-3f7e-4a95-86fd-3810f3b74f48",
+            "status": "cancelled",
+            "task_id": "6b4d3cf4-efcc-4030-a1ec-e521769f4bca",
+            "turn_id": "72b04a8e-0865-4ad8-9a5e-3400ac97c00b"
+          }
+        },
+        "exited_at_ack_observation": false,
+        "exit_wait_seconds": 0.5
+      }
+    }
+  ],
+  "error_type": "JSONDecodeError",
+  "error": "Extra data: line 2 column 1 (char 144)",
+  "provider_errors": [],
+  "provider_paid_calls": 0
+}

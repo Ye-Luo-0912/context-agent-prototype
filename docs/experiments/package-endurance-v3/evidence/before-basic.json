@@ -1,0 +1,29 @@
+{
+  "status": "FAIL",
+  "results": [
+    {
+      "case": "backtracking_matches_exhaustive_oracle",
+      "status": "PASS",
+      "detail": {
+        "a": 1,
+        "b": 1
+      }
+    },
+    {
+      "case": "disk_install_replay_conflict_cas_gc",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "('pointer mismatch', {'environment': 'prod', 'generation': 1, 'key': 'deploy-one', 'manifest_sha256': '83cb035ebd5dc829e8f27d341dcd2d2fffae026144159f9386c89a2e0b16e3a5', 'tenant': 'tenant-a'}, {'tenant': 'tenant-a', 'environment': 'prod', 'key': 'deploy-two', 'generation': 2, 'manifest_sha256': 'a0c49625eae531188bd4f51d68626928142ba1399782d2e5d355f347b62e55c0'})"
+    },
+    {
+      "case": "corrupted_source_refused",
+      "status": "PASS",
+      "detail": {
+        "ok": false,
+        "error_type": "ValueError",
+        "message": "missing/corrupt source blob 9d4885cc09e27fd287bf926330dc70208549a6afd381682ba421a1e5025e772c for pkg-000==1"
+      }
+    }
+  ],
+  "time": 1789859083.9817333
+}

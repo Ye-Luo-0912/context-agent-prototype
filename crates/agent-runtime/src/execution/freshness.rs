@@ -10,9 +10,9 @@ use agent_contracts::{
 };
 
 use super::state::{
-    ExecutionState, MAX_REVALIDATE_PER_ROUND, ObservationEvidence, ResourceObservation,
-    RuntimeExecutionAttribution, VerificationCause, VerificationCoverage, bound_item,
-    is_command_tool, operation_identity, path_mentioned_in_query, same_operation,
+    ExecutionState, FrontierProgress, MAX_REVALIDATE_PER_ROUND, ObservationEvidence,
+    ResourceObservation, RuntimeExecutionAttribution, VerificationCause, VerificationCoverage,
+    bound_item, is_command_tool, operation_identity, path_mentioned_in_query, same_operation,
 };
 use super::{ResourceFactKind, ResourceProvenance};
 
@@ -30,11 +30,18 @@ impl ExecutionState {
         self.last_turn = turn;
         let identity = operation_identity(output, "", None);
         let delta = FrontierDelta::RedundantEvidence;
-        self.update_convergence(&identity, None, delta, ObservationEvidence::None);
+        self.update_convergence(
+            &identity,
+            None,
+            delta,
+            ObservationEvidence::None,
+            FrontierProgress::None,
+        );
         self.refresh_validity();
         super::state::FrontierObservation {
             delta,
             actions_since_frontier_advance: self.convergence.actions_since_frontier_advance,
+            actions_since_delivery_advance: self.convergence.actions_since_delivery_advance,
             evidence_revision: self.convergence.evidence_revision,
             invalidated: 0,
             obligation_events: Vec::new(),
@@ -371,13 +378,35 @@ impl ExecutionState {
                 }
             }
         };
+        // 推进类别：知识更新与交付推进分开记账。只读证据（包括被外部
+        // 控制器反复改写的外部反馈文件）只推进知识前沿；产物变更、通过的
+        // 验证与义务解除才算交付推进（审查 5.2/§7）。
+        let progress = match delta {
+            FrontierDelta::ObservedWorldChange | FrontierDelta::ObligationResolved => {
+                FrontierProgress::Delivery
+            }
+            FrontierDelta::EvidenceAdvanced if is_verification => FrontierProgress::Delivery,
+            FrontierDelta::EvidenceAdvanced | FrontierDelta::EvidenceReconfirmed => {
+                FrontierProgress::Knowledge
+            }
+            FrontierDelta::WorldInvalidatedUnknown
+            | FrontierDelta::RedundantEvidence
+            | FrontierDelta::NoProgress => FrontierProgress::None,
+        };
         // BR3: the observation classification rides into convergence
         // accounting so an untracked window (local coverage summary full)
         // can never be counted as repeated behavior.
-        self.update_convergence(&identity, output.failure_class(), delta, obs_evidence);
+        self.update_convergence(
+            &identity,
+            output.failure_class(),
+            delta,
+            obs_evidence,
+            progress,
+        );
         super::state::FrontierObservation {
             delta,
             actions_since_frontier_advance: self.convergence.actions_since_frontier_advance,
+            actions_since_delivery_advance: self.convergence.actions_since_delivery_advance,
             evidence_revision: self.convergence.evidence_revision,
             invalidated,
             obligation_events,

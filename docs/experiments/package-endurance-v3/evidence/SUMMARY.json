@@ -1,0 +1,52 @@
+{
+  "status": "COMPLETED_WITH_ASSISTED_REPAIRS",
+  "closed_at_utc": "2026-09-20T00:40:44.881887+00:00",
+  "baseline_head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "uncommitted_working_tree": true,
+  "runtime_cancel_fix": "LOCAL_PASS_LIVE_AND_EXPLICIT_CHECKPOINT_RESTORE",
+  "runtime_new_combination_tests": 5,
+  "rust_validation": {
+    "command": "cargo test -p agent-runtime -p agent-host -- --test-threads=4",
+    "exit": 0,
+    "turn_passed": 163,
+    "turn_ignored": 1
+  },
+  "python_validation": {
+    "scripts_tests_passed": 49,
+    "v3_tests_passed": 34
+  },
+  "load": {
+    "target_seconds": 1800,
+    "elapsed_including_final_sweep_and_cleanup": 1841.812515258789,
+    "batches": 1797,
+    "verified_install_receipts": 7188,
+    "overlap_batches": 1797,
+    "actual_worker_crashes": 2,
+    "final_quiescent_repository_receipts": 7193,
+    "timeline_sha256": "9ab9209d7b6e8b8e15db499860e1b10fb889a0d886d30b67c2f29f1876ff3a1d"
+  },
+  "load_helper_version_note": "30-minute run uses recorded earlier helper; lifecycle-handle fix validated separately by native regressions,20-second load and full public-host journey",
+  "model_usage": {
+    "main_decisions": 48,
+    "provider_attempts": 49,
+    "tool_attempts": 59,
+    "input_tokens": 777096,
+    "cached_input_tokens": 210048,
+    "output_tokens": 29744,
+    "estimated_peak_usd": 0.20706748799999994,
+    "unknown_usd": 0.0,
+    "reserved_usd": 0.0
+  },
+  "model_only_audit": "NOT_ACCEPTED_STRICT_REVIEW_3_OF_13",
+  "model_narrow_oracle_passed": 7,
+  "assisted_audit_passed": 13,
+  "protected_model_baseline_files": 496,
+  "protected_model_baseline_changed": [],
+  "remaining_limits": [
+    "Automatic restore=latest after cancel is not a new guarantee; explicit checkpoint cold restore was tested.",
+    "Simple retrieval is preserved; unrooted observations need not enter every automatic prompt.",
+    "Windows lifetime observer is bounded4096identities/5ms; missed or uncertain history returns unconfirmed.",
+    "Assisted audit supports quiescent snapshots only; no hostile concurrent file replacement guarantee.",
+    "Unix runtime semantics and remote CI not run; no provider layout/cost A/B conclusion."
+  ]
+}

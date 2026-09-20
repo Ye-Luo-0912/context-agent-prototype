@@ -1935,6 +1935,223 @@ async fn run_scoped_request_with_work_identity_is_rejected(
     Ok(())
 }
 
+/// Public work text must reach typed validation without inheriting the
+/// decoder's much smaller metadata-string budget. Both transports exercise
+/// identical long-text handling, exact retained bodies, and recoverable
+/// rejections on the same connection. New task goals still obey the
+/// runtime's separate 2,000-character anchor bound; steering uses the full
+/// directive budget without changing that business rule.
+async fn work_text_limits_preserve_connection(endpoint: LocalEndpoint) -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let fixture = compose_workspace(dir.path()).await?;
+    fixture.composed.instance.start().await?;
+    let server = start_server(&fixture, endpoint, true).await?;
+    let mut stream = connect(&server.endpoint).await;
+
+    // Keep all fallible exchanges inside this result so the known RED
+    // disconnect still shuts down the runtime and joins the host thread.
+    let result = async {
+        for (label, text) in [("ascii", "a".repeat(20_000)), ("utf8", "汉".repeat(8_000))] {
+            let before_long_goal = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+                &mut stream,
+                &request("work", "snapshot", WorkSnapshotRequest {}),
+            )?);
+            // This text is legal at the protocol boundary but exceeds the
+            // existing task-anchor limit. The typed domain refusal must
+            // survive transport and must leave the task catalog untouched.
+            let long_goal = exchange::<_, _, WorkSubmitResponse>(
+                &mut stream,
+                &request(
+                    "work",
+                    "submit",
+                    WorkSubmitRequest {
+                        goal: format!("submit-{label}:{text}:complete"),
+                        client_request_id: format!("e2e-anchor-limit-{label}"),
+                    },
+                ),
+            )?;
+            match long_goal {
+                PlatformResponse::Error { error } => {
+                    anyhow::ensure!(error.class == agent_platform_protocol::PlatformErrorClass::Domain);
+                    anyhow::ensure!(error.code == "work.rejected");
+                    anyhow::ensure!(error.message.contains("task goal"));
+                }
+                PlatformResponse::Success { .. } => anyhow::bail!("oversized task anchor accepted"),
+            }
+            let after_long_goal = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+                &mut stream,
+                &request("work", "snapshot", WorkSnapshotRequest {}),
+            )?);
+            anyhow::ensure!(after_long_goal == before_long_goal,
+                "domain refusal must not admit the long {label} task goal");
+
+            // The UTF-8 goal is below 2,000 characters but above 4,096
+            // bytes, so it exercises accepted submission past the old
+            // decoder cap without weakening the task-anchor invariant.
+            let goal_body = if label == "ascii" { "a".repeat(1_900) } else { "汉".repeat(1_900) };
+            let goal = format!("submit-{label}:{goal_body}:complete");
+            let submitted = match exchange::<_, _, WorkSubmitResponse>(
+                &mut stream,
+                &request(
+                    "work",
+                    "submit",
+                    WorkSubmitRequest {
+                        goal: goal.clone(),
+                        client_request_id: format!("e2e-long-text-{label}"),
+                    },
+                ),
+            )? {
+                PlatformResponse::Success { value } => value,
+                PlatformResponse::Error { error } => anyhow::bail!("legal {label} submit: {error:?}"),
+            };
+            anyhow::ensure!(submitted.disposition == WorkSubmitDisposition::Accepted);
+            let task_id = submitted.task_id;
+            wait_until_not_running(&mut stream, "long submitted text").await?;
+            let detail = expect_value(exchange::<_, _, WorkTaskDetailResponse>(
+                &mut stream,
+                &request("work", "task_detail", WorkTaskDetailRequest { task_id }),
+            )?);
+            anyhow::ensure!(
+                detail.task_id == task_id && detail.goal == goal,
+                "public task detail must retain the complete {label} goal"
+            );
+            assert_retained_work_text(&fixture, task_id, &goal).await?;
+
+            let instruction = format!("steer-{label}:{text}:complete");
+            let steered = match exchange::<_, _, WorkSteerResponse>(
+                &mut stream,
+                &request(
+                    "work",
+                    "steer",
+                    WorkSteerRequest {
+                        instruction: instruction.clone(),
+                        expected_task_id: Some(task_id),
+                    },
+                ),
+            )? {
+                PlatformResponse::Success { value } => value,
+                PlatformResponse::Error { error } => anyhow::bail!("legal {label} steer: {error:?}"),
+            };
+            anyhow::ensure!(matches!(
+                steered.disposition,
+                WorkSteerDisposition::Applied | WorkSteerDisposition::Queued
+            ));
+            anyhow::ensure!(
+                steered.task_id == Some(task_id),
+                "long steering text must reach its expected task"
+            );
+            wait_until_not_running(&mut stream, "long steering text").await?;
+            assert_retained_work_text(&fixture, task_id, &instruction).await?;
+
+            // The ASCII case exceeds only the character cap; the UTF-8
+            // case exceeds only the byte cap. Test both mutation routes.
+            let oversized = if label == "ascii" {
+                "x".repeat(agent_platform_protocol::MAX_WORK_GOAL_CHARS + 1)
+            } else {
+                "汉".repeat(agent_platform_protocol::MAX_WORK_GOAL_BYTES / 3 + 1)
+            };
+            let before = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+                &mut stream,
+                &request("work", "snapshot", WorkSnapshotRequest {}),
+            )?);
+            for (operation, payload, field) in [
+                (
+                    "submit",
+                    json!({
+                        "goal": oversized,
+                        "client_request_id": format!("e2e-rejected-text-{label}"),
+                    }),
+                    "work.submit.goal",
+                ),
+                (
+                    "steer",
+                    json!({
+                        "instruction": oversized,
+                        "expected_task_id": task_id,
+                    }),
+                    "work.steer.instruction",
+                ),
+            ] {
+                let rejected = exchange::<_, _, serde_json::Value>(
+                    &mut stream,
+                    &request("work", operation, payload),
+                )?;
+                match rejected {
+                    PlatformResponse::Error { error } => {
+                        anyhow::ensure!(
+                            error.class == agent_platform_protocol::PlatformErrorClass::Protocol
+                        );
+                        anyhow::ensure!(error.code == "protocol.request_invalid");
+                        anyhow::ensure!(
+                            error.message.contains(field),
+                            "typed rejection must identify {field}: {}",
+                            error.message
+                        );
+                    }
+                    PlatformResponse::Success { .. } => {
+                        anyhow::bail!("oversized {label} {operation} unexpectedly succeeded")
+                    }
+                }
+                // exchange checks response correlation. This next public
+                // read proves the same stream survived, and an unchanged
+                // event watermark proves no rejected input was applied.
+                let after = expect_value(exchange::<_, _, WorkSnapshotResponse>(
+                    &mut stream,
+                    &request("work", "snapshot", WorkSnapshotRequest {}),
+                )?);
+                anyhow::ensure!(
+                    after == before,
+                    "rejected {label} {operation} must not alter runtime state or admit a task/input"
+                );
+            }
+            assert_retained_work_text(&fixture, task_id, &instruction).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    drop(stream);
+    let shutdown = fixture.composed.shutdown().await;
+    let stopped = stop_and_join_bounded(server, BOUNDED_STOP).await;
+    result?;
+    shutdown?;
+    let (_, registry) = stopped?;
+    assert_registry_drained(&registry).await;
+    Ok(())
+}
+
+/// Read the runtime's retained instruction identity after the public
+/// exchange; a bounded anchor preview cannot prove that text was uncut.
+async fn assert_retained_work_text(
+    fixture: &Composed,
+    task_id: agent_contracts::TaskId,
+    expected: &str,
+) -> anyhow::Result<()> {
+    let checkpoint = fixture.composed.instance.checkpoint().await?;
+    let task = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .ok_or_else(|| anyhow::anyhow!("accepted task absent from checkpoint"))?;
+    let directive = task
+        .current_directive
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("accepted instruction was not retained"))?;
+    anyhow::ensure!(directive.input.task_id == Some(task_id));
+    anyhow::ensure!(
+        directive.input.bytes == expected.len() as u64,
+        "retained instruction byte count must cover the complete body"
+    );
+    let expected_digest =
+        agent_contracts::ContentDigest::sha256_bytes(expected.as_bytes()).to_string();
+    anyhow::ensure!(
+        directive.input.digest.as_deref() == Some(expected_digest.as_str()),
+        "retained instruction digest must cover the complete body"
+    );
+    Ok(())
+}
+
 // multi_thread on purpose: the client side of this drill uses blocking
 // std IO; on the default current_thread test runtime that would freeze the
 // whole runtime and deadlock the server-side block_on calls.
@@ -2218,6 +2435,27 @@ async fn unix_socket_run_scoped_request_with_work_identity_is_rejected() {
 
 #[cfg(not(any(windows, unix)))]
 compile_error!("the host e2e requires a local transport");
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn named_pipe_work_text_limits_preserve_connection() {
+    work_text_limits_preserve_connection(LocalEndpoint::NamedPipe(format!(
+        "focus-agent-e2e-text-{}",
+        uuid_like()
+    )))
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unix_socket_work_text_limits_preserve_connection() {
+    work_text_limits_preserve_connection(LocalEndpoint::UnixSocket(
+        std::env::temp_dir().join(format!("focus-agent-e2e-text-{}.sock", uuid_like())),
+    ))
+    .await
+    .unwrap();
+}
 
 fn uuid_like() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

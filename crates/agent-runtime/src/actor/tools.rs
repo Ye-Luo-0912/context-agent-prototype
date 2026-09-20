@@ -2028,6 +2028,7 @@ impl RuntimeActor {
             .emit_event(RuntimeEvent::ExecutionFrontier {
                 delta: observation.delta,
                 actions_since_frontier_advance: observation.actions_since_frontier_advance,
+                actions_since_delivery_advance: observation.actions_since_delivery_advance,
                 evidence_revision: observation.evidence_revision,
                 invalidated: observation.invalidated,
                 settlement,

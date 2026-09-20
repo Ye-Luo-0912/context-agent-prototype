@@ -1,0 +1,64 @@
+{
+  "api_protocol": "chat",
+  "outcome": "completed",
+  "categories": [
+    "child_nonzero"
+  ],
+  "exit_code": 10,
+  "exit": 1,
+  "child_exit_code": 1,
+  "elapsed": 4.0,
+  "rounds": 0,
+  "tool_calls": 0,
+  "protected_unchanged": true,
+  "terminals": [],
+  "session": null,
+  "requests": 0,
+  "budget": {
+    "api_protocol": "chat",
+    "cap_usd": 1.0,
+    "inherited_ledger": true,
+    "cap_stopped": false,
+    "committed_usd": 0.3249050759999999,
+    "reserved_usd": 0.0,
+    "unknown_usd": 0.0,
+    "reserve_policy": {
+      "strategy": "wire_bytes_plus_8192_and_full_output",
+      "max_output_tokens": 8192,
+      "schema": 1,
+      "kind": "v4_real_snapshot_workflow",
+      "created_epoch": 1789899357.9161618,
+      "deadline_epoch": 1789913757.9161618,
+      "main_decisions": 96,
+      "provider_attempts": 128,
+      "tool_attempts": 384,
+      "input_tokens": 4000000,
+      "output_tokens": 250000,
+      "estimated_cost_usd": 1.0,
+      "api_protocol": "chat",
+      "chat_thinking": "disabled",
+      "model": "deepseek-flash"
+    }
+  },
+  "cleanup": {
+    "order": [
+      "relay_accept_stopped",
+      "child_stop:already_exited"
+    ],
+    "child": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "already_exited",
+      "scope": "windows_job",
+      "tree_confirmed": true,
+      "active_processes": 0,
+      "retained_member_handles": 7,
+      "captured_total_processes": 7,
+      "active_before_kill": 0,
+      "final_total_processes": 7,
+      "observed_processes": 7,
+      "retained_members_exited": true
+    },
+    "forced_unknown_attempts": []
+  }
+}

@@ -1,0 +1,104 @@
+{
+  "model_source_sha256": "9b15223d0af1e5d289dd64493402216633ae48ee64bc7e21eea96c5542524227",
+  "model_source_unchanged": true,
+  "assisted_source_sha256": "0cba6a4905e67e2a201830d8d1b8d1621b7742ff036d247235bc7f9083dc2a07",
+  "results": [
+    {
+      "candidate": "model",
+      "exit": 1,
+      "log": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\package-endurance-v3-audit-review-1789862366060371400\\model-independent-tests.log",
+      "summary": ".assertEqual(value['ok'], expected, value)\nAssertionError: False != True : {'errors': ['receipts table missing required columns: tenant, environment, key, generation, manifest_sha256', 'pointer tenant-a/prod: missing DB receipt for tenant-a/prod/first'], 'ok': False, 'receipts': 0}\n\n----------------------------------------------------------------------\nRan 13 tests in 1.575s\n\nFAILED (failures=10)\n"
+    },
+    {
+      "candidate": "model",
+      "case": "positive",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "model",
+      "case": "wrong_manifest_scope",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "model",
+      "case": "malformed_manifest_scope",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "model",
+      "case": "stale_pointer",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":2}",
+      "stderr": ""
+    },
+    {
+      "candidate": "model",
+      "case": "invalid_scope_orphan",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "model",
+      "case": "symlink_object_outside_root",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "assisted",
+      "exit": 0,
+      "log": "D:\\Users\\Ye_Luo\\APP\\context-agent-prototype\\target\\package-endurance-v3-audit-review-1789862366060371400\\assisted-independent-tests.log",
+      "summary": "root_remains_valid) ... ok\ntest_valid_historical_receipts_count_two (test_auditor_assisted.AssistedAuditor.test_valid_historical_receipts_count_two) ... ok\ntest_wal_sidecar_is_refused_without_modification (test_auditor_assisted.AssistedAuditor.test_wal_sidecar_is_refused_without_modification) ... ok\n\n----------------------------------------------------------------------\nRan 13 tests in 1.774s\n\nOK\n"
+    },
+    {
+      "candidate": "assisted",
+      "case": "positive",
+      "exit": 0,
+      "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "assisted",
+      "case": "wrong_manifest_scope",
+      "exit": 1,
+      "stdout": "{\"errors\":[\"receipt tenant-a/prod/first: manifest scope differs from receipt scope\"],\"ok\":false,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "assisted",
+      "case": "malformed_manifest_scope",
+      "exit": 1,
+      "stdout": "{\"errors\":[\"receipt tenant-a/prod/first: manifest has illegal tenant\"],\"ok\":false,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "assisted",
+      "case": "stale_pointer",
+      "exit": 1,
+      "stdout": "{\"errors\":[\"pointer tenant-a/prod: pointer differs from SQLite current authority\"],\"ok\":false,\"receipts\":2}",
+      "stderr": ""
+    },
+    {
+      "candidate": "assisted",
+      "case": "invalid_scope_orphan",
+      "exit": 1,
+      "stdout": "{\"errors\":[\"illegal deployment tenant directory 'tenant_bad'\"],\"ok\":false,\"receipts\":1}",
+      "stderr": ""
+    },
+    {
+      "candidate": "assisted",
+      "case": "symlink_object_outside_root",
+      "exit": 1,
+      "stdout": "{\"errors\":[\"snapshot audit incomplete: unsafe link or reparse point: D:\\\\Users\\\\Ye_Luo\\\\APP\\\\context-agent-prototype\\\\target\\\\package-endurance-v3-audit-review-1789862366060371400\\\\symlink_object_outside_root\\\\objects\"],\"ok\":false,\"receipts\":0}",
+      "stderr": ""
+    }
+  ],
+  "provider_paid_calls": 0
+}

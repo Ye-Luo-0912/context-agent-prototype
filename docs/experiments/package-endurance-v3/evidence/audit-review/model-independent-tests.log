@@ -1,0 +1,146 @@
+test_historical_corruption_with_actual_durable_history_is_detected (test_auditor_assisted.AssistedAuditor.test_historical_corruption_with_actual_durable_history_is_detected) ... ok
+test_invalid_directory_cannot_hide_orphan_pointer (test_auditor_assisted.AssistedAuditor.test_invalid_directory_cannot_hide_orphan_pointer) ... FAIL
+test_invalid_json_number_produces_single_error_document (test_auditor_assisted.AssistedAuditor.test_invalid_json_number_produces_single_error_document) ... FAIL
+test_manifest_scope_is_bound_to_receipt (test_auditor_assisted.AssistedAuditor.test_manifest_scope_is_bound_to_receipt) ... FAIL
+test_manifest_scope_shape_is_validated (test_auditor_assisted.AssistedAuditor.test_manifest_scope_shape_is_validated) ... FAIL
+test_missing_current_authority_is_not_a_pass (test_auditor_assisted.AssistedAuditor.test_missing_current_authority_is_not_a_pass) ... FAIL
+test_missing_current_pointer_is_not_a_pass (test_auditor_assisted.AssistedAuditor.test_missing_current_pointer_is_not_a_pass) ... FAIL
+test_noncanonical_pointer_is_rejected (test_auditor_assisted.AssistedAuditor.test_noncanonical_pointer_is_rejected) ... FAIL
+test_object_directory_link_cannot_escape_snapshot (test_auditor_assisted.AssistedAuditor.test_object_directory_link_cannot_escape_snapshot) ... FAIL
+test_old_durable_pointer_cannot_override_sqlite_current (test_auditor_assisted.AssistedAuditor.test_old_durable_pointer_cannot_override_sqlite_current) ... FAIL
+test_uri_special_character_in_root_remains_valid (test_auditor_assisted.AssistedAuditor.test_uri_special_character_in_root_remains_valid) ... FAIL
+test_valid_historical_receipts_count_two (test_auditor_assisted.AssistedAuditor.test_valid_historical_receipts_count_two) ... ok
+test_wal_sidecar_is_refused_without_modification (test_auditor_assisted.AssistedAuditor.test_wal_sidecar_is_refused_without_modification) ... ok
+
+======================================================================
+FAIL: test_invalid_directory_cannot_hide_orphan_pointer (test_auditor_assisted.AssistedAuditor.test_invalid_directory_cannot_hide_orphan_pointer)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 108, in test_invalid_directory_cannot_hide_orphan_pointer
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 1}
+
+======================================================================
+FAIL: test_invalid_json_number_produces_single_error_document (test_auditor_assisted.AssistedAuditor.test_invalid_json_number_produces_single_error_document)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 163, in test_invalid_json_number_produces_single_error_document
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 75, in audit
+    self.assertEqual(result.stderr, '', result.stderr)
+AssertionError: 'Traceback (most recent call last):\n  Fil[1810 chars]an\n' != ''
+Diff is 1806 characters long. Set self.maxDiff to None to see it. : Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\target\package-endurance-v3-20260920\model\workspace\app\audit.py", line 416, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\target\package-endurance-v3-20260920\model\workspace\app\audit.py", line 409, in main
+    result = audit(args.root)
+             ^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\target\package-endurance-v3-20260920\model\workspace\app\audit.py", line 392, in audit
+    audit_manifest(root, obj['manifest_sha256'], where, errors)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\target\package-endurance-v3-20260920\model\workspace\app\audit.py", line 223, in audit_manifest
+    if canonical_bytes(manifest) != _read_bytes(path):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\target\package-endurance-v3-20260920\model\workspace\app\audit.py", line 54, in canonical_bytes
+    text = json.dumps(obj, sort_keys=True, separators=(',', ':'),
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\AppData\Python\Lib\json\__init__.py", line 238, in dumps
+    **kw).encode(obj)
+          ^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\AppData\Python\Lib\json\encoder.py", line 200, in encode
+    chunks = self.iterencode(o, _one_shot=True)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\Users\Ye_Luo\AppData\Python\Lib\json\encoder.py", line 258, in iterencode
+    return _iterencode(o, 0)
+           ^^^^^^^^^^^^^^^^^
+ValueError: Out of range float values are not JSON compliant: nan
+
+
+======================================================================
+FAIL: test_manifest_scope_is_bound_to_receipt (test_auditor_assisted.AssistedAuditor.test_manifest_scope_is_bound_to_receipt)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 91, in test_manifest_scope_is_bound_to_receipt
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 1}
+
+======================================================================
+FAIL: test_manifest_scope_shape_is_validated (test_auditor_assisted.AssistedAuditor.test_manifest_scope_shape_is_validated)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 95, in test_manifest_scope_shape_is_validated
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 1}
+
+======================================================================
+FAIL: test_missing_current_authority_is_not_a_pass (test_auditor_assisted.AssistedAuditor.test_missing_current_authority_is_not_a_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 141, in test_missing_current_authority_is_not_a_pass
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 1}
+
+======================================================================
+FAIL: test_missing_current_pointer_is_not_a_pass (test_auditor_assisted.AssistedAuditor.test_missing_current_pointer_is_not_a_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 146, in test_missing_current_pointer_is_not_a_pass
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 1}
+
+======================================================================
+FAIL: test_noncanonical_pointer_is_rejected (test_auditor_assisted.AssistedAuditor.test_noncanonical_pointer_is_rejected)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 168, in test_noncanonical_pointer_is_rejected
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 1}
+
+======================================================================
+FAIL: test_object_directory_link_cannot_escape_snapshot (test_auditor_assisted.AssistedAuditor.test_object_directory_link_cannot_escape_snapshot)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 127, in test_object_directory_link_cannot_escape_snapshot
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 1}
+
+======================================================================
+FAIL: test_old_durable_pointer_cannot_override_sqlite_current (test_auditor_assisted.AssistedAuditor.test_old_durable_pointer_cannot_override_sqlite_current)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 101, in test_old_durable_pointer_cannot_override_sqlite_current
+    self.audit(False)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: True != False : {'errors': [], 'ok': True, 'receipts': 2}
+
+======================================================================
+FAIL: test_uri_special_character_in_root_remains_valid (test_auditor_assisted.AssistedAuditor.test_uri_special_character_in_root_remains_valid)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 175, in test_uri_special_character_in_root_remains_valid
+    self.audit(True)
+  File "D:\Users\Ye_Luo\APP\context-agent-prototype\scripts\package_endurance_v3\tests\test_auditor_assisted.py", line 78, in audit
+    self.assertEqual(value['ok'], expected, value)
+AssertionError: False != True : {'errors': ['receipts table missing required columns: tenant, environment, key, generation, manifest_sha256', 'pointer tenant-a/prod: missing DB receipt for tenant-a/prod/first'], 'ok': False, 'receipts': 0}
+
+----------------------------------------------------------------------
+Ran 13 tests in 1.575s
+
+FAILED (failures=10)

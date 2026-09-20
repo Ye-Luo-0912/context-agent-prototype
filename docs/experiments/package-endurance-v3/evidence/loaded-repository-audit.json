@@ -1,0 +1,10 @@
+{
+  "recovery": {
+    "ok": true,
+    "value": 0
+  },
+  "exit": 0,
+  "stdout": "{\"errors\":[],\"ok\":true,\"receipts\":7193}\n",
+  "stderr": "",
+  "auditor": "assisted_quiescent_only"
+}

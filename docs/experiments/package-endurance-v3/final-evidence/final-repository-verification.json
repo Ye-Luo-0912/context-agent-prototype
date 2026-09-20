@@ -1,0 +1,65 @@
+{
+  "status": "PASS",
+  "recorded_epoch": 1789896493.6457117,
+  "source_identity_unchanged": true,
+  "batches": 1794,
+  "verified_install_receipts": 7176,
+  "actual_overlap_batches": 1794,
+  "reported_overlap_batches": 1794,
+  "crashes": 2,
+  "worker_cleanups": 7,
+  "host_cleanups": 4,
+  "host_cases": 7,
+  "recovery": {
+    "ok": true,
+    "value": 0
+  },
+  "auditor": {
+    "errors": [],
+    "ok": true,
+    "receipts": 7177
+  },
+  "auditor_source_sha256": "0cba6a4905e67e2a201830d8d1b8d1621b7742ff036d247235bc7f9083dc2a07",
+  "audited_bytes_unchanged": true,
+  "audited_files": 183,
+  "tenant_receipts": [
+    [
+      "load-0",
+      "prod",
+      1794,
+      1,
+      1794
+    ],
+    [
+      "load-1",
+      "prod",
+      1794,
+      1,
+      1794
+    ],
+    [
+      "load-2",
+      "prod",
+      1794,
+      1,
+      1794
+    ],
+    [
+      "load-3",
+      "prod",
+      1794,
+      1,
+      1794
+    ],
+    [
+      "runtime",
+      "prod",
+      1,
+      1,
+      1
+    ]
+  ],
+  "provider_paid_calls": 0,
+  "timeline_sha256": "98979abd24d96d971931c9aacf0ac352eb8fe457c07a0e396f8e55e77d98dd31",
+  "first_install_to_last_finish_seconds": 1799.0050616264343
+}

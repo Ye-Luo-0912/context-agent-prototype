@@ -1,0 +1,164 @@
+{
+  "status": "FAIL",
+  "results": [
+    {
+      "case": "valid_history",
+      "status": "FAIL",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"cannot inspect receipts table: unable to open database file\",\"pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second\"],\"ok\":false,\"receipts\":0}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "cannot inspect receipts table: unable to open database file",
+            "pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second"
+          ],
+          "ok": false,
+          "receipts": 0
+        },
+        "error_type": "AssertionError",
+        "error": "('valid_history', True, {'errors': ['cannot inspect receipts table: unable to open database file', 'pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second'], 'ok': False, 'receipts': 0})",
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "corrupt_blob",
+      "status": "PASS",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"cannot inspect receipts table: unable to open database file\",\"pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second\"],\"ok\":false,\"receipts\":0}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "cannot inspect receipts table: unable to open database file",
+            "pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second"
+          ],
+          "ok": false,
+          "receipts": 0
+        },
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "corrupt_manifest",
+      "status": "PASS",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"cannot inspect receipts table: unable to open database file\",\"pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second\"],\"ok\":false,\"receipts\":0}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "cannot inspect receipts table: unable to open database file",
+            "pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second"
+          ],
+          "ok": false,
+          "receipts": 0
+        },
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "orphan_pointer_no_receipts",
+      "status": "PASS",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"cannot inspect receipts table: unable to open database file\",\"pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second\"],\"ok\":false,\"receipts\":0}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "cannot inspect receipts table: unable to open database file",
+            "pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second"
+          ],
+          "ok": false,
+          "receipts": 0
+        },
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "pointer_mismatch",
+      "status": "PASS",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"cannot inspect receipts table: unable to open database file\",\"pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second\"],\"ok\":false,\"receipts\":0}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "cannot inspect receipts table: unable to open database file",
+            "pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second"
+          ],
+          "ok": false,
+          "receipts": 0
+        },
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    },
+    {
+      "case": "unsafe_digest",
+      "status": "PASS",
+      "detail": {
+        "exit": 1,
+        "stdout": "{\"errors\":[\"cannot inspect receipts table: unable to open database file\",\"pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second\"],\"ok\":false,\"receipts\":0}\n",
+        "stderr": "",
+        "output": {
+          "errors": [
+            "cannot inspect receipts table: unable to open database file",
+            "pointer tenant-a/prod: missing DB receipt for tenant-a/prod/second"
+          ],
+          "ok": false,
+          "receipts": 0
+        },
+        "cleanup": {
+          "graceful_signal": null,
+          "taskkill_exit": null,
+          "outcome": "already_exited",
+          "scope": "windows_job",
+          "tree_confirmed": true,
+          "active_processes": 0,
+          "active_before_kill": 0
+        }
+      }
+    }
+  ],
+  "audit_source_sha256": "ca1ff629ef1f8ade81f670faf8bd3a79a1df4b17d6a11b17a4afddf4468bed86"
+}

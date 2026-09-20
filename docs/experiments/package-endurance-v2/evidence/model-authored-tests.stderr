@@ -1,0 +1,21 @@
+test_cycle_rejected (test_resolver.ResolveBacktracking.test_cycle_rejected) ... ok
+test_lex_greatest_tradeoff (test_resolver.ResolveBacktracking.test_lex_greatest_tradeoff) ... ok
+test_lexicographically_greatest (test_resolver.ResolveBacktracking.test_lexicographically_greatest) ... ok
+test_missing_dependency_rejected (test_resolver.ResolveBacktracking.test_missing_dependency_rejected) ... ok
+test_never_drops_root (test_resolver.ResolveBacktracking.test_never_drops_root) ... ok
+test_oracle_cycle_backtracks_to_acyclic (test_resolver.ResolveBacktracking.test_oracle_cycle_backtracks_to_acyclic) ... ok
+test_oracle_two_roots (test_resolver.ResolveBacktracking.test_oracle_two_roots) ... ok
+test_shared_constraint_intersection (test_resolver.ResolveBacktracking.test_shared_constraint_intersection) ... ok
+test_transitive_dep_closure (test_resolver.ResolveBacktracking.test_transitive_dep_closure) ... ok
+test_unsatisfiable_graph (test_resolver.ResolveBacktracking.test_unsatisfiable_graph) ... ok
+test_bad_range_rejected (test_resolver.ResolveValidation.test_bad_range_rejected) ... ok
+test_bool_version_rejected (test_resolver.ResolveValidation.test_bool_version_rejected) ... ok
+test_duplicate_version_inconsistent_rejected (test_resolver.ResolveValidation.test_duplicate_version_inconsistent_rejected) ... ok
+test_illegal_name_rejected (test_resolver.ResolveValidation.test_illegal_name_rejected) ... ok
+test_inputs_unchanged (test_resolver.ResolveValidation.test_inputs_unchanged) ... ok
+test_unknown_keys_rejected (test_resolver.ResolveValidation.test_unknown_keys_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 16 tests in 0.001s
+
+OK

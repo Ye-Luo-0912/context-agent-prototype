@@ -1,0 +1,101 @@
+{
+  "status": "NOT_ACCEPTED_DECISION_BUDGET_EXHAUSTED",
+  "closed_at_utc": "2026-09-19T19:12:09.186048+00:00",
+  "head": "71322074596b7e604be5c8750d350e7d626b0e28",
+  "task_ids": [
+    "9be63252-329a-4fd7-81f9-57bffa9f15ea"
+  ],
+  "usage": {
+    "provider_attempts": 243,
+    "main_decisions": 240,
+    "tool_attempts": 352,
+    "input_tokens": 4184924,
+    "cached_input_tokens": 1260416,
+    "output_tokens": 98015,
+    "estimated_peak_usd": 1.002532896,
+    "unknown_attempts": 0,
+    "reservation_remaining_usd": 0.0
+  },
+  "model_implementation_with_controller_feedback": true,
+  "manual_app_source_edits": false,
+  "application": "FAIL",
+  "publication": "STOPPED_BLIND_REPLAY_OBSERVED",
+  "soak_90_minutes": "NOT_RUN_DEPLOYMENT_GATE_FAILED",
+  "protected_files_checked": 483,
+  "protected_changed": [],
+  "runtime_binary_unchanged": true,
+  "rust_production_changed": false,
+  "runtime_component_checks": [
+    {
+      "command": "cargo test -p agent-runtime --test turn failure_resume:: -- --test-threads=1",
+      "passed": 12,
+      "ignored": 1,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test turn ingest_cancel:: -- --test-threads=1",
+      "passed": 3,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test turn policy::expired_authority_lease_rolls_back_the_staged_effect -- --exact",
+      "passed": 1,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test turn stream:: -- --test-threads=1",
+      "passed": 9,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test actor cold_consumption_ack:: -- --test-threads=1",
+      "passed": 1,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p tool-runtime stale_base_revision_is_typed_and_does_not_mutate -- --test-threads=1",
+      "passed": 1,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test turn effects:: -- --test-threads=1",
+      "passed": 16,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test turn completion::task_complete_without_evidence_policy_returns_a_model_visible_refusal -- --exact",
+      "passed": 1,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    },
+    {
+      "command": "cargo test -p agent-runtime --test turn completion::task_complete_without_a_registered_proof_route_fails_closed -- --exact",
+      "passed": 1,
+      "exit": 0,
+      "evidence": "executed Codex task command output; component evidence, not paid application trace"
+    }
+  ],
+  "runtime_component_passed": 45,
+  "model_segment_wall_seconds": 526.71,
+  "remaining_model_decisions": 0,
+  "app_documentation_missing": [
+    "README.md",
+    "DESIGN.md",
+    "RECOVERY.md",
+    "RESULT.json"
+  ],
+  "unexercised": [
+    "90-minute deployment load",
+    "two worker deaths during sustained load",
+    "partial tool batch cancellation combined with authority revocation in one new public-host journey",
+    "spoofed PASS text as a new public-host injection",
+    "provider layout A/B task cost comparison"
+  ]
+}

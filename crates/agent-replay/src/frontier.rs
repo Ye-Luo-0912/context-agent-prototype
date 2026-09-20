@@ -36,6 +36,10 @@ pub struct FrontierRebuild {
     pub invalidations: u64,
     /// Peak of consecutive non-advance actions (advisory fires at 5).
     pub no_advance_peak: u32,
+    /// Peak of consecutive actions without artifact or acceptance progress
+    /// (advisory fires at 5). Reading an externally updated feedback file is
+    /// knowledge, so it lifts this peak while `no_advance_peak` resets.
+    pub delivery_no_advance_peak: u32,
     /// Final monotonic evidence revision of the rebuilt state.
     pub evidence_revision: u64,
 }
@@ -66,6 +70,9 @@ pub fn rebuild_frontier(envelopes: &[RuntimeEventEnvelope]) -> FrontierRebuild {
         rebuild.no_advance_peak = rebuild
             .no_advance_peak
             .max(observation.actions_since_frontier_advance);
+        rebuild.delivery_no_advance_peak = rebuild
+            .delivery_no_advance_peak
+            .max(observation.actions_since_delivery_advance);
     }
     rebuild.evidence_revision = state.convergence.evidence_revision;
     rebuild.operational_evidence = state.view().operational_evidence;
@@ -125,5 +132,35 @@ mod tests {
         let trace = vec![envelope(RuntimeEvent::TurnCompleted)];
         let rebuild = rebuild_frontier(&trace);
         assert_eq!(rebuild, FrontierRebuild::default());
+    }
+
+    #[test]
+    fn heartbeat_reads_lift_delivery_debt_without_touching_the_knowledge_peak() {
+        // 控制器每轮改写反馈文件：每次都是新知识，但没有交付推进。
+        let trace: Vec<_> = (0..6)
+            .map(|round| {
+                let mut read = git_status();
+                read.tool_name = "fs.read".into();
+                read.summary = format!("batch {round}");
+                read.model_content = format!("{{\"batch\":{round}}}");
+                read.metadata = json!({
+                    "path": "runtime-feedback/latest.json",
+                    "revision": format!("batch-{round}"),
+                });
+                envelope(RuntimeEvent::ToolFinished {
+                    output: read,
+                    facts: None,
+                })
+            })
+            .collect();
+        let rebuild = rebuild_frontier(&trace);
+        assert_eq!(
+            rebuild.no_advance_peak, 0,
+            "every heartbeat read is new knowledge"
+        );
+        assert!(
+            rebuild.delivery_no_advance_peak >= 5,
+            "the delivery debt must keep growing: {rebuild:?}"
+        );
     }
 }

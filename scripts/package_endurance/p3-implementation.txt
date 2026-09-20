@@ -1,0 +1,16 @@
+Continue this exact task and retain landed resolver fixes. Independent oracle
+now confirms basic dependency backtracking; Repository is still a stub.
+Last failures were MALFORMED edit_patch arguments: missing closing brackets,
+not output token exhaustion. Avoid edit.patch entirely in this segment.
+Use fs.write for small complete modules (under 150 lines per call); serialize
+valid JSON. Implement repository persistence and install now, not more resolver
+plans. Split the implementation into modules under app/ and retain the
+Repository facade and every public API in SPEC.md. Implement verified blobs,
+canonical manifests, scoped request-bound receipts, transaction/journal recovery,
+GC root retention, worker CLI, migration, publication and tests. New modules
+can be written sequentially with fs.write; observe real tool outcomes each time.
+Do not claim completed until process.run tests actually pass. Two test commands:
+-m unittest discover -s tests -v
+-m unittest discover -s app/tests -v
+Use the granted absolute Python executable as argv[0]. All repairs count toward
+the same fixed campaign allocation. No external controller files or network.

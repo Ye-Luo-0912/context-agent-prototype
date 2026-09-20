@@ -1,0 +1,39 @@
+{
+  "status": "FAIL",
+  "source": "synthetic_provider_real_host_public_protocol",
+  "cases": [
+    {
+      "case": "T1_T2_T1_wrong_task_refused",
+      "status": "PASS",
+      "detail": {
+        "t1": "c43712c6-d57e-48bc-b298-6088ba066e0f",
+        "t2": "3feebb2b-8f8a-4f5d-a40d-44f213095072",
+        "wrong": {
+          "active_task_id": "c43712c6-d57e-48bc-b298-6088ba066e0f",
+          "disposition": "rejected",
+          "rejection": "expected_task_mismatch"
+        }
+      }
+    },
+    {
+      "case": "running_steer_queue_saturation",
+      "status": "PASS",
+      "detail": {
+        "queued": {
+          "disposition": "queued",
+          "task_id": "c43712c6-d57e-48bc-b298-6088ba066e0f"
+        },
+        "saturated": {
+          "active_task_id": "c43712c6-d57e-48bc-b298-6088ba066e0f",
+          "disposition": "rejected",
+          "rejection": "queue_full"
+        }
+      }
+    }
+  ],
+  "error_type": "EOFError",
+  "error": "host closed mid-frame",
+  "pids": [
+    15352
+  ]
+}

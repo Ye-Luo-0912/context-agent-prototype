@@ -1233,6 +1233,11 @@ pub struct TaskProgressView {
     /// 不阻断执行。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frontier_warning: Option<String>,
+    /// 交付停滞软提示：连续多轮没有产物变更、通过的验证或义务解除时的
+    /// advisory 行。只读知识更新（包括反复读到被外部控制器改写的外部反馈
+    /// 文件）不解除它。不阻断执行，也不是完成或权限声明。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_warning: Option<String>,
     /// LONG-TASK advisory: one bounded statement that the whole task may
     /// now be closed, projected only while a derived completion-opportunity
     /// lease is outstanding for this decision. Never an execution block.
@@ -1269,6 +1274,7 @@ impl TaskProgressView {
             && self.unresolved_blockers.is_empty()
             && self.stall_warning.is_none()
             && self.frontier_warning.is_none()
+            && self.delivery_warning.is_none()
             && self.completion_opportunity.is_none()
             && self.settlement.is_none()
     }

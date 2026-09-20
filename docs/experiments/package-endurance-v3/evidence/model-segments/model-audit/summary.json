@@ -1,0 +1,70 @@
+{
+  "outcome": "completed",
+  "categories": [
+    "child_nonzero"
+  ],
+  "exit_code": 10,
+  "exit": 1,
+  "child_exit_code": 1,
+  "elapsed": 40.3,
+  "rounds": 14,
+  "tool_calls": 19,
+  "protected_unchanged": true,
+  "terminals": [
+    {
+      "type": "turn_failed",
+      "turn_id": "fa1b9e79-57a9-447b-87c9-876bfde4a86e",
+      "task_id": "46aed40a-8ce7-4267-946c-2fae85dadd7a",
+      "class": "model",
+      "retryable": false
+    }
+  ],
+  "session": {
+    "approval_denied": false,
+    "exit": 1,
+    "kind": "session_end",
+    "round_budget": false,
+    "schema": "agent.headless.v1",
+    "status": "failed",
+    "stop": "failure",
+    "task_completed": false,
+    "task_state": "awaiting_operator_review"
+  },
+  "requests": 15,
+  "budget": {
+    "cap_usd": 1.0,
+    "inherited_ledger": false,
+    "cap_stopped": false,
+    "committed_usd": 0.06422259599999999,
+    "reserved_usd": 0.0,
+    "unknown_usd": 0.0,
+    "reserve_policy": {
+      "strategy": "wire_bytes_plus_8192_and_full_output",
+      "max_output_tokens": 8192,
+      "schema": 1,
+      "created_epoch": 1789859083.9817333,
+      "deadline_epoch": 1789873483.9817333,
+      "main_decisions": 48,
+      "provider_attempts": 64,
+      "tool_attempts": 192,
+      "estimated_cost_usd": 1.0,
+      "load_seconds": 1800
+    }
+  },
+  "cleanup": {
+    "order": [
+      "relay_accept_stopped",
+      "child_stop:already_exited"
+    ],
+    "child": {
+      "graceful_signal": null,
+      "taskkill_exit": null,
+      "outcome": "already_exited",
+      "scope": "windows_job",
+      "tree_confirmed": true,
+      "active_processes": 0,
+      "active_before_kill": 0
+    },
+    "forced_unknown_attempts": []
+  }
+}

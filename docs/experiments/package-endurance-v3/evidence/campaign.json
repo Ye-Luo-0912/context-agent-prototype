@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "created_epoch": 1789859083.9817333,
+  "deadline_epoch": 1789873483.9817333,
+  "main_decisions": 48,
+  "provider_attempts": 64,
+  "tool_attempts": 192,
+  "estimated_cost_usd": 1.0,
+  "load_seconds": 1800
+}

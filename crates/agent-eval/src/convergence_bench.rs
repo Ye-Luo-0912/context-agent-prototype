@@ -289,12 +289,14 @@ pub async fn scenario_operational_evidence() -> anyhow::Result<ConvergenceBenchR
             agent_contracts::RuntimeEvent::ExecutionFrontier {
                 delta,
                 actions_since_frontier_advance,
+                actions_since_delivery_advance,
                 invalidated,
                 ..
             } => {
                 let delta_name = format!("{delta:?}");
                 Some(format!(
-                    "{delta_name}(debt={invalidated},no_advance={actions_since_frontier_advance})"
+                    "{delta_name}(debt={invalidated},no_advance={actions_since_frontier_advance},\
+                     delivery_no_advance={actions_since_delivery_advance})"
                 ))
             }
             _ => None,
@@ -317,10 +319,11 @@ pub async fn scenario_operational_evidence() -> anyhow::Result<ConvergenceBenchR
         passed,
         format!(
             "frontier_advances={}, redundant_evidence_calls={}, no_advance_peak={}, \
-             deltas=[{}], list_meta={list_meta}",
+             delivery_no_advance_peak={}, deltas=[{}], list_meta={list_meta}",
             metrics.frontier_advances,
             metrics.redundant_evidence_calls,
             metrics.frontier_no_advance_peak,
+            metrics.frontier_delivery_no_advance_peak,
             frontier_log.join(", "),
         ),
     ))

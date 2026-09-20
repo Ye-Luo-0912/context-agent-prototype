@@ -1,0 +1,224 @@
+{
+  "status": "FAIL",
+  "results": [
+    {
+      "case": "deterministic_export_inspect_restore_and_idempotency",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'SnapshotError', 'error': \"orphan or unrecognized deployment path 'deployments/alpha'\", 'expected_error': True}",
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c001"
+    },
+    {
+      "case": "real_exit73_before_publish_then_retry",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "(0, '', '')",
+      "elapsed_seconds": 0.14,
+      "artifact_directory": "c002"
+    },
+    {
+      "case": "source_wal_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c003"
+    },
+    {
+      "case": "source_future_schema_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.141,
+      "artifact_directory": "c004"
+    },
+    {
+      "case": "source_outbox_obligation_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c005"
+    },
+    {
+      "case": "source_disk_journal_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.14,
+      "artifact_directory": "c006"
+    },
+    {
+      "case": "source_corrupt_blob_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c007"
+    },
+    {
+      "case": "source_missing_manifest_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c008"
+    },
+    {
+      "case": "source_stale_pointer_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.109,
+      "artifact_directory": "c009"
+    },
+    {
+      "case": "source_extra_root_file_refused",
+      "status": "PASS",
+      "detail": {
+        "source_unchanged": true
+      },
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c010"
+    },
+    {
+      "case": "archive_traversal_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.204,
+      "artifact_directory": "c011"
+    },
+    {
+      "case": "archive_duplicate_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.187,
+      "artifact_directory": "c012"
+    },
+    {
+      "case": "archive_extra_member_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.219,
+      "artifact_directory": "c013"
+    },
+    {
+      "case": "archive_compression_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.187,
+      "artifact_directory": "c014"
+    },
+    {
+      "case": "archive_missing_object_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.188,
+      "artifact_directory": "c015"
+    },
+    {
+      "case": "archive_corrupt_object_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.203,
+      "artifact_directory": "c016"
+    },
+    {
+      "case": "archive_noncanonical_json_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.203,
+      "artifact_directory": "c017"
+    },
+    {
+      "case": "archive_boolean_generation_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.188,
+      "artifact_directory": "c018"
+    },
+    {
+      "case": "archive_wrong_current_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.172,
+      "artifact_directory": "c019"
+    },
+    {
+      "case": "archive_over_member_cap_with_extra_names_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.203,
+      "artifact_directory": "c020"
+    },
+    {
+      "case": "archive_oversized_object_with_wrong_digest_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.203,
+      "artifact_directory": "c021"
+    },
+    {
+      "case": "archive_link_member_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.187,
+      "artifact_directory": "c022"
+    },
+    {
+      "case": "archive_duplicate_json_key_refused",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.172,
+      "artifact_directory": "c023"
+    },
+    {
+      "case": "existing_empty_destination_conflict",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c024"
+    },
+    {
+      "case": "existing_corrupt_destination_conflict",
+      "status": "FAIL",
+      "error_type": "AssertionError",
+      "error": "{'ok': False, 'error_type': 'AttributeError', 'error': \"module 'app.snapshot' has no attribute 'restore_snapshot'\", 'expected_error': False}",
+      "elapsed_seconds": 0.157,
+      "artifact_directory": "c025"
+    },
+    {
+      "case": "cli_single_document_success_and_failure",
+      "status": "FAIL",
+      "error_type": "JSONDecodeError",
+      "error": "Expecting value: line 1 column 1 (char 0)",
+      "elapsed_seconds": 0.125,
+      "artifact_directory": "c026"
+    }
+  ],
+  "candidate_sha256": "249bdc950715128497baff2f454fae3d1509b41c4b2bb5c746017e42781d7288",
+  "provider_paid_calls": 0,
+  "coverage": "bounded named cases; not every invalid ZIP/filesystem mutation"
+}
