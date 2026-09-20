@@ -1,9 +1,10 @@
 //! Algorithm tests for ExecutionState (formerly ResumePoint).
 
 use super::state::{
-    FRONTIER_ADVISORY_THRESHOLD, MAX_NEGATIVE_FACTS, MAX_OBLIGATIONS, MAX_RESUME_FAILURES,
-    MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_FACTS, MAX_VERIFICATION_SOURCES,
-    STALL_THRESHOLD, StallState, VerificationCause, VerificationCoverage, VerificationState,
+    DELIVERY_ADVISORY_THRESHOLD, FRONTIER_ADVISORY_THRESHOLD, MAX_NEGATIVE_FACTS, MAX_OBLIGATIONS,
+    MAX_RESUME_FAILURES, MAX_RESUME_FILES, MAX_REVALIDATE_PER_ROUND, MAX_VERIFICATION_FACTS,
+    MAX_VERIFICATION_SOURCES, STALL_THRESHOLD, StallState, VerificationCause, VerificationCoverage,
+    VerificationState,
 };
 use super::*;
 use agent_contracts::{
@@ -1657,6 +1658,125 @@ fn frontier_warning_reports_unknown_coverage_not_repetition() {
             .iter()
             .any(|delta| { matches!(delta, agent_contracts::FrontierDelta::RedundantEvidence) })
     );
+}
+
+/// 审查 5.2/§7 回归：外部控制器每轮都改写它自己的反馈文件时，新内容只是
+/// 知识更新。它推进知识前沿，但不得清空交付停滞，否则"又读到一份新的
+/// 监控快照"会无限推后任务级停滞。
+#[test]
+fn externally_updated_feedback_reads_never_clear_the_delivery_stall() {
+    let mut resume = ExecutionState::default();
+    let mut last = None;
+    for round in 0..(DELIVERY_ADVISORY_THRESHOLD as u64 + 1) {
+        let mut read = read_output("runtime-feedback/latest.json", &format!("batch-{round}"));
+        read.model_content = format!("{{\"batch\":{round},\"elapsed\":{round}}}");
+        let observation = resume.observe_tool(&read, 1, round + 1);
+        assert_eq!(
+            observation.delta,
+            FrontierDelta::EvidenceAdvanced,
+            "round {round}: a changed feedback body is new knowledge"
+        );
+        assert_eq!(
+            observation.actions_since_frontier_advance, 0,
+            "round {round}: the knowledge frontier did advance"
+        );
+        last = Some(observation);
+    }
+    let last = last.expect("at least one observation");
+    assert!(
+        last.actions_since_delivery_advance >= DELIVERY_ADVISORY_THRESHOLD,
+        "reading an updated feedback file is not artifact or acceptance progress: {last:?}"
+    );
+    let warning = resume
+        .delivery_warning()
+        .expect("the task-level stall must not be deferred by heartbeats");
+    assert!(warning.contains("DELIVERY STALL"), "{warning}");
+    assert!(warning.contains("feedback"), "{warning}");
+    assert_eq!(
+        resume.view().delivery_warning.as_deref(),
+        Some(warning.as_str()),
+        "the model-visible projection carries the delivery signal"
+    );
+    assert!(
+        resume.frontier_warning().is_none(),
+        "knowledge keeps advancing, so the frontier hint stays quiet"
+    );
+    assert!(
+        resume.stall_warning().is_none(),
+        "new knowledge is not a repeated-failure stall"
+    );
+}
+
+/// 交付停滞只被真正的产物变更解除。
+#[test]
+fn artifact_change_clears_the_delivery_stall() {
+    let mut resume = ExecutionState::default();
+    for round in 0..(DELIVERY_ADVISORY_THRESHOLD as u64 + 1) {
+        let mut read = read_output("runtime-feedback/latest.json", &format!("batch-{round}"));
+        read.model_content = format!("{{\"batch\":{round}}}");
+        resume.observe_tool(&read, 1, round + 1);
+    }
+    assert!(resume.delivery_warning().is_some());
+    let mut edit = output("edit.replace", true, "edited");
+    edit.metadata = json!({ "path": "app/live_backup.py", "revision": "after1" });
+    let observation = resume.observe_tool(&edit, 1, 40);
+    assert_eq!(observation.delta, FrontierDelta::ObservedWorldChange);
+    assert_eq!(
+        observation.actions_since_delivery_advance, 0,
+        "an accepted artifact change is delivery progress"
+    );
+    assert!(resume.delivery_warning().is_none());
+}
+
+/// 通过的验证是验收证据，同样解除交付停滞。
+#[test]
+fn passing_verification_clears_the_delivery_stall() {
+    let mut resume = ExecutionState::default();
+    for round in 0..(DELIVERY_ADVISORY_THRESHOLD as u64 + 1) {
+        let mut read = read_output("runtime-feedback/latest.json", &format!("batch-{round}"));
+        read.model_content = format!("{{\"batch\":{round}}}");
+        resume.observe_tool(&read, 1, round + 1);
+    }
+    assert!(resume.delivery_warning().is_some());
+    let mut verify = output("process.run", true, "cargo test -p app: pass");
+    verify.metadata = json!({ "path": "app/live_backup.py", "revision": "rev-9" });
+    let trusted = RuntimeExecutionAttribution {
+        host: ToolExecutionAttribution::bounded(
+            ToolExecutionPurpose::Verify,
+            ["app/live_backup.py".into()],
+            VerificationReuse::TaskScoped,
+        ),
+        rooted_targets: vec!["app/live_backup.py".into()],
+    };
+    let observation = resume.observe_tool_attributed(&verify, 1, 60, "trusted-verify", &trusted);
+    assert_eq!(
+        observation.actions_since_delivery_advance, 0,
+        "a passing verification is acceptance evidence"
+    );
+    assert!(resume.delivery_warning().is_none());
+}
+
+/// 未知足迹既不算交付推进，也不冒充重复行为。
+#[test]
+fn unknown_footprint_neither_delivers_nor_fabricates_repetition() {
+    let mut resume = ExecutionState::default();
+    for round in 0..(DELIVERY_ADVISORY_THRESHOLD as u64 + 1) {
+        let mut read = read_output("runtime-feedback/latest.json", &format!("batch-{round}"));
+        read.model_content = format!("{{\"batch\":{round}}}");
+        resume.observe_tool(&read, 1, round + 1);
+    }
+    let before = resume.convergence.actions_since_delivery_advance;
+    let observation = resume.observe_tool(
+        &pathless_command("process.run", true, "cargo build", "compiled"),
+        1,
+        80,
+    );
+    assert_eq!(observation.delta, FrontierDelta::WorldInvalidatedUnknown);
+    assert!(
+        observation.actions_since_delivery_advance > before,
+        "an unprovable footprint is not delivery progress"
+    );
+    assert!(resume.delivery_warning().is_some());
 }
 
 #[test]

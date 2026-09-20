@@ -787,6 +787,7 @@ fn metrics_json(metrics: &RunMetrics) -> serde_json::Value {
         "redundant_evidence_calls": metrics.redundant_evidence_calls,
         "reconfirmed_evidence_calls": metrics.reconfirmed_evidence_calls,
         "frontier_no_advance_peak": metrics.frontier_no_advance_peak,
+        "frontier_delivery_no_advance_peak": metrics.frontier_delivery_no_advance_peak,
         "evidence_invalidations": metrics.evidence_invalidations,
         "outcome_frontier_advances": metrics.outcome_frontier_advances,
         "outcome_mutation_results": metrics.outcome_mutation_results,

@@ -31,6 +31,11 @@ pub(super) const STALL_THRESHOLD: u32 = 3;
 pub(super) const STALL_CLUSTER_DISTINCT_TARGETS: u32 = 2;
 /// 连续无前沿推进的动作数达到该值即给收敛 advisory（软提示，不阻断）。
 pub(super) const FRONTIER_ADVISORY_THRESHOLD: u32 = 5;
+
+/// 交付停滞 advisory 阈值。数值与前沿阈值相同，但统计口径不同：
+/// 只累计"没有产物变更、验证通过或义务解除"的动作。只读知识更新——
+/// 包括反复读到被外部控制器改写的外部反馈文件——不解除它。
+pub(super) const DELIVERY_ADVISORY_THRESHOLD: u32 = FRONTIER_ADVISORY_THRESHOLD;
 /// 前沿证据行数上限（最新在前）。
 const MAX_EVIDENCE_ROWS: usize = 16;
 /// A single semantic evidence row may retain several disjoint fs.read
@@ -59,6 +64,8 @@ pub(super) const MAX_VERIFICATION_SOURCES: usize = 4;
 pub struct FrontierObservation {
     pub delta: FrontierDelta,
     pub actions_since_frontier_advance: u32,
+    /// 无产物变更/验收推进的动作连击（知识更新不解除）。
+    pub actions_since_delivery_advance: u32,
     pub evidence_revision: u64,
     pub invalidated: u64,
     /// 本次观察产生的义务账目事件（有界）。
@@ -97,6 +104,19 @@ pub(super) enum ResourceObservation {
     None,
     Reconfirmed,
     Advanced,
+}
+
+/// 一轮观察的推进类别。知识更新不等于交付推进：读到一份被外部控制器
+/// 反复改写的外部反馈文件是知识更新，不是产物变更，也不是验收推进
+/// （审查 5.2：反馈心跳不得清空任务级停滞）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FrontierProgress {
+    /// 本轮没有可证明的前沿推进。
+    None,
+    /// 只有知识更新：新的只读事实、只读证据或语义证据重新确认。
+    Knowledge,
+    /// 交付推进：已知足迹的产物变更、通过的验证结果，或一条义务解除。
+    Delivery,
 }
 
 impl ResourceObservation {
@@ -419,6 +439,12 @@ pub struct ConvergenceState {
     pub evidence_revision: u64,
     #[serde(default)]
     pub actions_since_frontier_advance: u32,
+    /// 交付推进债：只有产物变更（已知足迹的 mutation）、通过的验证或
+    /// 义务解除能清零。只读知识更新——包括反复读到被外部控制器改写的
+    /// 外部反馈文件——只清零知识前沿，不能清零这里。它让"又读到一份新的
+    /// 监控快照"不能无限推后任务级停滞（审查 5.2/§7）。
+    #[serde(default)]
+    pub actions_since_delivery_advance: u32,
     /// 最近 delta，最旧在前，有界环形。
     #[serde(default)]
     pub recent_deltas: Vec<FrontierDelta>,
@@ -1399,6 +1425,7 @@ impl ExecutionState {
             unresolved_blockers: self.obligation_warnings(),
             stall_warning: self.stall_warning(),
             frontier_warning: self.frontier_warning(),
+            delivery_warning: self.delivery_warning(),
             completion_opportunity: None,
             // The task-aware settlement fact is filled by the actor only
             // when the projection switch is on and the joined label rises
@@ -1468,6 +1495,34 @@ impl ExecutionState {
         ))
     }
 
+    /// 交付停滞 advisory：连续 [`DELIVERY_ADVISORY_THRESHOLD`] 个动作没有
+    /// 产物变更、通过的验证或义务解除即触发。只读知识更新（含反复读到被
+    /// 外部控制器改写的外部反馈文件）推进知识前沿，但不解除这里，否则
+    /// "又读到一份新的监控快照"会无限推后任务级停滞（审查 5.2/§7）。
+    /// 软提示：模型仍自主选择下一步；它不是验收，也不是权限来源。
+    pub(super) fn delivery_warning(&self) -> Option<String> {
+        if self.convergence.actions_since_delivery_advance < DELIVERY_ADVISORY_THRESHOLD {
+            return None;
+        }
+        let target = if self.stall.target.is_empty() {
+            "unknown target"
+        } else {
+            &self.stall.target
+        };
+        let blocker = self
+            .stall
+            .failure
+            .map(|class| class.as_str().to_string())
+            .unwrap_or_else(|| "none recorded".into());
+        Some(format!(
+            "EXECUTION DELIVERY STALL: {} action(s) without artifact or acceptance progress (unresolved failed operations: {}, last blocker: {} on {}). New observations, including an externally updated feedback file, only update knowledge: change the artifact, resolve the blocker, or finish with the current state.",
+            self.convergence.actions_since_delivery_advance,
+            self.unresolved_failed_command_count(),
+            blocker,
+            target
+        ))
+    }
+
     /// 有界的确定性停滞提示。两个检测器共用：同签名重复与跨目标同类
     /// 聚类，先触发者生效。仅建议，模型仍自主选择。
     pub(super) fn stall_warning(&self) -> Option<String> {
@@ -1514,8 +1569,10 @@ impl ExecutionState {
         failure: Option<ToolFailureClass>,
         delta: FrontierDelta,
         evidence: ObservationEvidence,
+        progress: FrontierProgress,
     ) {
         self.push_delta(delta);
+        let delivered = matches!(progress, FrontierProgress::Delivery);
         if delta.advances_frontier() {
             self.stall = StallState::default();
             self.failure_cluster = FailureCluster::default();
@@ -1525,11 +1582,24 @@ impl ExecutionState {
             // non-advancing run emits its hints again.
             self.stall_advice_emitted = false;
             self.frontier_advice_emitted = false;
+            // 知识前沿推进不等于交付推进：只有产物变更/验证通过/义务解除
+            // 清零交付债，其余推进轮同样记一笔未交付。
+            self.convergence.actions_since_delivery_advance = if delivered {
+                0
+            } else {
+                self.convergence
+                    .actions_since_delivery_advance
+                    .saturating_add(1)
+            };
             return;
         }
         self.convergence.actions_since_frontier_advance = self
             .convergence
             .actions_since_frontier_advance
+            .saturating_add(1);
+        self.convergence.actions_since_delivery_advance = self
+            .convergence
+            .actions_since_delivery_advance
             .saturating_add(1);
         // 失败聚类：任何带失败类别的非推进轮都累计——包括未知足迹的
         // 失败运行，换拼写的连击躲不开聚类。
