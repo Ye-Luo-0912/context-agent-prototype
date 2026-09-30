@@ -398,10 +398,18 @@ mod recovery_surface_tests {
 /// model queued for execution, the in-flight operation, and the tool
 /// surface snapshot captured at the round start — budget, prompt and
 /// tool-call validation all share it.
+const MAX_REPEATED_EXHAUSTED_GRANT_DENIALS: u8 = 16;
+
 struct ActiveTurn {
     turn_id: TurnId,
     turn_frame: TurnFrame,
+    /// Settled tool results before this position already entered Context in
+    /// this live turn. The normal end/cancel paths ingest only the suffix.
+    context_ingested_steps: usize,
     model_round: usize,
+    /// Runtime liveness only: Core owns every denial and grant counter. A
+    /// fresh turn starts a fresh observation episode, never fresh authority.
+    exhausted_grant_denials: HashMap<String, u8>,
     pending_tools: VecDeque<ToolCall>,
     /// EXEC-7 (R2-08): a `context.collect` directive whose full GC pass is
     /// parked as a spawned boundary operation. Set at the directive's
@@ -868,7 +876,9 @@ mod edit_attempt_tests {
         let mut turn = ActiveTurn {
             turn_id: TurnId::new(),
             turn_frame: TurnFrame::new("edit the file"),
+            context_ingested_steps: 0,
             model_round: 1,
+            exhausted_grant_denials: HashMap::new(),
             pending_tools: VecDeque::new(),
             deferred_context_collect: false,
             pending_loaded_tools: Vec::new(),

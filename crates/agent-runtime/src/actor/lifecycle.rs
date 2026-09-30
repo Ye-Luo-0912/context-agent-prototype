@@ -123,11 +123,11 @@ impl RuntimeActor {
             .await;
         match verdict {
             ApprovalVerdict::Allowed => Ok(()),
-            ApprovalVerdict::Denied(message) | ApprovalVerdict::Failed(message) => {
-                Err(AgentError::InvalidRequest(format!(
-                    "boundary anchor patch denied by approval policy: {message}"
-                )))
-            }
+            ApprovalVerdict::Denied(message)
+            | ApprovalVerdict::DeniedDetailed { message, .. }
+            | ApprovalVerdict::Failed(message) => Err(AgentError::InvalidRequest(format!(
+                "boundary anchor patch denied by approval policy: {message}"
+            ))),
         }
     }
 

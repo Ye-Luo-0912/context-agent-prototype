@@ -414,6 +414,11 @@ fn mutation_lock_key(relative: &str) -> String {
 pub struct Workspace {
     root: PathBuf,
     state_dir: PathBuf,
+    /// Pinned handle for the trusted runtime state tree.  The default state
+    /// directory is a child of `root`; benchmark integrations may place it
+    /// outside the task tree so artifact collection cannot capture journals,
+    /// checkpoints or model-facing runtime artifacts.
+    state_handle: Arc<ConfinedDir>,
     effect_journal: Arc<journal::WorkspaceEffectJournal>,
     process_journal: Arc<process_journal::ProcessEffectJournal>,
     remote_journal: Arc<remote_journal::RemoteEffectJournal>,
@@ -468,12 +473,31 @@ impl MutationSnapshot {
 
 impl Workspace {
     pub async fn open(root: impl AsRef<Path>) -> AgentResult<Self> {
+        Self::open_impl(root.as_ref(), None).await
+    }
+
+    /// Open a workspace with trusted runtime state stored outside the task
+    /// tree.  `state_dir` is a Core/composition-root choice; model-facing
+    /// paths remain confined to `root`, while journals and artifacts use the
+    /// pinned state handle.  An external state directory must not be inside
+    /// the workspace, otherwise an official artifact collector could still
+    /// capture it.
+    pub async fn open_with_state_dir(
+        root: impl AsRef<Path>,
+        state_dir: impl AsRef<Path>,
+    ) -> AgentResult<Self> {
+        Self::open_impl(root.as_ref(), Some(state_dir.as_ref())).await
+    }
+
+    async fn open_impl(root_path: &Path, external_state_dir: Option<&Path>) -> AgentResult<Self> {
         let root = normalize_canonical(
-            fs::canonicalize(root.as_ref())
+            fs::canonicalize(root_path)
                 .await
                 .map_err(|e| AgentError::Io(format!("canonicalize workspace: {e}")))?,
         );
-        let requested_state_dir = root.join(".focus-agent");
+        let requested_state_dir = external_state_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.join(".focus-agent"));
         match fs::create_dir(&requested_state_dir).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -493,9 +517,15 @@ impl Workspace {
         // `create_dir_all(requested_state_dir/artifacts)` would otherwise
         // follow a pre-planted symlink/junction and write outside the
         // workspace before we had a chance to inspect its canonical target.
-        if state_dir == root || !state_dir.starts_with(&root) {
+        // The default path is required to remain inside the workspace; an
+        // explicit benchmark state path is required to remain outside it.
+        let state_is_inside_workspace = state_dir.starts_with(&root);
+        if state_dir == root
+            || (external_state_dir.is_none() && !state_is_inside_workspace)
+            || (external_state_dir.is_some() && state_is_inside_workspace)
+        {
             return Err(AgentError::InvalidRequest(format!(
-                "runtime state directory resolves outside its dedicated workspace location: {}",
+                "runtime state directory is not isolated from the workspace: {}",
                 requested_state_dir.display()
             )));
         }
@@ -509,14 +539,19 @@ impl Workspace {
             )));
         }
         // Pin the runtime-state path before creating anything underneath it.
-        // A path-based `create_dir_all(.focus-agent/artifacts)` could be
-        // redirected if `.focus-agent` or `artifacts` were swapped for a
-        // symlink/junction after the canonicalization above.
-        let root_dir = ConfinedDir::open_root(&root)
-            .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
-        let state_handle = root_dir
-            .open_child_dir(std::ffi::OsStr::new(".focus-agent"))
-            .map_err(|e| confined_io_error("open runtime state dir", &state_dir, e))?;
+        // A path-based `create_dir_all` could be redirected if the directory
+        // or `artifacts` child were swapped for a symlink/junction after the
+        // canonicalization above.
+        let state_handle = if external_state_dir.is_some() {
+            ConfinedDir::open_root(&state_dir)
+                .map_err(|e| confined_io_error("open runtime state dir", &state_dir, e))?
+        } else {
+            let root_dir = ConfinedDir::open_root(&root)
+                .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
+            root_dir
+                .open_child_dir(std::ffi::OsStr::new(".focus-agent"))
+                .map_err(|e| confined_io_error("open runtime state dir", &state_dir, e))?
+        };
         open_or_create_child_dir(
             &state_handle,
             std::ffi::OsStr::new("artifacts"),
@@ -561,6 +596,7 @@ impl Workspace {
         Ok(Self {
             root,
             state_dir,
+            state_handle: Arc::new(state_handle),
             effect_journal,
             process_journal,
             remote_journal,
@@ -809,7 +845,7 @@ impl Workspace {
     /// artifacts or the change journal.
     pub async fn resolve_mutation(&self, relative: impl AsRef<Path>) -> AgentResult<PathBuf> {
         let path = self.resolve_relative(relative).await?;
-        if path == self.state_dir || path.starts_with(&self.state_dir) {
+        if self.is_runtime_state_path(&path) {
             return Err(AgentError::InvalidRequest(format!(
                 "mutations inside the runtime state directory are not allowed: {}",
                 display_relative(&self.root, &path)
@@ -855,7 +891,7 @@ impl Workspace {
             locator.ensure_run(run_id)?;
         }
         let relative = locator_relative_path(&locator);
-        let confined = self.confined_open_read(&relative).await?;
+        let confined = self.confined_open_state_read(&relative).await?;
         let metadata = confined.metadata().map_err(|e| {
             AgentError::Io(format!(
                 "inspect artifact '{}': {e}",
@@ -1094,6 +1130,51 @@ impl Workspace {
         Ok(ConfinedFile::new(file, self.root.join(clean)))
     }
 
+    /// Open a runtime artifact through the pinned state handle.  Artifact
+    /// locators retain their stable `.focus-agent/...` logical spelling even
+    /// when the physical state directory is mounted outside the task root.
+    async fn confined_open_state_read(&self, relative: &Path) -> AgentResult<ConfinedFile> {
+        let clean = clean_relative(relative)?;
+        let mut components = clean.components();
+        match components.next() {
+            Some(Component::Normal(name)) if name == ".focus-agent" => {}
+            _ => {
+                return Err(AgentError::InvalidRequest(format!(
+                    "runtime artifact path must start with .focus-agent: {}",
+                    relative.display()
+                )));
+            }
+        }
+        let mut state_relative = PathBuf::new();
+        for component in components {
+            state_relative.push(component.as_os_str());
+        }
+        if state_relative.as_os_str().is_empty() {
+            return Err(AgentError::InvalidRequest(
+                "cannot open the runtime state directory as a file".into(),
+            ));
+        }
+        let parts: Vec<std::ffi::OsString> = state_relative
+            .components()
+            .map(|component| component.as_os_str().to_owned())
+            .collect();
+        let (last, parents) = parts.split_last().ok_or_else(|| {
+            AgentError::InvalidRequest("cannot open the runtime state directory as a file".into())
+        })?;
+        let mut dir = self.state_handle.clone();
+        for part in parents {
+            let next_display = dir.display().join(part);
+            dir = Arc::new(dir.open_child_dir(part).map_err(|error| {
+                confined_io_error("open runtime state directory", &next_display, error)
+            })?);
+        }
+        let file_display = dir.display().join(last);
+        let file = dir
+            .open_existing(last)
+            .map_err(|error| confined_io_error("open runtime artifact", &file_display, error))?;
+        Ok(ConfinedFile::new(file, self.state_dir.join(state_relative)))
+    }
+
     /// SHA-256 hex of a workspace-relative file, matching `fs.read`'s
     /// content revision. Missing paths return `None`. Files above the
     /// canonical workspace mutation cap are skipped (`InvalidRequest`) so
@@ -1152,7 +1233,7 @@ impl Workspace {
             display.push(part.as_os_str());
             // The state directory is a trusted-core-owned region: no
             // mutation may descend into it (mirrors resolve_mutation).
-            if display == self.state_dir || display.starts_with(&self.state_dir) {
+            if self.is_runtime_state_path(&display) {
                 return Err(AgentError::InvalidRequest(format!(
                     "mutations inside the runtime state directory are not allowed: {}",
                     display_relative(&self.root, &display)
@@ -1501,13 +1582,11 @@ impl Workspace {
     /// followed as a symlink/junction, and the returned handle remains the
     /// authority for the subsequent exclusive file creation.
     fn artifact_run_dir(&self, run_id: RunId) -> AgentResult<ConfinedDir> {
-        let root = ConfinedDir::open_root(&self.root)
-            .map_err(|e| AgentError::Io(format!("open workspace root handle: {e}")))?;
-        let state = root
-            .open_child_dir(std::ffi::OsStr::new(".focus-agent"))
-            .map_err(|e| confined_io_error("open runtime state dir", &self.state_dir, e))?;
-        let artifacts =
-            open_or_create_child_dir(&state, std::ffi::OsStr::new("artifacts"), "artifacts")?;
+        let artifacts = open_or_create_child_dir(
+            &self.state_handle,
+            std::ffi::OsStr::new("artifacts"),
+            "artifacts",
+        )?;
         open_or_create_child_dir(
             &artifacts,
             std::ffi::OsStr::new(&run_id.to_string()),
@@ -1555,6 +1634,14 @@ impl Workspace {
         file.flush()
             .map_err(|e| AgentError::Storage(format!("flush change journal: {e}")))?;
         Ok(())
+    }
+
+    fn is_runtime_state_path(&self, path: &Path) -> bool {
+        let logical_state = self.root.join(".focus-agent");
+        path == logical_state
+            || path.starts_with(&logical_state)
+            || path == self.state_dir
+            || path.starts_with(&self.state_dir)
     }
 
     /// Read the change journal (B3): the newest records first, bounded by
@@ -2788,6 +2875,41 @@ mod tests {
     use super::*;
     use agent_contracts::{ArgumentDigest, EffectId, OperationId, ToolOperationIdentity, TurnId};
     use std::path::Path;
+
+    #[tokio::test]
+    async fn external_state_dir_keeps_runtime_artifacts_out_of_task_root() {
+        let task_root = tempfile::tempdir().unwrap();
+        let state_root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open_with_state_dir(task_root.path(), state_root.path())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            workspace.state_dir(),
+            normalize_canonical(state_root.path().canonicalize().unwrap())
+        );
+        assert!(!task_root.path().join(".focus-agent").exists());
+
+        let run_id = RunId::new();
+        let reference = workspace
+            .write_artifact(run_id, "result", "txt", b"external-state")
+            .await
+            .unwrap();
+        let (_, file) = workspace
+            .open_artifact_for_run(&reference, run_id)
+            .await
+            .unwrap();
+        use tokio::io::AsyncReadExt;
+        let mut content = Vec::new();
+        file.into_tokio().read_to_end(&mut content).await.unwrap();
+        assert_eq!(content, b"external-state");
+        assert!(state_root.path().join("artifacts").is_dir());
+
+        let result = workspace
+            .begin_mutation("fs.write", "write", ".focus-agent/should-not-exist")
+            .await;
+        assert!(matches!(result, Err(AgentError::InvalidRequest(_))));
+    }
 
     fn directory_effect_context() -> OperationEffectContext {
         OperationEffectContext {

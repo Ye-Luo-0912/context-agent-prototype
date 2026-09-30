@@ -171,6 +171,30 @@ impl BuiltinToolDispatcher {
         name == VERIFY_RUN_TOOL_NAME || self.config.always_loaded.iter().any(|core| core == name)
     }
 
+    /// Exclude one optional builtin from this host's catalog before the
+    /// dispatcher is shared. A tool absent from the catalog cannot be loaded
+    /// or shown to the model; Core approval remains the effect authority for
+    /// every tool that does stay available.
+    pub fn without_optional_tool(mut self, name: &str) -> AgentResult<Self> {
+        if self.stays_loaded(name) {
+            return Err(AgentError::InvalidRequest(format!(
+                "cannot exclude required tool {name}"
+            )));
+        }
+        let removed = self
+            .catalog
+            .get_mut()
+            .expect("tool catalog poisoned before sharing")
+            .remove(name);
+        if removed.is_none() {
+            return Err(AgentError::InvalidRequest(format!(
+                "unknown optional tool {name}"
+            )));
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        Ok(self)
+    }
+
     pub fn new(workspace: Workspace) -> Result<Self, VerificationDiscoveryError> {
         let recipes = VerificationRecipes::discover(&workspace)?;
         Ok(Self::with_config_and_verification_recipes(
@@ -1175,6 +1199,32 @@ mod tests {
             inner: BuiltinToolDispatcher::new(workspace).unwrap(),
             _dir: dir,
         }
+    }
+
+    #[tokio::test]
+    async fn host_can_exclude_optional_shell_without_hiding_structured_process() {
+        let (workspace, _dir) = open_workspace().await;
+        let dispatcher = BuiltinToolDispatcher::new(workspace).unwrap();
+        assert!(
+            dispatcher
+                .catalog()
+                .iter()
+                .any(|entry| entry.name == "shell.exec")
+        );
+        let dispatcher = dispatcher.without_optional_tool("shell.exec").unwrap();
+        assert!(
+            !dispatcher
+                .catalog()
+                .iter()
+                .any(|entry| entry.name == "shell.exec")
+        );
+        assert!(
+            dispatcher
+                .catalog()
+                .iter()
+                .any(|entry| entry.name == "process.run")
+        );
+        assert!(dispatcher.load("shell.exec").is_err());
     }
 
     fn request(name: &str, arguments: Value) -> ToolExecutionRequest {

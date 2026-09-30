@@ -10,7 +10,7 @@ use agent_contracts::{
     EffectReconciliation, EngineQuery, OperationEffectContext, OperationId, OperationQueryResult,
     OperationSnapshot, OperationState, OperationTerminal, OutputBroker, ResourceDescriptor, RunId,
     RuntimeEvent, TaskId, ToolCall, ToolDispatcher, ToolExecutionRequest, ToolOperationIdentity,
-    ToolOutcome, ToolOutput, ToolRisk, ToolSurfaceSnapshot,
+    ToolOutcome, ToolOutput, ToolRisk, ToolSpec, ToolSurfaceSnapshot,
 };
 
 use crate::authority::{
@@ -1116,9 +1116,12 @@ impl CoreAuthority {
         // that never reaches the approval gate, the effect journal or
         // completion debt. Snapshots with no profile (legacy formats and
         // hand-built test fixtures) keep the previous behavior.
-        if let Some(profile) = surface.schema_profiles.get(&call.name)
-            && let Some(violation) = profile.validate(&call.arguments).err()
-        {
+        let schema_violation = surface
+            .schema_profiles
+            .get(&call.name)
+            .and_then(|profile| profile.validate(&call.arguments).err())
+            .or_else(|| invalid_process_executable(&call, &spec));
+        if let Some(violation) = schema_violation {
             let message = schema_mismatch_message(&call, &violation);
             if let Err(error) = self
                 .operations
@@ -1154,6 +1157,25 @@ impl CoreAuthority {
                     message.clone(),
                     format!("tool error: {message}"),
                     serde_json::json!({"executed": false}),
+                )));
+            }
+            ApprovalVerdict::DeniedDetailed { message, reason } => {
+                if let Err(error) = self
+                    .operations
+                    .finish_refused(identity.operation_id, &message)
+                {
+                    return refused(ToolOutcome::Value(tool_error_output(
+                        &call,
+                        error.to_string(),
+                    )));
+                }
+                return refused(ToolOutcome::Value(agent_contracts::tool_failure_output(
+                    call.id.clone(),
+                    call.name.clone(),
+                    agent_contracts::ToolFailureClass::ApprovalDenied,
+                    message.clone(),
+                    format!("tool error: {message}"),
+                    serde_json::json!({"executed": false, "approval_denial": reason}),
                 )));
             }
         }
@@ -1314,7 +1336,7 @@ impl CoreAuthority {
                 format!("tool dispatch rejected: {error}"),
             )));
         }
-        let (outcome, mut recovery_required) = match self.tools.execute(request).await {
+        let (mut outcome, mut recovery_required) = match self.tools.execute(request).await {
             Ok(outcome) => (outcome, None),
             Err(error @ AgentError::RecoveryRequired(_)) => {
                 let message = bound_utf8(
@@ -1333,6 +1355,18 @@ impl CoreAuthority {
                 None,
             ),
         };
+        // This diagnostic is minted only by Core's pre-dispatch refusal
+        // above. A granted tool producer cannot forge an exhausted grant to
+        // make Runtime terminate a live, authorized task.
+        let output = match &mut outcome {
+            ToolOutcome::Value(output)
+            | ToolOutcome::PreparedEffect { output, .. }
+            | ToolOutcome::RuntimeDirective { output, .. }
+            | ToolOutcome::EngineQuery { output, .. } => output,
+        };
+        if let Some(metadata) = output.metadata.as_object_mut() {
+            metadata.remove("approval_denial");
+        }
 
         let (outcome, effect_id, value_completion_pending) = match outcome {
             ToolOutcome::PreparedEffect { output, effect } => {
@@ -1776,6 +1810,40 @@ fn schema_mismatch_output(
             }
         }),
     )
+}
+
+/// The JSON-schema subset describes an argv array but cannot constrain only
+/// its first element without also forbidding valid empty *later* arguments.
+/// Reject an empty or shell-quoted program as malformed input before Core
+/// consults approval. `process.run` passes argv directly, so surrounding
+/// quotes are literal filename bytes, not shell syntax to be stripped.
+fn invalid_process_executable(
+    call: &ToolCall,
+    spec: &ToolSpec,
+) -> Option<agent_contracts::SchemaViolation> {
+    if call.name != "process.run" || spec.risk != ToolRisk::ProcessExecution {
+        return None;
+    }
+    let executable = call.arguments.get("argv")?.as_array()?.first()?.as_str()?;
+    let trimmed = executable.trim();
+    if trimmed.is_empty() {
+        return Some(agent_contracts::SchemaViolation {
+            pointer: "/argv/0".into(),
+            expected: "a non-empty executable name".into(),
+            actual: "empty or whitespace-only string".into(),
+        });
+    }
+    if trimmed.len() > 1
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        return Some(agent_contracts::SchemaViolation {
+            pointer: "/argv/0".into(),
+            expected: "an executable name without surrounding shell quotes".into(),
+            actual: "shell-quoted executable string".into(),
+        });
+    }
+    None
 }
 
 fn schema_mismatch_message(

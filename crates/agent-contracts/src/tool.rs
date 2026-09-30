@@ -2410,6 +2410,8 @@ pub enum ToolSurfaceOmissionReason {
     /// The actor reserved the last configured decision for an honest final
     /// response. This says nothing about durable task acceptance.
     DecisionBudgetFinalization,
+    /// Repeated calls need a standing grant that Core says is exhausted.
+    AuthorityExhaustedFinalization,
 }
 
 impl ToolSurfaceOmissionReason {
@@ -2421,6 +2423,7 @@ impl ToolSurfaceOmissionReason {
             Self::Unavailable => "not available at the safe point",
             Self::CompletionFinalization => "completion repair finalization",
             Self::DecisionBudgetFinalization => "decision budget finalization",
+            Self::AuthorityExhaustedFinalization => "exhausted grant finalization",
         }
     }
 }

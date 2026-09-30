@@ -28,8 +28,8 @@
 //! ninth-batch assertions, which stay intact:
 //!
 //! 1. FULL STABLE PREFIX — every round's ENTIRE `input[0..=B]` (B0 against
-//!    the trajectory baseline on every round; the declared B1 region within
-//!    a turn) and the participating tools/schema blocks are compared
+//!    the trajectory baseline on every round; B1 may refresh only after
+//!    settled observation ingress or at a turn boundary) and the tools/schema blocks are compared
 //!    item-for-item, with the first divergent item index named on failure.
 //!    The ninth-batch checks compared `input[B0]` plus sampled adjacent
 //!    first-differences; items before the breakpoint were a blind spot.
@@ -704,6 +704,60 @@ fn first_prefix_divergence(previous: &Value, current: &Value, end: usize) -> Opt
         .position(|(left, right)| left != right)
 }
 
+/// An evidence refresh never permits policy or other declared-prefix drift.
+/// The caller must establish a turn boundary or a real settled tool result.
+fn declared_prefix_change_allowed(
+    previous: &Value,
+    current: &Value,
+    end: usize,
+    evidence_index: usize,
+    evidence_refresh: bool,
+) -> bool {
+    let previous_items = wire_input_items(previous);
+    let current_items = wire_input_items(current);
+    if previous_items.len() <= end || current_items.len() <= end {
+        return false;
+    }
+    (0..=end).all(|index| {
+        previous_items[index] == current_items[index]
+            || (index == evidence_index
+                && evidence_refresh
+                && item_text(&current_items[index]).starts_with("SELECTED WORKING CONTEXT"))
+    })
+}
+
+#[test]
+fn evidence_refresh_preserves_every_other_declared_prefix_item() {
+    let previous = json!({"input": [
+        {"content": [{"text": "stable policy"}]},
+        {"content": [{"text": "SELECTED WORKING CONTEXT old"}]},
+        {"content": [{"text": "another stable block"}]}
+    ]});
+    let mut current = previous.clone();
+    current["input"][1]["content"][0]["text"] = json!("SELECTED WORKING CONTEXT new observation");
+    assert!(!declared_prefix_change_allowed(
+        &previous, &current, 2, 1, false
+    ));
+    assert!(declared_prefix_change_allowed(
+        &previous, &current, 2, 1, true
+    ));
+    for index in [0, 2] {
+        let mut drift = current.clone();
+        drift["input"][index]["content"][0]["text"] = json!("unexpected drift");
+        assert!(!declared_prefix_change_allowed(
+            &previous, &drift, 2, 1, true
+        ));
+    }
+    current["input"][1]["content"][0]["text"] = json!("unstructured replacement");
+    assert!(!declared_prefix_change_allowed(
+        &previous, &current, 2, 1, true
+    ));
+    current["input"].as_array_mut().unwrap().pop();
+    assert!(!declared_prefix_change_allowed(
+        &previous, &current, 2, 1, true
+    ));
+}
+
 /// A bounded single-line preview of one input item for failure output.
 fn item_preview(item: &Value) -> String {
     let text = item_text(item).replace(['\n', '\r'], "\\n");
@@ -886,8 +940,8 @@ fn delivered_big_log_pages(wire: &Value) -> Vec<(u64, u64, String)> {
 /// The scripted trajectory's FIXED turn starts as 1-based round numbers:
 /// T1:R1-3, T2:R4-5, T3:R6, T4:R7-9, T5:R10-12, T6:R13-14, T6b:R15..(the
 /// dynamic walk's completion round), T7:R-last. A turn commit may
-/// legitimately re-render the declared evidence item; mid-turn rounds may
-/// not (the full-prefix checks key off this).
+/// legitimately re-render the declared evidence item. Incrementally ingested
+/// settled observations may also refresh it inside a turn.
 fn turn_start_rounds(total_rounds: usize) -> Vec<usize> {
     vec![1, 4, 6, 7, 10, 13, 15, total_rounds]
 }
@@ -1345,6 +1399,14 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
     // (the read RESULT) is really on the wire — the read is proven by its
     // body, not by the fact that a call was emitted.
     assert_sentinels(&body_of(1), &["ALPHA-REV1-SENTINEL"], 2);
+    assert_eq!(breakpoints[1], vec![b0_index, b0_index + 1]);
+    let r2_evidence = item_text(&wires[1]["input"][b0_index + 1]);
+    assert!(
+        r2_evidence.starts_with("SELECTED WORKING CONTEXT")
+            && r2_evidence.contains("ToolObservation")
+            && r2_evidence.contains("path=notes/alpha"),
+        "R2: settled read identity must enter Context; its body is already visible in the turn tail"
+    );
     let diff = first_input_diff(&wires[0], &wires[1]).expect("R2 differs from R1");
     assert!(
         diff > b0_index,
@@ -1355,11 +1417,8 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
     // the artifact (the write itself is proven by disk, not by wire text).
     assert_sentinels(&body_of(2), &["file updated: evidence.txt"], 3);
 
-    // R3 -> R4: turn 2 begins; turn 1's observations were ingested at its
-    // commit, so the DECLARED EVIDENCE REGION itself now appears: R4 is
-    // the first round that declares B1, the item right after B0, and it
-    // is the SELECTED WORKING CONTEXT block carrying the turn-1 read
-    // observation. This is the "new evidence enters" wire fact.
+    // R3 -> R4: turn 2 begins; the declared evidence region must retain the
+    // settled read that already entered Context incrementally during turn 1.
     let diff = first_input_diff(&wires[2], &wires[3]).expect("R4 differs from R3");
     assert!(
         diff > b0_index,
@@ -1470,10 +1529,9 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
     // before the breakpoint were a blind spot. Three comparisons:
     // (a) every round's whole input[0..=B0] against the trajectory
     //     baseline, item for item;
-    // (b) every adjacent pair's whole DECLARED COMMON prefix — within a
-    //     turn it must be item-for-item identical (the declared evidence
-    //     region may not move while the turn runs);
-    // (c) at a turn start the pair may diverge ONLY at the declared
+    // (b) every adjacent pair's whole DECLARED COMMON prefix; a settled
+    //     observation can refresh only the evidence item, never policy;
+    // (c) at a turn start the pair may likewise diverge ONLY at the declared
     //     evidence item itself, and the re-rendered item must keep the
     //     declared structure. Every failure names the first divergent
     //     item index. The participating tools/schema blocks are compared
@@ -1490,6 +1548,7 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
         }
     }
     let turn_starts = turn_start_rounds(wires.len());
+    let mut mid_turn_evidence_refreshes = 0;
     for previous in 0..wires.len() - 1 {
         let current = previous + 1;
         let common_end = breakpoints[previous]
@@ -1501,19 +1560,23 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
         let divergence = first_prefix_divergence(&wires[previous], &wires[current], common_end);
         let current_is_turn_start = turn_starts.contains(&(current + 1));
         let evidence_index = b0_index + 1;
-        let allowed = match divergence {
-            None => true,
-            // Mid-turn rounds: nothing inside the declared common prefix
-            // may change at all.
-            Some(_) if !current_is_turn_start => false,
-            // A turn start may re-render the declared evidence item, and
-            // only that item — the declared structure must survive.
-            Some(index) if index == evidence_index => {
-                let text = item_text(&wires[current]["input"][evidence_index]);
-                text.starts_with("SELECTED WORKING CONTEXT")
-            }
-            Some(_) => false,
+        let settled_observation = match &served[previous] {
+            Script::Call { call_id, .. } => wire_input_items(&wires[current]).iter().any(|item| {
+                item["type"].as_str() == Some("function_call_output")
+                    && item["call_id"].as_str() == Some(call_id.as_str())
+            }),
+            _ => false,
         };
+        let allowed = declared_prefix_change_allowed(
+            &wires[previous],
+            &wires[current],
+            common_end,
+            evidence_index,
+            current_is_turn_start || settled_observation,
+        );
+        if !current_is_turn_start && divergence == Some(evidence_index) && settled_observation {
+            mid_turn_evidence_refreshes += 1;
+        }
         assert!(
             allowed,
             "rounds {}->{}: the declared stable prefix input[0..={}] diverged at item {:?} \
@@ -1525,7 +1588,7 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
             if current_is_turn_start {
                 "at a turn start only the declared evidence item may change"
             } else {
-                "mid-turn: nothing in the declared prefix may change"
+                "mid-turn: only settled observation ingress may refresh the evidence item"
             },
             divergence
                 .map(|index| item_preview(&wires[previous]["input"][index]))
@@ -1552,6 +1615,10 @@ async fn production_trajectory_of_one_task_over_the_local_capture_server() {
             }
         }
     }
+    assert!(
+        mid_turn_evidence_refreshes > 0,
+        "the production trajectory must exercise incremental evidence refresh"
+    );
 
     // ---- Dimension 4 (tenth batch, class 3): the FULL cost ledger — one
     // known row per SERVED decision, settled exactly once, never invented,

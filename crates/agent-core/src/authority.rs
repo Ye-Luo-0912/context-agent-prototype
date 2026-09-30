@@ -173,6 +173,11 @@ pub enum ApprovalVerdict {
     Allowed,
     /// The policy denied the call; the message is model-facing.
     Denied(String),
+    /// A standing grant was exhausted at the exact authorization decision.
+    DeniedDetailed {
+        message: String,
+        reason: agent_contracts::ApprovalDenialReason,
+    },
     /// The approval machinery itself failed; the message is model-facing.
     Failed(String),
 }
@@ -202,10 +207,28 @@ impl ApprovalAuthority {
         spec: &ToolSpec,
         cancel: &CancellationToken,
     ) -> ApprovalVerdict {
-        match self.approval.authorize(call, spec, cancel).await {
-            Ok(ApprovalDecision::Allow) => ApprovalVerdict::Allowed,
-            Ok(ApprovalDecision::Deny) => {
-                ApprovalVerdict::Denied(format!("tool denied by approval policy: {}", call.name))
+        match self.approval.authorize_detailed(call, spec, cancel).await {
+            Ok(result) if result.decision == ApprovalDecision::Allow => ApprovalVerdict::Allowed,
+            Ok(result) => {
+                let message = format!("tool denied by approval policy: {}", call.name);
+                if let Some(reason) = result.denial {
+                    let detail = match &reason {
+                        agent_contracts::ApprovalDenialReason::GrantExhausted {
+                            grant_id,
+                            used,
+                            max_runs,
+                        } => format!(
+                            "standing grant '{}' exhausted ({used}/{max_runs} executions); operator authorization is required before another matching call",
+                            grant_id.chars().take(80).collect::<String>()
+                        ),
+                    };
+                    ApprovalVerdict::DeniedDetailed {
+                        message: format!("{message}: {detail}"),
+                        reason,
+                    }
+                } else {
+                    ApprovalVerdict::Denied(message)
+                }
             }
             Err(error) => ApprovalVerdict::Failed(format!("approval check failed: {error}")),
         }

@@ -5,7 +5,7 @@ use agent_contracts::{FocusState, ModelMessage, TaskAnchorView, ToolDispatcher};
 use agent_core::{CoreAuthorityConfig, PolicyApprovalGate};
 use agent_runtime::{
     ModelBudget, RuntimeServices, approx_layer_tokens, engine_pack_window, focus_frame_tokens,
-    spawn_runtime,
+    provider_send_window, spawn_runtime,
 };
 use agent_workspace::capture_host_runtime_facts;
 
@@ -13,8 +13,17 @@ use crate::harness::*;
 
 #[tokio::test]
 async fn engine_receives_only_the_context_frame_budget() {
+    for kernel_budget in [24_000, 30_000, 40_000] {
+        assert_context_frame_budget(kernel_budget).await;
+    }
+}
+
+async fn assert_context_frame_budget(kernel_budget: usize) {
     let context = Arc::new(RecordingContextEngine::default());
-    let config = CoreAuthorityConfig::default();
+    let config = CoreAuthorityConfig {
+        context_budget_tokens: kernel_budget,
+        ..Default::default()
+    };
     let max_rounds = config.max_tool_rounds;
     let system_tokens = approx_tokens(&config.system_prompt)
         + approx_tokens(&capture_host_runtime_facts().render());
@@ -54,13 +63,17 @@ async fn engine_receives_only_the_context_frame_budget() {
     // The turn is a single model round; the engine query is recorded before
     // the actor replies, so the budget is observable immediately.
     let turn_tokens = approx_layer_tokens(&[ModelMessage::user("hello")]);
-    let pack_window = engine_pack_window(Some(30_000), 24_000);
+    let send_window = provider_send_window(Some(30_000), kernel_budget);
+    let pack_window = engine_pack_window(Some(30_000), kernel_budget);
+    // The provider-only headroom pays turn tokens first. That capacity must
+    // not be charged twice, but it never raises the engine's pack cap.
+    let turn_charged_to_pack = turn_tokens.saturating_sub(send_window - pack_window);
     let expected = ModelBudget::compute(
         pack_window,
         2_000,
         system_tokens,
         focus_tokens,
-        turn_tokens,
+        turn_charged_to_pack,
         tools_tokens,
     )
     .context_frame_budget;
@@ -70,12 +83,23 @@ async fn engine_receives_only_the_context_frame_budget() {
         assert_eq!(queries.len(), 1, "one model round -> one materialization");
         assert_eq!(
             queries[0].budget_tokens, expected,
-            "the engine must receive the kernel pack cap minus output/system/focus/turn/tools, not the larger provider send window"
+            "Context must receive only the pack remainder; provider-only headroom pays turn tokens once"
         );
         assert!(
-            pack_window < 30_000,
-            "a 30k send window must not raise C's pack cap above the 24k kernel budget"
+            queries[0].budget_tokens <= kernel_budget.min(send_window),
+            "neither a larger provider window nor a larger kernel budget may inflate the pack cap"
         );
+        if kernel_budget >= send_window {
+            assert_eq!(
+                turn_charged_to_pack, turn_tokens,
+                "no headroom preserves the original charge"
+            );
+        } else {
+            assert_eq!(
+                turn_charged_to_pack, 0,
+                "the small turn fits entirely in send-only headroom"
+            );
+        }
     }
 
     handle.stop().await.unwrap();

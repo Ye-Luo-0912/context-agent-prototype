@@ -1,0 +1,168 @@
+{
+  "schema": "tb46-tb47-static-preflight-v1",
+  "created_at_utc": "2026-09-29T04:30:40.276909+00:00",
+  "supplier_calls": 0,
+  "core_grant_approval": "pending",
+  "variants": {
+    "baseline": {
+      "status": "STATIC_READY_NO_PROVIDER_CALLS",
+      "identity": {
+        "protocol": "TB46_BUDGET_BASELINE_56_PAIR_20260929",
+        "arms": [
+          "dynamic",
+          "rolling"
+        ],
+        "rounds_per_arm": 56,
+        "max_provider_attempts_per_arm": 70,
+        "max_input_tokens_per_arm": 8000000,
+        "max_output_tokens_per_arm": 440000,
+        "tool_attempt_stop_threshold": 1400,
+        "agent_timeout_secs": 8400,
+        "provider_profile": "easycli-local-gpt-6-luna",
+        "model": "gpt-6-luna",
+        "provider_base_url": "http://127.0.0.1:8317/v1",
+        "api_protocol": "responses",
+        "responses_reasoning_effort": "max",
+        "api_safe_tool_names": true,
+        "prefer_max_completion_tokens": false,
+        "omit_stream_options": false,
+        "min_request_interval_ms": 1000,
+        "main_request_timeout_secs": 660,
+        "relay_upstream_timeout_secs": 600,
+        "max_retryable_408_retries": 1,
+        "repair_missing_tool_call_ids": false,
+        "declared_context_window": 65536,
+        "per_request_output_tokens": 16384,
+        "stream_retry_mode": "buffered_bounded",
+        "excluded_tool_names": [
+          "shell.exec"
+        ],
+        "maintenance_calls": 0,
+        "maintenance_tokens": 0,
+        "harbor_retries": 0,
+        "model_transport_max_attempts_per_call": 4,
+        "model_transport_format_regenerations": 1,
+        "peak_cache_miss_usd_cap_per_arm": 4,
+        "price_snapshot": {
+          "checked_date": "2026-09-29",
+          "source": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+          "model_version": "GPT-6 Luna via local EasyCLIProxyAPI; reasoning effort max",
+          "basis": "OpenAI direct API list-price equivalent only; EasyCLI Codex Plus subscription quota and actual billing are not measured by this estimate",
+          "proxy_price_verified": false,
+          "tariff_user_provided": false,
+          "subscription_quota": true,
+          "cache_miss_input_usd_per_million": 0.1,
+          "cache_read_input_usd_per_million": 0.01,
+          "output_usd_per_million": 0.5,
+          "max_token_envelope_peak_miss_usd": 1.02,
+          "limit_type": "direct_api_equivalent_not_subscription_quota_cap"
+        },
+        "provider_rate_limits": {
+          "rpm": null,
+          "tpm": null
+        },
+        "task_path": "/home/ye_luo/.cache/context-agent-terminal-bench/tasks-tb38/live-database-cutover",
+        "task_image": "harborframework/terminal-bench:live-database-cutover-environment-5997c5b486ffe2b0",
+        "task_image_id": "sha256:dbd2997e95d6bdde237f94cefb8cdc45ef5c7bbd44ecde02052a6dffcde14054",
+        "binary_compatibility": {
+          "status": "PASS",
+          "task_image_id": "sha256:dbd2997e95d6bdde237f94cefb8cdc45ef5c7bbd44ecde02052a6dffcde14054",
+          "required_help_flag": "--state-dir="
+        },
+        "task_files": {
+          "instruction.md": "7c466c3b181bdda2751d8af68af5d030802bce94d3e9ece62d755af4aa9ec27e",
+          "task.toml_harbor_normalized": "771fb5d6703e63a80d9d468f21d8f090be9df95c2262461ecfe0ac318618a540",
+          "task.toml_official_raw": "3d92be60d134825cdc7c0dc70603938c912200f96cb9c4ffb9d8a297192b5941"
+        },
+        "hashes": {
+          "target-debian12/experiments/tb45-budget-baseline/agent-tui": "88bbf059d1ec56b9cf7abf097a6ab22222ddecde4635212f74e75e1c3bd5fb4d",
+          "scripts/terminal_bench_pilot/run_bounded_b_pair.py": "e92a2106975b33102a80454be33080ca44ae2ae3b2f8f508224411d686977f2f",
+          "scripts/terminal_bench_pilot/harbor_agent.py": "e7a95fb3918612d887183dec76c2d2708db032aee9d47ff8ef3d5608901f74b7",
+          "scripts/terminal_bench_pilot/credential_relay.py": "f817e71dfaf6eaad7cb5444d7d45ae5e851bfbba9af94ea4f31059489a8805b4",
+          "scripts/terminal_bench_pilot/read_probe.py": "4407a9f8e59341ebc73743da698e03053ccf0ab307742326095a84ba7bc63ba9"
+        },
+        "grant_sha256": "0644d7b8628fa2478dce072d656ce726f5ba97b882cbff926d3a22b840584813"
+      }
+    },
+    "treatment": {
+      "status": "STATIC_READY_NO_PROVIDER_CALLS",
+      "identity": {
+        "protocol": "TB47_BUDGET_TREATMENT_56_PAIR_20260929",
+        "arms": [
+          "dynamic",
+          "rolling"
+        ],
+        "rounds_per_arm": 56,
+        "max_provider_attempts_per_arm": 70,
+        "max_input_tokens_per_arm": 8000000,
+        "max_output_tokens_per_arm": 440000,
+        "tool_attempt_stop_threshold": 1400,
+        "agent_timeout_secs": 8400,
+        "provider_profile": "easycli-local-gpt-6-luna",
+        "model": "gpt-6-luna",
+        "provider_base_url": "http://127.0.0.1:8317/v1",
+        "api_protocol": "responses",
+        "responses_reasoning_effort": "max",
+        "api_safe_tool_names": true,
+        "prefer_max_completion_tokens": false,
+        "omit_stream_options": false,
+        "min_request_interval_ms": 1000,
+        "main_request_timeout_secs": 660,
+        "relay_upstream_timeout_secs": 600,
+        "max_retryable_408_retries": 1,
+        "repair_missing_tool_call_ids": false,
+        "declared_context_window": 65536,
+        "per_request_output_tokens": 16384,
+        "stream_retry_mode": "buffered_bounded",
+        "excluded_tool_names": [
+          "shell.exec"
+        ],
+        "maintenance_calls": 0,
+        "maintenance_tokens": 0,
+        "harbor_retries": 0,
+        "model_transport_max_attempts_per_call": 4,
+        "model_transport_format_regenerations": 1,
+        "peak_cache_miss_usd_cap_per_arm": 4,
+        "price_snapshot": {
+          "checked_date": "2026-09-29",
+          "source": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+          "model_version": "GPT-6 Luna via local EasyCLIProxyAPI; reasoning effort max",
+          "basis": "OpenAI direct API list-price equivalent only; EasyCLI Codex Plus subscription quota and actual billing are not measured by this estimate",
+          "proxy_price_verified": false,
+          "tariff_user_provided": false,
+          "subscription_quota": true,
+          "cache_miss_input_usd_per_million": 0.1,
+          "cache_read_input_usd_per_million": 0.01,
+          "output_usd_per_million": 0.5,
+          "max_token_envelope_peak_miss_usd": 1.02,
+          "limit_type": "direct_api_equivalent_not_subscription_quota_cap"
+        },
+        "provider_rate_limits": {
+          "rpm": null,
+          "tpm": null
+        },
+        "task_path": "/home/ye_luo/.cache/context-agent-terminal-bench/tasks-tb38/live-database-cutover",
+        "task_image": "harborframework/terminal-bench:live-database-cutover-environment-5997c5b486ffe2b0",
+        "task_image_id": "sha256:dbd2997e95d6bdde237f94cefb8cdc45ef5c7bbd44ecde02052a6dffcde14054",
+        "binary_compatibility": {
+          "status": "PASS",
+          "task_image_id": "sha256:dbd2997e95d6bdde237f94cefb8cdc45ef5c7bbd44ecde02052a6dffcde14054",
+          "required_help_flag": "--state-dir="
+        },
+        "task_files": {
+          "instruction.md": "7c466c3b181bdda2751d8af68af5d030802bce94d3e9ece62d755af4aa9ec27e",
+          "task.toml_harbor_normalized": "771fb5d6703e63a80d9d468f21d8f090be9df95c2262461ecfe0ac318618a540",
+          "task.toml_official_raw": "3d92be60d134825cdc7c0dc70603938c912200f96cb9c4ffb9d8a297192b5941"
+        },
+        "hashes": {
+          "target-debian12/x86_64-unknown-linux-gnu/debug/agent-tui": "119ba505c31f2444d6674980b62af0d052041ab57e4009ceceff97db568bb262",
+          "scripts/terminal_bench_pilot/run_bounded_b_pair.py": "e92a2106975b33102a80454be33080ca44ae2ae3b2f8f508224411d686977f2f",
+          "scripts/terminal_bench_pilot/harbor_agent.py": "e7a95fb3918612d887183dec76c2d2708db032aee9d47ff8ef3d5608901f74b7",
+          "scripts/terminal_bench_pilot/credential_relay.py": "f817e71dfaf6eaad7cb5444d7d45ae5e851bfbba9af94ea4f31059489a8805b4",
+          "scripts/terminal_bench_pilot/read_probe.py": "4407a9f8e59341ebc73743da698e03053ccf0ab307742326095a84ba7bc63ba9"
+        },
+        "grant_sha256": "0644d7b8628fa2478dce072d656ce726f5ba97b882cbff926d3a22b840584813"
+      }
+    }
+  }
+}

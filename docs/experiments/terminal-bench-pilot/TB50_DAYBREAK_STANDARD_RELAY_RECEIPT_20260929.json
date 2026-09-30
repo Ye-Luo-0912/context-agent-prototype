@@ -1,0 +1,113 @@
+{
+  "max_requests": 1,
+  "max_body_bytes": 4096,
+  "max_output_tokens": 16,
+  "max_input_tokens_total": 8192,
+  "max_output_tokens_total": 16,
+  "max_peak_miss_usd": null,
+  "input_price_milli_usd_per_million": 400,
+  "cached_input_price_milli_usd_per_million": 40,
+  "cached_input_price_is_assumed": false,
+  "output_price_milli_usd_per_million": 2000,
+  "estimated_cost_nano_usd": 154400,
+  "peak_miss_cost_nano_usd": 154400,
+  "api_safe_tool_names": false,
+  "prefer_max_completion_tokens": false,
+  "omit_stream_options": false,
+  "min_request_interval_ms": 0,
+  "upstream_timeout_secs": 60,
+  "repair_missing_tool_call_ids": false,
+  "api_protocol": "responses",
+  "input_tokens_reserved": 0,
+  "output_tokens_reserved": 0,
+  "input_tokens_committed": 306,
+  "cached_input_tokens_committed": 0,
+  "output_tokens_committed": 16,
+  "budget_unknown": false,
+  "budget_exceeded": false,
+  "max_retryable_408_retries": 0,
+  "retryable_408_retries_used": 0,
+  "retryable_408_retry_pending": false,
+  "retryable_408_recovered": false,
+  "non_retryable_unknown": false,
+  "active_calls_after_close": 0,
+  "rejections": {},
+  "attempts": [
+    {
+      "attempt": 1,
+      "input_bytes": 152,
+      "output_cap": 16,
+      "input_tokens_reservation": 4248,
+      "retry_of_unknown_408": false,
+      "state": "completed",
+      "usage": {
+        "attribution": {
+          "items": {
+            "msg_0d180c22a4726878016abb6373db1087d084ac928eb0b88f5e": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "content": [
+                {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0,
+                  "input_tokens": 8,
+                  "output_tokens": 0
+                }
+              ],
+              "input_tokens": 8,
+              "output_tokens": 0
+            },
+            "rs_0d180c22a4726878016abb6374abb487d08647903396404cd5": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "input_tokens": 2,
+              "output_tokens": 9
+            },
+            "msg_0d180c22a4726878016abb6374f55487d09b1fb9f4f3cc8aee": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "content": [
+                {
+                  "cache_write_tokens": 0,
+                  "cached_tokens": 0,
+                  "input_tokens": 0,
+                  "output_tokens": 7
+                }
+              ],
+              "input_tokens": 0,
+              "output_tokens": 7
+            }
+          },
+          "request_fields": {
+            "tools": {
+              "cache_write_tokens": 0,
+              "cached_tokens": 0,
+              "input_tokens": 296,
+              "output_tokens": 0
+            }
+          }
+        },
+        "input_tokens": 306,
+        "input_tokens_details": {
+          "cache_write_tokens": 0,
+          "cached_tokens": 0
+        },
+        "output_tokens": 16,
+        "output_tokens_details": {
+          "reasoning_tokens": 9
+        },
+        "total_tokens": 322,
+        "prompt_tokens": 306,
+        "completion_tokens": 16,
+        "cached_input_tokens": 0
+      },
+      "input_tokens": 306,
+      "cached_input_tokens": 0,
+      "output_tokens": 16,
+      "estimated_cost_nano_usd": 154400,
+      "peak_miss_cost_nano_usd": 154400,
+      "response_completed": true,
+      "response_access_program_metadata_captured": false
+    }
+  ]
+}

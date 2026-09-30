@@ -1,0 +1,12 @@
+--- a/schema.py
++++ b/schema.py
+@@ -89,6 +89,9 @@
+ def ensure_schema(engine: Engine) -> None:
+     """Create missing target objects; safe to run on every API startup."""
+     with engine.begin() as connection:
++        # One database-scoped key shared by API and migration processes.
++        # Acquire before any DDL; commit/rollback releases it automatically.
++        connection.execute(text("SELECT pg_advisory_xact_lock(74057, 1)"))
+         for statement in DDL:
+             connection.execute(text(statement))
+         # Upgrade legacy schemas once. Avoid ALTER TYPE during every worker boot:

@@ -939,6 +939,7 @@ impl ProcessRunTool {
         for (key, value) in &args.env {
             command.env(key, value);
         }
+        crate::child_env::remove_provider_credentials(command.as_std_mut());
 
         // Make the process a process-group leader on Unix so a
         // cancellation or timeout can kill its whole tree (`kill(-pgid)`),

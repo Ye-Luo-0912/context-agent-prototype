@@ -576,6 +576,7 @@ impl ProcessSessionTool {
         for (key, value) in &args.env {
             command.env(key, value);
         }
+        crate::child_env::remove_provider_credentials(command.as_std_mut());
         #[cfg(unix)]
         command.process_group(0);
 

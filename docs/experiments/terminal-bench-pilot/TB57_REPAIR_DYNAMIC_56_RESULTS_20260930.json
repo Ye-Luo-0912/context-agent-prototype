@@ -1,0 +1,38 @@
+[
+  {
+    "arm": "dynamic",
+    "harbor_exit": 0,
+    "runner_error": null,
+    "tool_attempts_observed": 132,
+    "trials": [
+      {
+        "trial": "live-database-cutover__YbCNrMo",
+        "harbor_exception": null,
+        "rewards": {
+          "reward": 0.0
+        },
+        "runtime": {
+          "status": "completed",
+          "exit": 0,
+          "approval_denied": false,
+          "task_completed": false,
+          "round_budget": false,
+          "finalization_reason": null
+        },
+        "verifier": {
+          "tests": 18,
+          "passed": 13,
+          "failed": 5,
+          "skipped": 0,
+          "pending": 0,
+          "other": 0,
+          "start": 1790749943669,
+          "stop": 1790749944594
+        },
+        "grading_status": "GRADED"
+      }
+    ],
+    "provider_usage_settled": true,
+    "comparison_status": "COMPARABLE"
+  }
+]

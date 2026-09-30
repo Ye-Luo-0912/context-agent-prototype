@@ -2089,6 +2089,77 @@ async fn schema_mismatch_refuses_before_approval_or_dispatch() {
     assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
+#[tokio::test]
+async fn malformed_process_executable_is_a_repairable_schema_failure_not_a_grant_denial() {
+    let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let kernel = Arc::new(CoreAuthority::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(RecordingEngine::default()),
+        Arc::new(PanicDispatcher),
+        Arc::new(CountingApproval(approvals.clone())),
+        None,
+        None,
+    ));
+    let schema = serde_json::json!({
+        "type": "object", "required": ["argv"],
+        "properties": {"argv": {"type": "array", "minItems": 1,
+            "items": {"type": "string"}}},
+    });
+    let spec = ToolSpec {
+        name: "process.run".into(),
+        description: "run argv".into(),
+        input_schema: schema.clone(),
+        risk: ToolRisk::ProcessExecution,
+        output_budget: None,
+        roles: vec![ToolSemanticRole::EscapeHatch],
+    };
+    let surface = ToolSurfaceSnapshot {
+        specs: vec![spec.clone()],
+        schema_profiles: std::collections::BTreeMap::from([(
+            spec.name.clone(),
+            agent_contracts::SchemaProfile::compile(&schema).unwrap(),
+        )]),
+        ..ToolSurfaceSnapshot::default()
+    };
+    for (index, executable) in ["", "   ", "\"python3\"", "'python3'"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut tool_call = call("process.run");
+        tool_call.id = format!("invalid-{index}");
+        tool_call.arguments = serde_json::json!({"argv": [executable, "python3"]});
+        let generation = kernel.current_authority_epoch();
+        let execution = kernel
+            .execute_tool(
+                operation_identity(&kernel, &tool_call, generation),
+                tool_call,
+                CancellationToken::new(),
+                &surface,
+                generation,
+            )
+            .await;
+        let ToolOutcome::Value(output) = execution.outcome else {
+            panic!("invalid argv must be a plain no-dispatch result")
+        };
+        assert_eq!(
+            output.failure_class(),
+            Some(agent_contracts::ToolFailureClass::SchemaMismatch)
+        );
+        assert_eq!(output.metadata["schema"]["pointer"], "/argv/0");
+        assert!(execution.lease.is_none());
+        assert!(execution.effect_id.is_none());
+    }
+    assert_eq!(approvals.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let mut valid = call("process.run");
+    valid.arguments = serde_json::json!({"argv": ["python3", "-c", ""]});
+    assert!(
+        surface.schema_profiles["process.run"]
+            .validate(&valid.arguments)
+            .is_ok()
+    );
+    assert!(invalid_process_executable(&valid, &spec).is_none());
+}
+
 /// Matching arguments pass the schema gate and reach approval plus dispatch
 /// exactly as before.
 #[tokio::test]

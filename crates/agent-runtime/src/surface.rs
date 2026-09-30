@@ -38,6 +38,9 @@ pub(crate) enum TextOnlyFinalizationReason {
     /// The host decision budget is exhausted (`model_round >=
     /// max_tool_rounds`): the reserved last round answers in plain text.
     DecisionBudgetExhausted,
+    /// Repeated calls against a Core-confirmed exhausted grant are closed
+    /// with an ordinary answer. Task completion remains operator-owned.
+    AuthorityGrantExhausted,
 }
 
 /// Mutable only while one round is being prepared. It is consumed into the
@@ -312,6 +315,13 @@ impl RoundSurfacePlan {
         );
     }
 
+    pub(crate) fn force_authority_finalization(&mut self) {
+        self.force_text_finalization(
+            TextOnlyFinalizationReason::AuthorityGrantExhausted,
+            ToolSurfaceOmissionReason::AuthorityExhaustedFinalization,
+        );
+    }
+
     fn force_text_finalization(
         &mut self,
         reason: TextOnlyFinalizationReason,
@@ -502,6 +512,7 @@ impl RoundSurfacePlan {
                     reason,
                     ToolSurfaceOmissionReason::CompletionFinalization
                         | ToolSurfaceOmissionReason::DecisionBudgetFinalization
+                        | ToolSurfaceOmissionReason::AuthorityExhaustedFinalization
                 )
             };
             let a_final = is_final(a.reason);
@@ -1421,6 +1432,17 @@ mod tests {
                 .iter()
                 .any(|row| { row.reason == ToolSurfaceOmissionReason::DecisionBudgetFinalization })
         );
+
+        let mut exhausted = build(&requirements);
+        exhausted.force_authority_finalization();
+        assert_eq!(
+            exhausted.text_only_finalization(),
+            Some(TextOnlyFinalizationReason::AuthorityGrantExhausted)
+        );
+        assert!(exhausted.specs().is_empty());
+        assert!(exhausted.omissions.iter().any(|row| {
+            row.reason == ToolSurfaceOmissionReason::AuthorityExhaustedFinalization
+        }));
 
         let mut repair = build(&requirements);
         repair.force_completion_finalization();

@@ -60,6 +60,7 @@ fn git_command(workspace: &Workspace) -> AgentResult<Command> {
             AgentError::Tool("git executable not found on the absolute host PATH".into())
         })?;
     let mut command = Command::new(program);
+    crate::child_env::remove_provider_credentials(command.as_std_mut());
     for (key, _) in std::env::vars_os() {
         if key
             .to_string_lossy()

@@ -125,6 +125,7 @@ impl ShellDialect {
 
     fn spawn_command(&self, script: &str) -> Command {
         let mut command = Command::new(self.kind.program());
+        crate::child_env::remove_provider_credentials(command.as_std_mut());
         match self.kind {
             ShellKind::PowerShell7 | ShellKind::WindowsPowerShell51 => {
                 command

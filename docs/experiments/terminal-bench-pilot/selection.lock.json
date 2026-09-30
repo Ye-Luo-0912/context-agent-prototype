@@ -1,0 +1,610 @@
+{
+  "schema": "context-agent.terminal-bench-pilot.selection.v1",
+  "status": "TB2_CALIBRATED_READY_FOR_TB3",
+  "verified_date": "2026-09-21",
+  "upstream": {
+    "repository": "https://github.com/harbor-framework/terminal-bench",
+    "ref": "v4.0.0",
+    "commit": "452bf305c6daa62fc59061d22133a7cbc7c1572e",
+    "tag_target_verified": true
+  },
+  "local_source_baseline": "ece82e04fee63625675248fb80d638b02cdcdd26",
+  "execution_lock_complete": false,
+  "unresolved_execution_fields": [
+    "harbor_version",
+    "container_image_digests",
+    "linux_execution_host",
+    "binary_sha256",
+    "adapter_sha256",
+    "provider_serving_identity",
+    "verified_effective_send_budget",
+    "price_snapshot",
+    "authorized_budget_window",
+    "oracle_noop_receipts",
+    "mock_runtime_receipt"
+  ],
+  "arms": [
+    {
+      "id": "R",
+      "context": "rolling"
+    },
+    {
+      "id": "D",
+      "context": "dynamic"
+    }
+  ],
+  "common": {
+    "model_proposal": "deepseek-flash",
+    "thinking_mode_proposal": "disabled_if_supported",
+    "request_output_tokens_proposal": 8192,
+    "effective_send_tokens_proposal": 32768,
+    "maintenance_calls_per_maintain": 0,
+    "maintenance_tokens_per_maintain": 0,
+    "repeats_per_arm": 1,
+    "concurrent_trials": 1,
+    "full_trial_automatic_retries": 0,
+    "official_hidden_feedback_during_trial": false,
+    "trial_context": "fresh"
+  },
+  "planned_primary_trials": 12,
+  "stage_provider_usd_caps": {
+    "A": 12,
+    "B": 24
+  },
+  "total_provider_usd_cap_proposal": 36,
+  "total_agent_wall_hours_cap": 36,
+  "tasks": [
+    {
+      "id": "wal-recovery-ordering",
+      "role": "primary",
+      "task_tree_sha1": "55e146c823b0e999c08203f17d45af382163f897",
+      "upstream_file_count": 34,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/wal-recovery-ordering",
+      "expert_time_estimate_hours": 6,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 900.0,
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240
+      },
+      "verifier_timeout_sec": 1800.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": null,
+      "verifier_collect_steps": 0,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "4186d0d2cfc471d5bf14e9159e7948955c263e9a",
+          "bytes": 192,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "c4f7ec1d37aef5ed1de9db299bbe167240fb9e5d",
+          "bytes": 3345,
+          "sha256": "f8e44418b9cb1329b1ac226d88a03c8c9654c496e1a32950ce31d768139a4ad3",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "5b1d26bd416a550253656173d77538e369f9d674",
+          "bytes": 695,
+          "sha256": "147d7d1f314a9a0240335984d8ecb025baed41cb4e80f352e82dfba37b174fe0",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "9a3243d2ee52d390ac2db648551bc8002f8618d2",
+          "bytes": 322,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "9832adb5807287c5d72fd0cfe1bb86d0ce9d0b53",
+          "bytes": 4245,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "order": 1,
+      "stage": "A",
+      "arm_order": [
+        "R",
+        "D"
+      ],
+      "per_trial_limits": {
+        "agent_wall_seconds": 7200,
+        "main_decisions": 240,
+        "provider_attempts": 280,
+        "tool_attempt_stop_threshold": 800,
+        "input_tokens": 8000000,
+        "output_tokens": 220000,
+        "estimated_provider_usd": 2,
+        "maintenance_calls": 0
+      }
+    },
+    {
+      "id": "mvcc-lsm-compaction",
+      "role": "primary",
+      "task_tree_sha1": "d937ad9de788625952897098a32aeb1fefda68a2",
+      "upstream_file_count": 28,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/mvcc-lsm-compaction",
+      "expert_time_estimate_hours": 4,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 600.0,
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0
+      },
+      "verifier_timeout_sec": 900.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": null,
+      "verifier_collect_steps": 0,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "92e371b343da275ed8fa4809b4e8625d747486a0",
+          "bytes": 300,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "9ca80a07e0f908b26d65dab65403d04e0482f53b",
+          "bytes": 846,
+          "sha256": "76c595ed358032ab3c5af64292564e0f58346e629318c7d791b9b91f5ae1ca08",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "62fd30170a2b448379b5e18e12a7a13e2ac57a90",
+          "bytes": 1406,
+          "sha256": "a183fa449530a316735635cdb40dd60322b8de7dbeaa058ef83f6472ce8d014a",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "6b9fc18ae451037e62d43b93406e600820d25389",
+          "bytes": 435,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "6ef3fb22dbd9fb005d59725e94ead49073f9a528",
+          "bytes": 1063,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "order": 2,
+      "stage": "A",
+      "arm_order": [
+        "D",
+        "R"
+      ],
+      "per_trial_limits": {
+        "agent_wall_seconds": 7200,
+        "main_decisions": 240,
+        "provider_attempts": 280,
+        "tool_attempt_stop_threshold": 800,
+        "input_tokens": 8000000,
+        "output_tokens": 220000,
+        "estimated_provider_usd": 2,
+        "maintenance_calls": 0
+      }
+    },
+    {
+      "id": "session-window-debug",
+      "role": "primary",
+      "task_tree_sha1": "a1c13b0f0d072e4c186190fee0df378101c8d50b",
+      "upstream_file_count": 25,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/session-window-debug",
+      "expert_time_estimate_hours": 8,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 600.0,
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240
+      },
+      "verifier_timeout_sec": 300.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": null,
+      "verifier_collect_steps": 0,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "c8278519be1b8818d6533b8cdfc4d5ed367b3921",
+          "bytes": 272,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "81a3e9aeddcbc01ba12ae480e06340ef82d62878",
+          "bytes": 1003,
+          "sha256": "65b05c866323a7b7195a5ab72ac9c4844d1d4e5f179ff24c15baf86a5a50e193",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "a0f4cc0491c7b5b2c4d59c39afd557c8648aad28",
+          "bytes": 706,
+          "sha256": "6906eb9b22f63e59346ba720dd7ff46ae7937e9485ffa63ca832ac16c023ad82",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "03a42aa8a105d157348130bff47398a1e4e9f695",
+          "bytes": 204,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "f42dc8c60b14963876ff314f956de125c70f72f0",
+          "bytes": 3395,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "order": 3,
+      "stage": "A",
+      "arm_order": [
+        "R",
+        "D"
+      ],
+      "per_trial_limits": {
+        "agent_wall_seconds": 7200,
+        "main_decisions": 240,
+        "provider_attempts": 280,
+        "tool_attempt_stop_threshold": 800,
+        "input_tokens": 8000000,
+        "output_tokens": 220000,
+        "estimated_provider_usd": 2,
+        "maintenance_calls": 0
+      }
+    },
+    {
+      "id": "payments-pipeline-fix",
+      "role": "primary",
+      "task_tree_sha1": "8154e5f646fd8e0fe0f9fe5a062fbe6454074b72",
+      "upstream_file_count": 25,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/payments-pipeline-fix",
+      "expert_time_estimate_hours": 2,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 600.0,
+        "cpus": 4,
+        "memory_mb": 8192,
+        "storage_mb": 10240
+      },
+      "verifier_timeout_sec": 600.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": {
+        "build_timeout_sec": 600.0,
+        "cpus": 6,
+        "memory_mb": 12288,
+        "storage_mb": 10240
+      },
+      "verifier_collect_steps": 1,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "a157dcffb06967bc52723c14772d7b51a1226012",
+          "bytes": 662,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "environment/docker-compose.yaml",
+          "git_blob_sha1": "18aa25abc74fcad468680385b9884b899e57090f",
+          "bytes": 2749,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "cf758eaa43ec4742f869b082adfa522788185edd",
+          "bytes": 483,
+          "sha256": "791a0b832032970263283374703c6fd7c4c6ba275d7d285c0bd362c0724a45c3",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "75e579f909d0544b328ec05b06c13c40c85543a0",
+          "bytes": 2150,
+          "sha256": "7434c9d7142d08ccf8ec31a4fddaeef79ab9d47fc24bfa577db16ebf73ec9e65",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "a25250942239c34a6aae6186ce0751ab848f2a21",
+          "bytes": 1171,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "b6fc2482a82ed30b63b71bb7f77d1280c80c437a",
+          "bytes": 4041,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "order": 4,
+      "stage": "B",
+      "arm_order": [
+        "D",
+        "R"
+      ],
+      "per_trial_limits": {
+        "agent_wall_seconds": 14400,
+        "main_decisions": 400,
+        "provider_attempts": 460,
+        "tool_attempt_stop_threshold": 1400,
+        "input_tokens": 16000000,
+        "output_tokens": 440000,
+        "estimated_provider_usd": 4,
+        "maintenance_calls": 0
+      }
+    },
+    {
+      "id": "rs-archive-clone",
+      "role": "primary",
+      "task_tree_sha1": "de559cdf3e6aae15aa3c4b71d22db62b58c6f7f1",
+      "upstream_file_count": 225,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/rs-archive-clone",
+      "expert_time_estimate_hours": 16,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 600.0,
+        "cpus": 4,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0
+      },
+      "verifier_timeout_sec": 1200.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": null,
+      "verifier_collect_steps": 0,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "7d01718c76844cf7fe09fc70ea7846ea922743b8",
+          "bytes": 993,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "e6fc10fa851281f792de3aaddfaea5b378157801",
+          "bytes": 2309,
+          "sha256": "16c7eebb3143af99bebec5eddee12dd0e72f154879f3e46293930490d997084e",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "751dda21c0ab444cac600a8df5a774a7f7f7cad3",
+          "bytes": 726,
+          "sha256": "69fa8da3adb67acd66547107ed8b616e889882e1eb70f66db2cd3414fb645d32",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "e55f2ebff4e89185f561d178fe431b05ef31a294",
+          "bytes": 744,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "7b506a16440b26fc082e67e17cf7335000309541",
+          "bytes": 462,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "order": 5,
+      "stage": "B",
+      "arm_order": [
+        "R",
+        "D"
+      ],
+      "per_trial_limits": {
+        "agent_wall_seconds": 14400,
+        "main_decisions": 400,
+        "provider_attempts": 460,
+        "tool_attempt_stop_threshold": 1400,
+        "input_tokens": 16000000,
+        "output_tokens": 440000,
+        "estimated_provider_usd": 4,
+        "maintenance_calls": 0
+      }
+    },
+    {
+      "id": "live-database-cutover",
+      "role": "primary",
+      "task_tree_sha1": "5821e6e3b25686e6460eaa46faa350ae7ec9dd19",
+      "upstream_file_count": 40,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/live-database-cutover",
+      "expert_time_estimate_hours": 8.0,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 1800.0,
+        "cpus": 16,
+        "memory_mb": 16384,
+        "storage_mb": 20480,
+        "gpus": 0
+      },
+      "verifier_timeout_sec": 600.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": {
+        "build_timeout_sec": 1800.0,
+        "cpus": 16,
+        "memory_mb": 16384,
+        "storage_mb": 40960,
+        "gpus": 0
+      },
+      "verifier_collect_steps": 5,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "bc29f7684850d94911db938ee1df3113f1b6486f",
+          "bytes": 1272,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "environment/docker-compose.yaml",
+          "git_blob_sha1": "992d45a4dfbf7952b273f8d736df4f5cc2dcf334",
+          "bytes": 3072,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "d0e93921f8511a0caaafb5c216ee1e2385012f14",
+          "bytes": 1017,
+          "sha256": "7c466c3b181bdda2751d8af68af5d030802bce94d3e9ece62d755af4aa9ec27e",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "1717d1b8e411570f4cb6d2005e38463822683f6f",
+          "bytes": 4647,
+          "sha256": "3d92be60d134825cdc7c0dc70603938c912200f96cb9c4ffb9d8a297192b5941",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "ea1d84f9021df1e63b2e4202984f90c266403b6e",
+          "bytes": 1662,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "ffcb9cc3428d1703a4fd111e10f76b8c274871ac",
+          "bytes": 6817,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "order": 6,
+      "stage": "B",
+      "arm_order": [
+        "D",
+        "R"
+      ],
+      "per_trial_limits": {
+        "agent_wall_seconds": 14400,
+        "main_decisions": 400,
+        "provider_attempts": 460,
+        "tool_attempt_stop_threshold": 1400,
+        "input_tokens": 16000000,
+        "output_tokens": 440000,
+        "estimated_provider_usd": 4,
+        "maintenance_calls": 0
+      }
+    },
+    {
+      "id": "risk-scorer-replay",
+      "role": "reserve",
+      "task_tree_sha1": "9c9a259486637b915847ceacacd8f5412e2d2d57",
+      "upstream_file_count": 24,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/risk-scorer-replay",
+      "expert_time_estimate_hours": 4.0,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 600.0,
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 0
+      },
+      "verifier_timeout_sec": 300.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": null,
+      "verifier_collect_steps": 0,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "f0d9da145e042bdbba2971ed8a608f79be1d8ace",
+          "bytes": 1014,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "92bb1773d99387b52e0e4deeb7c2ed0cc9188bfc",
+          "bytes": 2263,
+          "sha256": "78cfe68f132a464ccfbec5097314e607487f5d90a418580b8066b18868bf3c6e",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "6149176428062da0dc3d66cde1eca79f8d2abf72",
+          "bytes": 784,
+          "sha256": "8baefd659c792031962dadfc95355a9d3145dc7fe6a33038d5588693c03f2a52",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "a788e9ca37d4f148642a9e5cc3e8ffde611bb887",
+          "bytes": 885,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "3fed0d78229c527e1066fdbc859e5408cbadb15e",
+          "bytes": 440,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "replacement_for": "payments-pipeline-fix",
+      "replacement_rule": "Only before any primary model trial, after documented environment preflight failure; issue a new protocol identity."
+    },
+    {
+      "id": "distributed-dedup",
+      "role": "reserve",
+      "task_tree_sha1": "91586d74cbf9d5de0ee692f6f9161341e402ae9e",
+      "upstream_file_count": 50,
+      "source_url": "https://github.com/harbor-framework/terminal-bench/tree/452bf305c6daa62fc59061d22133a7cbc7c1572e/tasks/distributed-dedup",
+      "expert_time_estimate_hours": 10,
+      "official_agent_timeout_sec": 28800.0,
+      "agent_environment": {
+        "build_timeout_sec": 1800.0,
+        "cpus": 8,
+        "memory_mb": 16384,
+        "storage_mb": 15000,
+        "gpus": 0
+      },
+      "verifier_timeout_sec": 1800.0,
+      "verifier_environment_mode": "separate",
+      "verifier_environment_override": null,
+      "verifier_collect_steps": 0,
+      "source_files": [
+        {
+          "path": "environment/Dockerfile",
+          "git_blob_sha1": "8adf922a0db3cc2e773445cc7a091e25b5e0269a",
+          "bytes": 1419,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "instruction.md",
+          "git_blob_sha1": "f30fad4cf5d1cd21b1e32c3f91460cfa8e5163f3",
+          "bytes": 2371,
+          "sha256": "c466abed3f57377f1ee5aec6c7777f847cc9ae073364935470c83a4964a985d8",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "task.toml",
+          "git_blob_sha1": "1f8c3227a481265942d8620e34afc208f924fdf2",
+          "bytes": 1131,
+          "sha256": "93a52d72ac1a08e43877cea2d091507d06b70ef2fedf2d382c7a988cf3a10d92",
+          "content_verified_against_git_blob": true
+        },
+        {
+          "path": "tests/Dockerfile",
+          "git_blob_sha1": "5f2e9a6c8bf7cebeef4eaa9f8af335dc1098ecb0",
+          "bytes": 3062,
+          "content_verified_against_git_blob": false
+        },
+        {
+          "path": "tests/test.sh",
+          "git_blob_sha1": "4187373189a81b69c034b05a372665561e81ffde",
+          "bytes": 3994,
+          "content_verified_against_git_blob": false
+        }
+      ],
+      "replacement_for": "live-database-cutover",
+      "replacement_rule": "Only before any primary model trial, after documented environment preflight failure; issue a new protocol identity."
+    }
+  ]
+}

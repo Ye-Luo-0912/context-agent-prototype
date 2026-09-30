@@ -324,6 +324,35 @@ impl PromptAssembler {
         catalog: &[ToolCatalogEntry],
         protocol_bodies: &[ProtocolBodyRow],
     ) -> (ModelInput, ProtocolBodyAssemblyStats) {
+        self.assemble_with_catalog_stats_keep(
+            runtime_focus,
+            task_anchor,
+            task_progress,
+            history,
+            turn,
+            tools,
+            catalog,
+            protocol_bodies,
+            agent_contracts::TURN_FRAME_KEEP_EXCHANGES,
+        )
+    }
+
+    /// The runtime passes its one per-round tail selection through budgeting,
+    /// Context hints, assembly and wire accounting. Other callers keep the
+    /// compatible six-exchange projection through the wrapper above.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_with_catalog_stats_keep(
+        &self,
+        runtime_focus: Option<&FocusState>,
+        task_anchor: Option<&TaskAnchorView>,
+        task_progress: Option<&TaskProgressView>,
+        history: &MaterializedContext,
+        turn: &TurnFrame,
+        tools: Vec<ToolSpec>,
+        catalog: &[ToolCatalogEntry],
+        protocol_bodies: &[ProtocolBodyRow],
+        keep_exchanges: usize,
+    ) -> (ModelInput, ProtocolBodyAssemblyStats) {
         let tools: Vec<ToolSpec> = tools
             .into_iter()
             .map(ToolSpec::compact_for_model_surface)
@@ -332,8 +361,7 @@ impl PromptAssembler {
         // historical context. Exact file bodies carried by the retained
         // turn tail or restored checkpoint spill are the only reason a
         // selected historical fs.read body may collapse to a descriptor.
-        let (turn_frame, turn_checkpoint) =
-            turn.checkpoint(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+        let (turn_frame, turn_checkpoint) = turn.checkpoint(keep_exchanges);
         let compacted_exchanges = turn_checkpoint.compacted_exchanges;
         let checkpoint_body_demand = checkpoint_body_demand(turn, &turn_frame, task_progress);
         let restored =
@@ -690,12 +718,27 @@ fn same_body_exposure(left: &FileBodyWindow, right: &FileBodyWindow) -> bool {
 /// Exact file-body identities already present in the model-facing request.
 /// This is also the materializer's body-coverage input, so packing and final
 /// rendering use the same IdentityKnown != BodyVisible predicate.
+#[cfg(test)]
 pub(crate) fn visible_body_identities_for_request(
     full_turn: &TurnFrame,
     progress: Option<&TaskProgressView>,
     protocol_bodies: &[ProtocolBodyRow],
 ) -> Vec<String> {
-    let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+    visible_body_identities_for_request_keep(
+        full_turn,
+        progress,
+        protocol_bodies,
+        agent_contracts::TURN_FRAME_KEEP_EXCHANGES,
+    )
+}
+
+pub(crate) fn visible_body_identities_for_request_keep(
+    full_turn: &TurnFrame,
+    progress: Option<&TaskProgressView>,
+    protocol_bodies: &[ProtocolBodyRow],
+    keep_exchanges: usize,
+) -> Vec<String> {
+    let (retained, _) = full_turn.checkpoint_tail(keep_exchanges);
     let restored = rehydrated_protocol_bodies(full_turn, &retained, progress, protocol_bodies);
     visible_body_identities_from_parts(&retained, &restored)
 }
@@ -796,12 +839,27 @@ fn visible_body_windows_from_parts(
 /// can therefore never be larger than the re-injected set — a cache row that
 /// fails freshness, identity, or the demand filter contributes no window,
 /// exactly as it contributes no identity.
+#[cfg(test)]
 pub(crate) fn visible_body_windows_for_request(
     full_turn: &TurnFrame,
     progress: Option<&TaskProgressView>,
     protocol_bodies: &[ProtocolBodyRow],
 ) -> Vec<agent_contracts::FileBodyWindow> {
-    let (retained, _) = full_turn.checkpoint_tail(agent_contracts::TURN_FRAME_KEEP_EXCHANGES);
+    visible_body_windows_for_request_keep(
+        full_turn,
+        progress,
+        protocol_bodies,
+        agent_contracts::TURN_FRAME_KEEP_EXCHANGES,
+    )
+}
+
+pub(crate) fn visible_body_windows_for_request_keep(
+    full_turn: &TurnFrame,
+    progress: Option<&TaskProgressView>,
+    protocol_bodies: &[ProtocolBodyRow],
+    keep_exchanges: usize,
+) -> Vec<agent_contracts::FileBodyWindow> {
+    let (retained, _) = full_turn.checkpoint_tail(keep_exchanges);
     let restored = rehydrated_protocol_bodies(full_turn, &retained, progress, protocol_bodies);
     visible_body_windows_from_parts(&retained, &restored)
 }
@@ -985,6 +1043,7 @@ pub fn focus_frame_tokens(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Public compatibility wrapper for existing callers.
 pub fn prompt_layer_costs_with_catalog(
     assembler: &PromptAssembler,
     focus: Option<&FocusState>,
@@ -996,7 +1055,34 @@ pub fn prompt_layer_costs_with_catalog(
     catalog: &[ToolCatalogEntry],
     protocol_bodies: &[ProtocolBodyRow],
 ) -> agent_contracts::PromptLayerCosts {
-    let (assembled, body_stats) = assembler.assemble_with_catalog_stats(
+    prompt_layer_costs_with_catalog_keep(
+        assembler,
+        focus,
+        task,
+        progress,
+        history,
+        turn,
+        tools,
+        catalog,
+        protocol_bodies,
+        agent_contracts::TURN_FRAME_KEEP_EXCHANGES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_layer_costs_with_catalog_keep(
+    assembler: &PromptAssembler,
+    focus: Option<&FocusState>,
+    task: Option<&TaskAnchorView>,
+    progress: Option<&TaskProgressView>,
+    history: &MaterializedContext,
+    turn: &TurnFrame,
+    tools: &[ToolSpec],
+    catalog: &[ToolCatalogEntry],
+    protocol_bodies: &[ProtocolBodyRow],
+    keep_exchanges: usize,
+) -> agent_contracts::PromptLayerCosts {
+    let (assembled, body_stats) = assembler.assemble_with_catalog_stats_keep(
         focus,
         task,
         progress,
@@ -1005,6 +1091,7 @@ pub fn prompt_layer_costs_with_catalog(
         tools.to_vec(),
         catalog,
         protocol_bodies,
+        keep_exchanges,
     );
     let historical = assembled
         .context_frame

@@ -12,10 +12,14 @@
 //!         = Input budget           (runtime final send guard)
 //!
 //! Pack window = min(kernel context_budget_tokens, send window)
+//! Send-only headroom = Send window - Pack window
+//! Turn charge to pack = max(Turn Frame - Send-only headroom, 0)
+//!
+//! Pack window
 //!         - Output Reserve
 //!         - System Policy (includes Runtime Facts)
 //!         - Runtime Focus Frame (TaskAnchor + TaskProgress + Current Focus)
-//!         - Turn Frame
+//!         - Turn charge to pack
 //!         - Active Tool Schemas
 //!         = Context Frame Budget   (what the engine receives)
 //! ```
@@ -25,11 +29,13 @@
 //! subtraction (the frame budget is the remaining slice, saturated at zero).
 //! Append-only baselines may ignore the pack query and grow until the send
 //! guard trims them.
+//! The final send guard still prices the full turn frame: send-only headroom
+//! prevents a duplicate pack charge, never an increase to the Context cap.
 
 use agent_contracts::tokens::approx_tokens;
 use agent_contracts::{
     CAPABILITY_INSPECT, CAPABILITY_LOAD, CAPABILITY_MANAGE, CAPABILITY_SEARCH, CAPABILITY_UNLOAD,
-    CONTEXT_MANAGE, ToolSpec,
+    CONTEXT_MANAGE, TURN_FRAME_KEEP_EXCHANGES, ToolSpec, TurnFrame, TurnFrameStep,
 };
 use serde::Serialize;
 
@@ -187,10 +193,94 @@ pub fn approx_layer_tokens(layer: &impl Serialize) -> usize {
     approx_tokens(&String::from_utf8_lossy(&bytes))
 }
 
+/// Keep complete protocol exchanges while the provider's send window has
+/// room beyond the Context pack window. This never borrows the Context
+/// engine's existing allocation or changes the full audit frame.
+pub fn retained_turn_exchanges(frame: &TurnFrame, send_only_headroom: usize) -> usize {
+    let floor = TURN_FRAME_KEEP_EXCHANGES;
+    if send_only_headroom == 0 {
+        return floor;
+    }
+    let total = frame
+        .steps
+        .iter()
+        .filter(|step| matches!(step, TurnFrameStep::AssistantToolCalls { .. }))
+        .count();
+    let baseline = approx_layer_tokens(&frame.checkpointed_messages(floor));
+    let limit = baseline.saturating_add(send_only_headroom);
+    let mut keep = floor;
+    while keep < total {
+        let candidate = keep + 1;
+        if approx_layer_tokens(&frame.checkpointed_messages(candidate)) > limit {
+            break;
+        }
+        keep = candidate;
+    }
+    keep
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_contracts::ModelMessage;
+
+    #[test]
+    fn spare_send_window_keeps_more_complete_exchanges_without_spending_context_budget() {
+        let mut frame = TurnFrame::new("work on several files");
+        for index in 0..12 {
+            let id = format!("call-{index}");
+            frame.push_tool_calls(vec![agent_contracts::ToolCall {
+                id: id.clone(),
+                name: "fs.read".into(),
+                arguments: serde_json::json!({"path": format!("api/module-{index}.py")}),
+            }]);
+            frame.push_tool_result(
+                agent_contracts::ToolOutput {
+                    call_id: id,
+                    tool_name: "fs.read".into(),
+                    ok: true,
+                    summary: "read".into(),
+                    model_content: format!("small source {index}"),
+                    artifact_ref: None,
+                    metadata: serde_json::json!({}),
+                },
+                None,
+                agent_contracts::ToolExecutionFacts::empty(),
+            );
+        }
+        assert_eq!(retained_turn_exchanges(&frame, 0), 6);
+        assert_eq!(retained_turn_exchanges(&frame, 8192), 12);
+        let (wire, checkpoint) = frame.checkpoint(retained_turn_exchanges(&frame, 8192));
+        assert_eq!(wire.steps.len(), frame.steps.len());
+        assert_eq!(checkpoint.compacted_exchanges, 0);
+        assert_eq!(frame.steps.len(), 24, "audit history remains intact");
+
+        frame.push_tool_calls(vec![agent_contracts::ToolCall {
+            id: "large".into(),
+            name: "fs.read".into(),
+            arguments: serde_json::json!({"path":"api/large.py"}),
+        }]);
+        frame.push_tool_result(
+            agent_contracts::ToolOutput {
+                call_id: "large".into(),
+                tool_name: "fs.read".into(),
+                ok: true,
+                summary: "large read".into(),
+                model_content: "x".repeat(12000),
+                artifact_ref: None,
+                metadata: serde_json::json!({}),
+            },
+            None,
+            agent_contracts::ToolExecutionFacts::empty(),
+        );
+        // Put the large result immediately before the six most recent
+        // exchanges: it is the first optional group the selector considers.
+        let result = frame.steps.pop().unwrap();
+        let call = frame.steps.pop().unwrap();
+        frame.steps.splice(12..12, [call, result]);
+        let limited = retained_turn_exchanges(&frame, 200);
+        assert_eq!(limited, 6, "one large body cannot overrun a small headroom");
+    }
 
     #[test]
     fn budget_subtracts_every_layer_from_the_window() {

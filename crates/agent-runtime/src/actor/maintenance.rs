@@ -60,6 +60,8 @@ impl MaintenanceContinuation {
 pub(super) struct PendingMaintenance {
     continuation: MaintenanceContinuation,
     task: JoinHandle<()>,
+    rollback_basis: Option<Arc<tokio::sync::Mutex<Option<serde_json::Value>>>>,
+    ingested_through: Option<usize>,
 }
 
 /// EXEC-1: the round tail parked while a spawned materialization runs. The
@@ -146,6 +148,34 @@ impl RuntimeActor {
         });
         let context = self.services.context_engine();
         let trigger = continuation.trigger();
+        let (settled_observations, ingested_through) =
+            if matches!(continuation, MaintenanceContinuation::BeforeModel) {
+                let pending = turn
+                    .turn_frame
+                    .steps
+                    .iter()
+                    .skip(turn.context_ingested_steps)
+                    .filter_map(|step| match step {
+                        TurnFrameStep::ToolResult {
+                            output,
+                            scope_id,
+                            disposition: ToolResultDisposition::PersistObservation,
+                            facts,
+                        } => Some(ContextIngress::ToolObservation {
+                            output: output.clone(),
+                            scope_id: *scope_id,
+                            facts: facts.clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let end = (!pending.is_empty()).then_some(turn.turn_frame.steps.len());
+                (pending, end)
+            } else {
+                (Vec::new(), None)
+            };
+        let rollback_basis = ingested_through.map(|_| Arc::new(tokio::sync::Mutex::new(None)));
+        let task_basis = rollback_basis.clone();
         // Episode compaction can await inside ingest, before maintain is
         // reached. Keep both calls under the same abort/join and rollback
         // boundary. A continuation has no new input transaction to ingest.
@@ -159,13 +189,28 @@ impl RuntimeActor {
         };
         let op_tx = op_tx.clone();
         let task = tokio::spawn(async move {
-            let report = async {
+            let mut report = async {
+                if let Some(basis) = task_basis.as_ref() {
+                    *basis.lock().await = Some(context.checkpoint().await?);
+                }
                 if let Some(ingress) = ingress {
                     context.ingest(ingress).await?;
+                }
+                for observation in settled_observations {
+                    context.ingest(observation).await?;
                 }
                 context.maintain(trigger).await
             }
             .await;
+            if report.is_err()
+                && let Some(basis) = task_basis.as_ref()
+                && let Some(checkpoint) = basis.lock().await.take()
+                && let Err(error) = context.restore(checkpoint).await
+            {
+                report = Err(AgentError::RecoveryRequired(format!(
+                    "incremental tool-observation rollback failed: {error}"
+                )));
+            }
             // A full completion channel cannot hold cancellation cleanup:
             // once the engine future ended, cancellation may drop this send.
             tokio::select! {
@@ -187,7 +232,12 @@ impl RuntimeActor {
             }
         });
         turn.op.as_mut().unwrap().abort = Some(task.abort_handle());
-        self.state.maintenance = Some(PendingMaintenance { continuation, task });
+        self.state.maintenance = Some(PendingMaintenance {
+            continuation,
+            task,
+            rollback_basis,
+            ingested_through,
+        });
     }
 
     /// EXEC-1: run the round's context materialization as a spawned
@@ -302,8 +352,15 @@ impl RuntimeActor {
             .take()
             .expect("current maintenance has a continuation");
         // The completion is sent only after the engine future returned.
+        let ingested_through = pending.ingested_through;
         match pending.continuation {
             MaintenanceContinuation::BeforeModel => {
+                if report.is_ok()
+                    && let Some(end) = ingested_through
+                    && let Some(turn) = self.state.turn.as_mut()
+                {
+                    turn.context_ingested_steps = end;
+                }
                 self.continue_model_operation_after_maintenance(op_tx, report)
                     .await;
             }
@@ -451,6 +508,8 @@ impl RuntimeActor {
         let PendingMaintenance {
             continuation,
             mut task,
+            rollback_basis,
+            ..
         } = pending;
         let stopped = match tokio::time::timeout(MAINTENANCE_CLEANUP_TIMEOUT, &mut task).await {
             Ok(Ok(())) => true,
@@ -463,6 +522,21 @@ impl RuntimeActor {
         } else {
             Some("maintenance task cleanup was not confirmed".to_string())
         };
+        if stopped
+            && let Some(basis) = rollback_basis
+            && let Some(checkpoint) = basis.lock().await.take()
+        {
+            match tokio::time::timeout(
+                MAINTENANCE_CLEANUP_TIMEOUT,
+                self.services.context_engine().restore(checkpoint),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failure = Some(error.to_string()),
+                Err(_) => failure = Some("incremental context rollback was not confirmed".into()),
+            }
+        }
         if let MaintenanceContinuation::UserInput(start) = continuation {
             let start = *start;
             if stopped && let Some(checkpoint) = start.checkpoint {

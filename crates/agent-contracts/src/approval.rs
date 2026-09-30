@@ -9,6 +9,33 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// A Core-owned explanation of a refusal. It records authority state at the
+/// same decision that consumed or refused the effect; it never grants access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum ApprovalDenialReason {
+    GrantExhausted {
+        grant_id: String,
+        used: u32,
+        max_runs: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalOutcome {
+    pub decision: ApprovalDecision,
+    pub denial: Option<ApprovalDenialReason>,
+}
+
+impl From<ApprovalDecision> for ApprovalOutcome {
+    fn from(decision: ApprovalDecision) -> Self {
+        Self {
+            decision,
+            denial: None,
+        }
+    }
+}
+
 /// Target scope of a standing grant: what the grant covers. At least one of
 /// the scopes must be set (a grant with neither matches nothing and is
 /// rejected at grant time).
@@ -71,6 +98,17 @@ pub trait ApprovalGate: Send + Sync {
         spec: &ToolSpec,
         cancel: &CancellationToken,
     ) -> AgentResult<ApprovalDecision>;
+
+    /// Existing gates keep their old answer. Gates owning a standing-grant
+    /// book can override this to return an atomic, typed refusal reason.
+    async fn authorize_detailed(
+        &self,
+        call: &ToolCall,
+        spec: &ToolSpec,
+        cancel: &CancellationToken,
+    ) -> AgentResult<ApprovalOutcome> {
+        self.authorize(call, spec, cancel).await.map(Into::into)
+    }
 }
 
 /// The v2 perspective on one approval decision, computed *beside* the

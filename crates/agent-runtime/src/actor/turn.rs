@@ -475,7 +475,9 @@ impl RuntimeActor {
         self.state.turn = Some(ActiveTurn {
             turn_id,
             turn_frame: TurnFrame::new(content),
+            context_ingested_steps: 0,
             model_round: 0,
+            exhausted_grant_denials: HashMap::new(),
             pending_tools: VecDeque::new(),
             deferred_context_collect: false,
             pending_loaded_tools: Vec::new(),
@@ -1821,9 +1823,10 @@ impl RuntimeActor {
     }
 
     /// Observe one post-refusal repair action after its authoritative result
-    /// has been folded into task/execution state. This closes the liveness gap
-    /// where a model could stop proposing completion and repeat tools forever:
-    /// only a strictly lower typed blocker potential resets the episode.
+    /// has been folded into task/execution state. Completion control/resolver
+    /// loops are bounded separately from ordinary work. Reading, editing or
+    /// running the task must not spend the completion-repair allowance merely
+    /// because operator-owned completion authority remains unchanged.
     pub(super) fn observe_completion_repair_action(&mut self, output: &ToolOutput) {
         if output.tool_name == "task.complete"
             && output
@@ -1869,8 +1872,18 @@ impl RuntimeActor {
         };
         let no_progress_steps = if improved {
             0
-        } else {
+        } else if output.tool_name == "task.manage"
+            || previous.plan["steps"].as_array().is_some_and(|steps| {
+                steps
+                    .iter()
+                    .any(|step| step["tool"].as_str() == Some(output.tool_name.as_str()))
+            })
+        {
             previous.no_progress_steps.saturating_add(1)
+        } else {
+            // Normal work remains subject to the turn/operation budgets.
+            // A denied completion is not a new, six-action development cap.
+            previous.no_progress_steps
         }
         .min(MAX_COMPLETION_REPAIR_STEPS);
         let terminal = !improved
@@ -3009,7 +3022,12 @@ impl RuntimeActor {
         }
         let mut ingested = false;
         if let Some(turn) = self.state.turn.as_mut() {
-            for step in &turn.turn_frame.steps {
+            for step in turn
+                .turn_frame
+                .steps
+                .iter()
+                .skip(turn.context_ingested_steps)
+            {
                 let TurnFrameStep::ToolResult {
                     output,
                     scope_id,
@@ -3045,7 +3063,13 @@ impl RuntimeActor {
         if let Some(turn) = self.state.turn.as_mut() {
             turn.turn_state = TurnState::Committing;
         }
-        if ingested {
+        if ingested
+            || self
+                .state
+                .turn
+                .as_ref()
+                .is_some_and(|turn| turn.context_ingested_steps > 0)
+        {
             self.spawn_maintenance(
                 maintenance::MaintenanceContinuation::AfterTool { content },
                 op_tx,
@@ -3491,6 +3515,7 @@ impl RuntimeActor {
             .turn_frame
             .steps
             .iter()
+            .skip(turn.context_ingested_steps)
             .filter_map(|step| match step {
                 TurnFrameStep::ToolResult {
                     output,

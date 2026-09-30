@@ -514,6 +514,14 @@ fn env_usize(name: &str, default: usize, min: usize) -> anyhow::Result<usize> {
     .unwrap_or(default))
 }
 
+fn parse_buffered_retry_flag(raw: &str) -> Result<bool, String> {
+    match raw {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err("must be 0 or 1".into()),
+    }
+}
+
 /// Build the retrying provider transport plus its checked identity for an
 /// already-checked key. Invalid configuration fails here, before any
 /// workspace or runtime state exists.
@@ -521,6 +529,16 @@ fn provider_from_env(
     api_key: String,
 ) -> anyhow::Result<(Arc<dyn ModelTransport>, ProviderProfile)> {
     provider_from_env_with_timeout(api_key, None)
+}
+
+fn parse_main_request_timeout(raw: &str) -> Result<std::time::Duration, String> {
+    let seconds = raw
+        .parse::<u64>()
+        .map_err(|_| "must be an integer from 30 to 660 seconds".to_string())?;
+    if !(30..=660).contains(&seconds) {
+        return Err("must be an integer from 30 to 660 seconds".into());
+    }
+    Ok(std::time::Duration::from_secs(seconds))
 }
 
 /// COST-4 (D02): `timeout_override` lets the optional maintenance transport
@@ -585,13 +603,18 @@ fn provider_from_env_with_timeout(
         responses_reasoning_effort,
         chat_thinking,
     };
+    let request_timeout = match timeout_override {
+        Some(timeout) => timeout,
+        None => env_checked("OPENAI_REQUEST_TIMEOUT_SECS", parse_main_request_timeout)?
+            .unwrap_or(std::time::Duration::from_secs(120)),
+    };
     let provider = OpenAiProvider::new(OpenAiConfig {
         api_key,
         base_url,
         model,
         protocol,
         max_output_tokens: profile.max_output_tokens,
-        timeout: timeout_override.unwrap_or(std::time::Duration::from_secs(120)),
+        timeout: request_timeout,
         send_stream_options: true,
         send_max_tokens: true,
         max_stream_bytes: provider_openai::DEFAULT_MAX_STREAM_BYTES,
@@ -604,8 +627,18 @@ fn provider_from_env_with_timeout(
     .map_err(anyhow::Error::msg)?
     .with_chat_thinking(chat_thinking)
     .map_err(anyhow::Error::msg)?;
-    let transport = Arc::new(
+    // A headless evaluation can buffer the complete response until it is
+    // valid. That leaves no externally visible stream to replay after a
+    // malformed tool call; interactive runs keep live deltas by default.
+    let buffer_for_retry =
+        env_checked("OPENAI_BUFFER_STREAM_FOR_RETRY", parse_buffered_retry_flag)?.unwrap_or(false);
+    let retry = if buffer_for_retry {
+        RetryingTransport::new_buffering(provider, 3, std::time::Duration::from_millis(500))
+    } else {
         RetryingTransport::new(provider, 3, std::time::Duration::from_millis(500))
+    };
+    let transport = Arc::new(
+        retry
             // Same retry-observability contract as the evaluation harness: set
             // `OPENAI_RETRY_METRICS_FILE` to persist typed incident/stage
             // records; without it the stderr retry line stays the only channel.
@@ -1081,6 +1114,29 @@ mod tests {
     use agent_runtime::ProofVerifier;
     use context_simple::{SimpleContextConfig, SimpleContextEngine};
     use tool_runtime::{BuiltinToolDispatcher, VerificationRecipe, VerificationRecipes};
+
+    #[test]
+    fn buffered_retry_is_an_explicit_headless_opt_in() {
+        assert_eq!(parse_buffered_retry_flag("0"), Ok(false));
+        assert_eq!(parse_buffered_retry_flag("1"), Ok(true));
+        assert!(parse_buffered_retry_flag("yes").is_err());
+        assert!(parse_buffered_retry_flag("").is_err());
+    }
+
+    #[test]
+    fn main_request_timeout_has_a_finite_validated_override() {
+        assert_eq!(
+            parse_main_request_timeout("600"),
+            Ok(std::time::Duration::from_secs(600))
+        );
+        assert_eq!(
+            parse_main_request_timeout("660"),
+            Ok(std::time::Duration::from_secs(660))
+        );
+        for invalid in ["0", "29", "661", "unbounded"] {
+            assert!(parse_main_request_timeout(invalid).is_err());
+        }
+    }
 
     fn host_echo_recipe() -> VerificationRecipe {
         #[cfg(windows)]

@@ -1,0 +1,122 @@
+[
+  {
+    "id": "tb14-live-api",
+    "risk": "WorkspaceWrite",
+    "target": {
+      "workspace_path_prefix": "api"
+    },
+    "constraint": {
+      "max_content_bytes": 4194304
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-verify",
+    "risk": "WorkspaceWrite",
+    "target": {
+      "workspace_path_prefix": "_verify.py"
+    },
+    "constraint": {
+      "max_content_bytes": 4194304
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-migrate",
+    "risk": "WorkspaceWrite",
+    "target": {
+      "workspace_path_prefix": "migrate.py"
+    },
+    "constraint": {
+      "max_content_bytes": 4194304
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-python3",
+    "risk": "ProcessExecution",
+    "target": {
+      "exec_argv_prefix": [
+        "python3"
+      ]
+    },
+    "constraint": {
+      "max_runs": 600
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-pytest",
+    "risk": "ProcessExecution",
+    "target": {
+      "exec_argv_prefix": [
+        "pytest"
+      ]
+    },
+    "constraint": {
+      "max_runs": 32
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-ls",
+    "risk": "ProcessExecution",
+    "target": {
+      "exec_argv_prefix": [
+        "ls"
+      ]
+    },
+    "constraint": {
+      "max_runs": 8
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-curl",
+    "risk": "ProcessExecution",
+    "target": {
+      "exec_argv_prefix": [
+        "curl"
+      ]
+    },
+    "constraint": {
+      "max_runs": 64
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-env",
+    "risk": "ProcessExecution",
+    "target": {
+      "exec_argv_prefix": [
+        "env"
+      ]
+    },
+    "constraint": {
+      "max_runs": 8
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-entrypoint",
+    "risk": "WorkspaceWrite",
+    "target": {
+      "workspace_path_prefix": "entrypoint.sh"
+    },
+    "constraint": {
+      "max_content_bytes": 4194304
+    },
+    "expires_at_ms": 1790726400000
+  },
+  {
+    "id": "tb14-live-archive",
+    "risk": "WorkspaceWrite",
+    "target": {
+      "workspace_path_prefix": "migrate_archive"
+    },
+    "constraint": {
+      "max_content_bytes": 4194304
+    },
+    "expires_at_ms": 1790726400000
+  }
+]

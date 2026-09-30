@@ -13,6 +13,7 @@ pub struct ProductArgs {
     pub read_only: bool,
     pub context_policy: String,
     pub root: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
     pub grant_args: Vec<String>,
     pub grant_files: Vec<PathBuf>,
     pub jsonl_out: Option<PathBuf>,
@@ -22,6 +23,7 @@ pub struct ProductArgs {
     pub max_rounds: Option<usize>,
     pub defer_proof: bool,
     pub prompt: Option<String>,
+    pub task_goal: Option<String>,
     pub work: bool,
     pub continue_task: bool,
     pub timeout_secs: Option<u64>,
@@ -49,6 +51,7 @@ where
         read_only: false,
         context_policy: "dynamic".to_string(),
         root: None,
+        state_dir: None,
         grant_args: Vec::new(),
         grant_files: Vec::new(),
         jsonl_out: None,
@@ -58,6 +61,7 @@ where
         max_rounds: None,
         defer_proof: false,
         prompt: None,
+        task_goal: None,
         work: false,
         continue_task: false,
         timeout_secs: None,
@@ -84,6 +88,14 @@ where
             parsed.defer_proof = true;
         } else if let Some(value) = arg.strip_prefix("--context=") {
             parsed.context_policy = value.to_string();
+        } else if let Some(value) = arg.strip_prefix("--state-dir=") {
+            if value.trim().is_empty() {
+                anyhow::bail!("--state-dir needs a path");
+            }
+            if parsed.state_dir.is_some() {
+                anyhow::bail!("--state-dir may be given only once");
+            }
+            parsed.state_dir = Some(PathBuf::from(value));
         } else if let Some(value) = arg.strip_prefix("--grant=") {
             parsed.grant_args.push(value.to_string());
         } else if let Some(value) = arg.strip_prefix("--grant-file=") {
@@ -112,6 +124,14 @@ where
                 anyhow::bail!("--prompt may be given only once");
             }
             parsed.prompt = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--task-goal=") {
+            if value.trim().is_empty() {
+                anyhow::bail!("--task-goal is empty");
+            }
+            if parsed.task_goal.is_some() {
+                anyhow::bail!("--task-goal may be given only once");
+            }
+            parsed.task_goal = Some(value.to_string());
         } else if let Some(value) = arg.strip_prefix("--timeout-secs=") {
             parsed.timeout_secs = Some(parse_timeout_secs(value)?);
         } else if arg.starts_with("--") {
@@ -153,6 +173,17 @@ impl ProductArgs {
         }
         if self.work && self.prompt.is_none() {
             anyhow::bail!("--work needs --prompt=<text> (or --prompt=- to read stdin)");
+        }
+        if self.task_goal.is_some() && self.prompt.is_none() {
+            anyhow::bail!("--task-goal needs --prompt=<text> (or --prompt=- to read stdin)");
+        }
+        if self.task_goal.is_some() && self.work {
+            anyhow::bail!(
+                "--task-goal cannot combine with --work: it focuses the task before the prompt"
+            );
+        }
+        if self.task_goal.is_some() && self.continue_task {
+            anyhow::bail!("--task-goal cannot combine with --continue");
         }
         if self.continue_task && self.prompt.is_some() {
             anyhow::bail!(
@@ -218,6 +249,7 @@ process calls are denied immediately. There is no --yes / --allow-all.
 
 Options:
   --prompt=<text>     one user message (\"-\" reads stdin); implies headless
+  --task-goal=<text>  focus/create a bounded task goal before --prompt (benchmark use)
   --work              compose like /work (set_focus + task.manage + the prompt)
   --continue          continue the restored/active task's stored directive
   --grant=<JSON>      standing write/process grant (repeatable)
@@ -228,6 +260,7 @@ Options:
   --timeout-secs=<N>  headless wait cap (default 900, max 86400)
   --restore=<path>    cold resume; \"latest\" resolves in checkpoints/
   --context=<policy>  dynamic | append | rolling | service
+  --state-dir=<path>  trusted runtime state outside the workspace (benchmark use)
   --defer-proof       opt into deferred proof refresh
   --doctor            product self-check and exit
   --help              this text
@@ -360,5 +393,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(empty.contains("--jsonl-out"), "{empty}");
+    }
+
+    #[test]
+    fn external_state_dir_is_explicit_and_bounded_to_one_path() {
+        let parsed = parse_args([
+            "--prompt=run",
+            "--state-dir=/tmp/context-agent-state",
+            "/app",
+        ])
+        .unwrap();
+        assert_eq!(
+            parsed.state_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/context-agent-state"))
+        );
+
+        let duplicate = parse_args(["--prompt=run", "--state-dir=/tmp/a", "--state-dir=/tmp/b"])
+            .unwrap_err()
+            .to_string();
+        assert!(duplicate.contains("--state-dir"), "{duplicate}");
     }
 }

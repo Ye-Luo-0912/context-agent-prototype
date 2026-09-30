@@ -6,8 +6,9 @@ use std::{
 };
 
 use agent_contracts::{
-    AgentError, AgentResult, ApprovalDecision, ApprovalGate, CancellationToken, EffectIntent,
-    HostToolPolicies, IntentShadowGate, ShadowVerdict, StandingGrant, ToolCall, ToolRisk, ToolSpec,
+    AgentError, AgentResult, ApprovalDecision, ApprovalDenialReason, ApprovalGate, ApprovalOutcome,
+    CancellationToken, EffectIntent, HostToolPolicies, IntentShadowGate, ShadowVerdict,
+    StandingGrant, ToolCall, ToolRisk, ToolSpec,
 };
 use tokio::sync::{Mutex, broadcast, oneshot};
 use uuid::Uuid;
@@ -540,16 +541,15 @@ impl IntentShadowGate for TaskApprovalGate {
     }
 }
 
-#[async_trait::async_trait]
-impl ApprovalGate for TaskApprovalGate {
-    async fn authorize(
+impl TaskApprovalGate {
+    async fn authorize_with_grant_reason(
         &self,
         call: &ToolCall,
         spec: &ToolSpec,
         cancel: &CancellationToken,
-    ) -> AgentResult<ApprovalDecision> {
+    ) -> AgentResult<ApprovalOutcome> {
         if spec.risk == ToolRisk::ReadOnly {
-            return Ok(ApprovalDecision::Allow);
+            return Ok(ApprovalDecision::Allow.into());
         }
 
         let now = (self.now)();
@@ -568,10 +568,11 @@ impl ApprovalGate for TaskApprovalGate {
         if matches!(intent, EffectIntent::ReadOnly) {
             drop(book);
             self.record(&call.name, spec.risk, None).await;
-            return Ok(ApprovalDecision::Allow);
+            return Ok(ApprovalDecision::Allow.into());
         }
 
         let mut matched_id: Option<String> = None;
+        let mut exhausted: Option<ApprovalDenialReason> = None;
         for (id, entry) in book.iter_mut() {
             if !Self::grant_matches(&entry.grant, &intent) {
                 continue;
@@ -579,6 +580,16 @@ impl ApprovalGate for TaskApprovalGate {
             if let Some(max) = entry.grant.constraint.max_runs
                 && entry.runs_used >= max
             {
+                if exhausted.as_ref().is_none_or(|current| {
+                    let ApprovalDenialReason::GrantExhausted { grant_id, .. } = current;
+                    id < grant_id
+                }) {
+                    exhausted = Some(ApprovalDenialReason::GrantExhausted {
+                        grant_id: id.clone(),
+                        used: entry.runs_used,
+                        max_runs: max,
+                    });
+                }
                 continue;
             }
             matched_id = Some(id.clone());
@@ -594,11 +605,41 @@ impl ApprovalGate for TaskApprovalGate {
 
         if let Some(id) = matched_id {
             self.record(&call.name, spec.risk, Some(id)).await;
-            return Ok(ApprovalDecision::Allow);
+            return Ok(ApprovalDecision::Allow.into());
         }
 
         self.record(&call.name, spec.risk, None).await;
-        self.inner.authorize(call, spec, cancel).await
+        let decision = self.inner.authorize(call, spec, cancel).await?;
+        Ok(ApprovalOutcome {
+            decision,
+            denial: (decision == ApprovalDecision::Deny)
+                .then_some(exhausted)
+                .flatten(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ApprovalGate for TaskApprovalGate {
+    async fn authorize(
+        &self,
+        call: &ToolCall,
+        spec: &ToolSpec,
+        cancel: &CancellationToken,
+    ) -> AgentResult<ApprovalDecision> {
+        Ok(self
+            .authorize_with_grant_reason(call, spec, cancel)
+            .await?
+            .decision)
+    }
+
+    async fn authorize_detailed(
+        &self,
+        call: &ToolCall,
+        spec: &ToolSpec,
+        cancel: &CancellationToken,
+    ) -> AgentResult<ApprovalOutcome> {
+        self.authorize_with_grant_reason(call, spec, cancel).await
     }
 }
 
@@ -1189,6 +1230,47 @@ mod tests {
             "argv matching must keep argument boundaries"
         );
         assert_eq!(inner.calls.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exhausted_process_grant_reports_the_atomic_limit_without_reauthorizing() {
+        let inner = RecordingGate::denying();
+        let gate = builtin_gate(inner.clone());
+        gate.grant(exec_grant("python-task", &["python3"], Some(2)))
+            .await
+            .unwrap();
+        for args in [
+            &["python3", "-c", "print(1)"][..],
+            &["python3", "-m", "pip"][..],
+        ] {
+            let outcome = gate
+                .authorize_detailed(
+                    &process_run_call(args),
+                    &process_run_spec(),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.decision, ApprovalDecision::Allow);
+            assert_eq!(outcome.denial, None);
+        }
+        let call = process_run_call(&["python3", "-c", "print(2)"]);
+        let authority = crate::authority::ApprovalAuthority::new(Arc::new(gate));
+        let verdict = authority
+            .authorize(&call, &process_run_spec(), &CancellationToken::new())
+            .await;
+        assert!(matches!(
+            verdict,
+            crate::authority::ApprovalVerdict::DeniedDetailed {
+                reason: ApprovalDenialReason::GrantExhausted {
+                    ref grant_id,
+                    used: 2,
+                    max_runs: 2,
+                },
+                ref message,
+            } if grant_id == "python-task" && message.contains("2/2 executions")
+        ));
+        assert_eq!(inner.calls.lock().await.len(), 1);
     }
 
     #[tokio::test]

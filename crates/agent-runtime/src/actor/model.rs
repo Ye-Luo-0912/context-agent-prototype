@@ -317,6 +317,7 @@ pub(super) struct ModelRoundPlan {
     pub(super) turn_id: TurnId,
     pub(super) model_round: usize,
     pub(super) turn_frame: TurnFrame,
+    pub(super) retained_turn_exchanges: usize,
     pub(super) runtime_focus: Option<agent_contracts::FocusState>,
     pub(super) task_view: Option<agent_contracts::TaskAnchorView>,
     pub(super) base_progress_view: Option<agent_contracts::TaskProgressView>,
@@ -808,6 +809,12 @@ impl RuntimeActor {
         // blocked by a tool this round will never call.
         if completion_repair_terminal {
             surface_plan.force_completion_finalization();
+        } else if self.state.turn.as_ref().is_some_and(|turn| {
+            turn.exhausted_grant_denials
+                .values()
+                .any(|count| *count >= MAX_REPEATED_EXHAUSTED_GRANT_DENIALS)
+        }) {
+            surface_plan.force_authority_finalization();
         } else if self.services.max_tool_rounds() > 1
             && model_round >= self.services.max_tool_rounds()
         {
@@ -1012,9 +1019,6 @@ impl RuntimeActor {
         // Token 计量的是确定性 checkpointing 之后真正上线的协议视图
         // （保留尾部 + 有界 checkpoint 注记），与装配器一致。
         let capabilities = self.services.model_capabilities();
-        let turn_frame_tokens = approx_layer_tokens(
-            &turn_frame.checkpointed_messages(agent_contracts::TURN_FRAME_KEEP_EXCHANGES),
-        );
         let active_tools_tokens = approx_layer_tokens(&surface_plan.specs());
         let kernel_budget = self.services.context_budget_tokens();
         let send_window = provider_send_window(capabilities.context_window, kernel_budget);
@@ -1053,12 +1057,52 @@ impl RuntimeActor {
             task_view.as_ref(),
             budget_progress_view.as_ref(),
         );
+        // Start with the extra complete exchanges that the provider's send
+        // headroom can carry. Before asking Context to materialize, price the
+        // actual request with an empty Context frame and the same progress,
+        // protocol-body cache and tool surface the final assembler will use.
+        // A large recent tool result can exceed the send window even when
+        // the Context frame is empty; in that case checkpoint whole older
+        // exchanges until the fixed request fits. Doing this *before* the
+        // Context query keeps its visible-body hints aligned with the final
+        // turn projection instead of silently invalidating them afterward.
+        let mut retained_turn_exchanges = crate::budget::retained_turn_exchanges(
+            &turn_frame,
+            send_window.saturating_sub(pack_window),
+        );
+        let input_budget = send_window.saturating_sub(output_reserve);
+        const FIXED_REQUEST_RENDER_MARGIN: usize = 512;
+        while retained_turn_exchanges > 0 {
+            let (minimal_input, _) = self.assemble_model_input(
+                runtime_focus.as_ref(),
+                task_view.as_ref(),
+                budget_progress_view.as_ref(),
+                &MaterializedContext::default(),
+                &turn_frame,
+                retained_turn_exchanges,
+                surface_plan.specs().to_vec(),
+            );
+            if assembled_input_total(&minimal_input)
+                <= input_budget.saturating_sub(FIXED_REQUEST_RENDER_MARGIN)
+            {
+                break;
+            }
+            retained_turn_exchanges -= 1;
+        }
+        let turn_frame_tokens =
+            approx_layer_tokens(&turn_frame.checkpointed_messages(retained_turn_exchanges));
+        // Complete exchanges retained in the provider-only send headroom are
+        // paid by that headroom, not charged to Context's smaller pack window.
+        // The final assembler still checks the full request against the
+        // provider send limit using the actual (unreduced) turn frame.
+        let turn_frame_tokens_charged_to_pack =
+            turn_frame_tokens.saturating_sub(send_window.saturating_sub(pack_window));
         let model_budget = ModelBudget::compute(
             pack_window,
             output_reserve,
             self.assembler.system_prompt_tokens(),
             runtime_focus_frame_tokens,
-            turn_frame_tokens,
+            turn_frame_tokens_charged_to_pack,
             active_tools_tokens,
         );
         let materialize_started = std::time::Instant::now();
@@ -1074,15 +1118,17 @@ impl RuntimeActor {
             .unwrap_or_default();
         let foreground_resources = self.foreground_resource_hints(&turn_frame, &current_input);
         let protocol_bodies = self.eligible_protocol_bodies();
-        let visible_body_identities = crate::prompt::visible_body_identities_for_request(
+        let visible_body_identities = crate::prompt::visible_body_identities_for_request_keep(
             &turn_frame,
             base_progress_view.as_ref(),
             &protocol_bodies,
+            retained_turn_exchanges,
         );
-        let visible_body_windows = crate::prompt::visible_body_windows_for_request(
+        let visible_body_windows = crate::prompt::visible_body_windows_for_request_keep(
             &turn_frame,
             base_progress_view.as_ref(),
             &protocol_bodies,
+            retained_turn_exchanges,
         );
         let context_budget = model_budget.context_frame_budget;
         let query = ContextQuery {
@@ -1105,6 +1151,7 @@ impl RuntimeActor {
             turn_id,
             model_round,
             turn_frame,
+            retained_turn_exchanges,
             runtime_focus,
             task_view,
             base_progress_view,
@@ -1140,6 +1187,7 @@ impl RuntimeActor {
             turn_id,
             model_round,
             turn_frame,
+            retained_turn_exchanges,
             runtime_focus,
             task_view,
             mut base_progress_view,
@@ -1250,6 +1298,7 @@ impl RuntimeActor {
             packing_progress_view.as_ref(),
             &materialized,
             &turn_frame,
+            retained_turn_exchanges,
             surface_plan.specs().to_vec(),
             settlement_packing_requires_counterfactual(
                 settlement_candidate,
@@ -1370,6 +1419,7 @@ impl RuntimeActor {
                 packing_progress_view.as_ref(),
                 &materialized,
                 &turn_frame,
+                retained_turn_exchanges,
                 surface_plan.specs().to_vec(),
                 settlement_packing_requires_counterfactual(
                     settlement_candidate,
@@ -1409,6 +1459,7 @@ impl RuntimeActor {
                 packing_progress_view.as_ref(),
                 &materialized,
                 &turn_frame,
+                retained_turn_exchanges,
                 surface_plan.specs().to_vec(),
                 settlement_packing_requires_counterfactual(
                     settlement_candidate,
@@ -1563,6 +1614,7 @@ impl RuntimeActor {
                         base_progress_view.as_ref(),
                         &materialized,
                         &turn_frame,
+                        retained_turn_exchanges,
                         surface_plan.specs().to_vec(),
                     )
                     .0;
@@ -1688,7 +1740,7 @@ impl RuntimeActor {
                     .as_ref()
                     .map(agent_contracts::TurnCheckpointStats::from)
                     .unwrap_or_default(),
-                prompt_layers: crate::prompt::prompt_layer_costs_with_catalog(
+                prompt_layers: crate::prompt::prompt_layer_costs_with_catalog_keep(
                     &self.assembler,
                     runtime_focus.as_ref(),
                     task_view.as_ref(),
@@ -1698,6 +1750,7 @@ impl RuntimeActor {
                     &input.tool_schemas,
                     &self.services.tool_catalog(),
                     &self.eligible_protocol_bodies(),
+                    retained_turn_exchanges,
                 ),
             })
             .await
@@ -1837,6 +1890,7 @@ impl RuntimeActor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble_model_input(
         &self,
         focus: Option<&FocusState>,
@@ -1844,6 +1898,7 @@ impl RuntimeActor {
         progress: Option<&TaskProgressView>,
         history: &MaterializedContext,
         turn_frame: &TurnFrame,
+        retained_turn_exchanges: usize,
         tools: Vec<ToolSpec>,
     ) -> (ModelInput, crate::prompt::ProtocolBodyAssemblyStats) {
         // 当轮正文缓存的可回注行交给组装器。休眠
@@ -1851,7 +1906,7 @@ impl RuntimeActor {
         // 验证通过）时才恢复资格；是否回注由组装器再核对 checkpoint
         // 截断 + Fresh 事实一致。
         let protocol_bodies = self.eligible_protocol_bodies();
-        self.assembler.assemble_with_catalog_stats(
+        self.assembler.assemble_with_catalog_stats_keep(
             focus,
             task,
             progress,
@@ -1860,6 +1915,7 @@ impl RuntimeActor {
             tools,
             &self.services.tool_catalog(),
             &protocol_bodies,
+            retained_turn_exchanges,
         )
     }
 
@@ -1896,6 +1952,7 @@ impl RuntimeActor {
         packing_progress_view: Option<&TaskProgressView>,
         materialized: &MaterializedContext,
         turn_frame: &TurnFrame,
+        retained_turn_exchanges: usize,
         tool_specs: Vec<ToolSpec>,
         assemble_counterfactual: bool,
     ) -> FinalPackInputs {
@@ -1905,6 +1962,7 @@ impl RuntimeActor {
             progress_view,
             materialized,
             turn_frame,
+            retained_turn_exchanges,
             tool_specs.clone(),
         );
         let input_total = assembled_input_total(&input);
@@ -1915,6 +1973,7 @@ impl RuntimeActor {
                 packing_progress_view,
                 materialized,
                 turn_frame,
+                retained_turn_exchanges,
                 tool_specs,
             )
             .0

@@ -199,6 +199,7 @@ fn probe_candidate(candidate: &PythonCandidate) -> Result<String, String> {
         "import os,sys; sys.exit(3) if sys.version_info[0] != 3 else print({PROBE_MARKER:?} + os.path.abspath(sys.executable))"
     );
     let mut command = Command::new(&candidate.program);
+    crate::child_env::remove_provider_credentials(&mut command);
     command
         .args(&candidate.launcher_args)
         .args(["-I", "-c", &script])

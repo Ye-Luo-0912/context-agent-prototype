@@ -571,7 +571,8 @@ async fn run_test_command(command: &[String], timeout: Duration) -> PluginTestRe
         .current_dir(temp.path())
         .env_clear()
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
     for key in PLUGIN_TEST_ENV_KEYS {
         if let Ok(value) = std::env::var(key) {
             cmd.env(key, value);
@@ -626,10 +627,11 @@ async fn run_test_command(command: &[String], timeout: Duration) -> PluginTestRe
     let exit_code = status.and_then(|s| s.code());
     let timed_out = status.is_none();
     let ok = !timed_out && exit_code == Some(0);
-    let mut tail = clip_tail(&tail);
+    let mut tail = tail;
     if timed_out && !kill_ok {
         tail.push_str(" (the check process tree could not be killed)");
     }
+    let tail = clip_tail(&tail);
     PluginTestResult {
         id,
         ok,

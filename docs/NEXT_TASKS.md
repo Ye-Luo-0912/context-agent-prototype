@@ -1,8 +1,56 @@
 # 可执行任务队列
 
+**2026-09-30 当前选定本地切片已完成：TB57 schema 初始化竞态及随后暴露的 queue 延迟修复。** 五个冻结失败断言均确认是 ConnectError，四 worker 同建 `idx_items_order` 的原版反例重现为 1 成功/3 次 23505。事务 advisory lock 修复的冷/暖初始化、回滚释放和 MySQL-less 四 worker 启动通过；加锁后回放 17/18 暴露真实 queue p95 59.6 ms，既有索引边界查询修复后原 verifier 回放 18/18、queue p95 2.3 ms（预算 20 ms），六类边界语义通过。补丁和重建/验证脚本已交付，新增供应商调用 0。Stage A 沿用冻结记录，Stage B 16 项新执行；TB57 原正式 reward 0、13/18 和原用量保留。**TB58 未启动**；下一次完整实时迁移或模型评测须明确方式、身份、预算和有效 grant 窗口，不从本地回放派生新正式成绩。详见[本地修复回执](experiments/terminal-bench-pilot/TB57_SCHEMA_AND_QUEUE_LOCAL_REPAIR_20260930.md)。
+
+**2026-09-30 当前停点：TB53 因 usage unknown 且 Runtime 失败，不可比；TB54 未启动。** TB53 完成 13/14 上游请求结算，EasyCLI 用量库将第 14 次记为 408／600,013 ms，但 relay 未观测到符合安全重试条件的上游 408，仍保留 97,922 input／16,384 output 预约。Plus 额度影响未知，不重放；失败任务 reward 0 不算质量分。此结果触发原方案停点，TB54 的原授权不再适用。任何下一次真实供应商评测须采用新身份，并在检查此次 unknown 后取得新的明确授权。详见 [TB53 停止回执](experiments/terminal-bench-pilot/TB53_ABORTED_20260930.md)。
+
+**TB53 后续本地诊断已补齐，408 来源仍未证实。** EasyCLI 的 600,013 ms 与 relay 收据中的 600 秒上游超时接近；原 TB53 attempt 未保存上游 HTTP 状态或 Responses 终态事件，不能区分代理超时、上游 408 后的映射，或无终态事件 EOF。relay 现在只记录允许列表中的 `response.completed`／`response.failed`／`response.incomplete`，不记录错误正文，重试策略未变。Python relay/pilot 47 项中46通过、1平台跳过；尚无新供应商请求。
+
+**2026-09-29 当前停点：TB51 因跨 Core grant 的 edit.patch 被拒绝并在取消时留下 usage unknown；TB52 未启动。** TB51 没有评分，不能比较旧/新 ELF。35 次请求结算 input 973,951（含 cached 77,824）、output 151,534；第 36 次保留 input 196,515 / output 16,384，没有 EasyCLI usage 记录，真实 Plus 影响未知，未重放。Core 拒绝来自一个 `edit.patch files[]` 同时横跨 `api/` 和 `migrate.py` 两个单独授权范围；Core 要求一条 grant 覆盖整组，未执行写入，agent 没遵守 harness 已有的拆分指令。TB52 必须依方案停止，不沿用这次授权再开。旧 relay 写回执时漏报 active call 的 unknown 标记已本地修复，runner 比较现在也检查 usage 结算；relay/pilot Python 44 项中43通过、1平台跳过。新真实评测需要新身份和明确窗口，保留原 Core scopes，不把未知请求重试或清账。见 [TB51 停止回执](experiments/terminal-bench-pilot/TB51_ABORTED_20260929.md)与 [原两槽方案](experiments/terminal-bench-pilot/TB51_TB52_STANDARD_DYNAMIC_PROPOSAL_20260929.md)。
+
+**2026-09-30 TB53/TB54 单文件 patch 配对预检已归档，TB53 实跑结果见上方停点。** 本地严格 schema 合成回归与两份身份的 ABI/题包/relay 预检通过；TB53 运行后遇 usage unknown，TB54 未启动。原方案和静态材料见 [TB53/TB54 提案](experiments/terminal-bench-pilot/TB53_TB54_SINGLE_FILE_STANDARD_PROPOSAL_20260930.md)及[预检](experiments/terminal-bench-pilot/TB53_TB54_SINGLE_FILE_STANDARD_PREFLIGHT_20260930.json)。
+
+**2026-09-29 TB50 标准模式单请求已成功；TB48/TB49 状态保持停止。** 单次 Responses 请求显式带 `access_programs.cyber=standard`，返回 200/`response.completed`，用量 input 306 / cached 0 / output 16，2.25 秒结算，unknown=0；请求前 `/v1/models` 未列出 `gpt-6-luna`，但 TB48 已证明同模型直连此前成功18次。由于 TB50 未记录服务端返回的 access-program 元数据，这支持但未完全证明显式 standard 规避了 TB48 的 Daybreak Blue 校验。host relay 和 runner 现可选注入 standard，身份会固定该设置；合成路径检查后 Python relay/pilot 41 项中40通过、1平台跳过。TB50 没有运行 Harbor，不能算真实任务评测。TB51/TB52 两条 Dynamic 新身份（旧/新 ELF）现已完成零供应商预检，standard 注入、锁定题包、ABI、Core grant 摘要均通过。每槽上限56决策、70次上游尝试、8M input、440k output、1400工具尝试、8400秒；两槽合计112决策、140次尝试、16M input、880k output、2800工具尝试，账户侧沿用 Plus 会员额度上限，relay 无法强制该账号额度。候选 grant 是同权限与次数的10条规则，SHA-256 `0644d7b8628fa2478dce072d656ce726f5ba97b882cbff926d3a22b840584813`，到期2026-09-30 02:00（上海）；新身份需新的明确授权，任何 unknown/非可比即停止。方案见 [TB51/TB52 提案](experiments/terminal-bench-pilot/TB51_TB52_STANDARD_DYNAMIC_PROPOSAL_20260929.md)、[预检](experiments/terminal-bench-pilot/TB51_TB52_STANDARD_STATIC_PREFLIGHT_20260929.json)和 [TB50 回执](experiments/terminal-bench-pilot/TB50_DAYBREAK_STANDARD_ONESHOT_20260929.md)。
+
+**2026-09-29 当前停点：TB48 第 19 次后端 Daybreak Blue 访问校验 HTTP 503、用量 unknown，TB49 未启动。** EasyCLI 转发日志只读核查得到 `Unable to verify Daybreak Blue access. Please try again.`；本地 Codex 凭证仍 active，失败前 Plus 用量信号 primary 5%／secondary 7%，且请求没有显式 `access_programs`。具体是暂时校验故障、账号资格/工作区配置，还是该 OAuth 转发路径的缺省选路，尚未证实；用量库 0:0 也不证明未扣额。relay 保留 input 115,038 / output 16,384 预约并冻结，无 Core deny，Runtime exit 1，Harbor reward 0、无 CTRF，槽位不可比；用户批准的“非可比或 unknown 即停止”已经触发。下一步核对该账号在官方界面的 Daybreak 状态和预期标准/Blue 模式；确认访问路径前不盲目添加 503 自动重试。若再做真实请求，须先确定未知用量与 503 政策、建立新试验身份并取得新授权。TB46 的本地 `ValueError` 与本次后端 503 分开记录，均未重放。见 [TB48 回执](experiments/terminal-bench-pilot/TB48_ABORTED_20260929.md)。
+
+**2026-09-29 TB48/TB49 开窗前方案（历史状态）。** 用户曾另行批准越过 TB46 停点，先运行旧 ELF TB48 Dynamic、只有该槽可比才运行新 ELF TB49；两份身份静态预检和镜像 ABI 均通过。TB48 的 503/unknown 触发了相同停止规则，TB49 没有执行。原上限与身份见 [限定方案](experiments/terminal-bench-pilot/TB48_TB49_DYNAMIC_PROPOSAL_20260929.md)，实际结果见上方停点。
+
+**2026-09-29 当前停点：TB46 Dynamic 第 56 次上游响应用量 unknown，TB47 依已批准协议未启动。** relay 保留 input 203,462 / output 16,384 预约并冻结，Runtime `provider_transport` exit 1；官方 reward 0、CTRF 4/18 不能作为可比成绩。旧收据只有 `ValueError` 类别，无法确定具体流故障位置，也无法确定该次 Plus quota 消耗。已为后续窗口增加不含正文的本地错误类别与字节计数、补畸形 SSE 负例（Python 44 项中 43 通过、1 平台跳过），但 TB46 原始失败不能被回填或重放。下一步先核对本地流兼容/边界反例及新诊断的静态预检；若需新的真实窗口，必须用新身份并重新明确越过这次“非可比即停止”停点的授权。详见 [TB46 中止回执](experiments/terminal-bench-pilot/TB46_ABORTED_20260929.md)。
+
+**2026-09-29 TB46/TB47 开窗前本地切片已完成（历史计划）。** relay 未知用量围栏、类型化预算收尾摘要、目标镜像 ELF 启动门和 Context headroom 额度修正已实施并定向验收，开窗前新增供应商调用 0。两份 56 决策配对当时均通过锁定镜像 ABI 与静态预检；用户之后批准了至 2026-09-30 02:00 的原 10 条 grant，TB46 首槽执行结果见上方停点。计划与原始静态身份见 [TB46/TB47 本地方案](experiments/terminal-bench-pilot/TB46_TB47_LOCAL_REPAIR_AND_PLAN_20260929.md)。Warm/闭合工具作用域错误的自动召回仍需单独设计，不从 TB45 第 18→54 轮探针正文直接推断 Context 丢失。
+
+**2026-09-29 用户选定的进一步评估已交付；建议下一实施片为本地 unknown 围栏修复与终止原因报告。** localhost 已复现 `408→精确重试成功→后续响应缺 usage→新请求仍被放行`，需让第四次请求在 relay 返回 423、保留原预约，补串联回归；不得用之前的 recovered 状态放行新的未知用量。两槽第 56 轮均由 `decision_budget_finalization` 收尾，应从类型化事件进入摘要。随后固化目标镜像 ELF 预检，再用 Dynamic 第 18→54 轮重复权限失败调查阻塞事实的最终可见性。评估证据、应用失败归因、读取覆盖和单变量复测方案见 [TB45 评估](experiments/terminal-bench-pilot/TB45_ASSESSMENT_20260929.md)；本轮未修改生产实现或冻结候选，未开新模型窗口。
+
+**2026-09-29 当前选定切片已完成：408 有界重试、ABI 修复、TB45 配对测评。** 重试实现只对响应头前的上游 HTTP 408放行一次完全相同请求体，保留原未知预算预约；部分流断开、二次失败等仍冻结。Python 回归 36 项（35 通过、1 平台跳过）、Compose timeout 与 Provider 状态分类测试各 1/1、Debian 12 容器内 ELF `--help` 通过；TB45 Dynamic/Rolling 各 56/56，112/112 upstream 完成、unknown=0、Core deny=0、reward 均为 0，Rolling verifier 15/18。TB45 没有遇到 HTTP 408，故不能声称真实重试已触发；本功能仍需未来自然出现 408 时验证或另行设计零供应商端到端注入。TB44 的 ABI 启动失败和 TB45 的完整回执见 [TB44/TB45](experiments/terminal-bench-pilot/TB44_TB45_EASYCLI_RETRY_20260929.md)；实现及限制见 [408 重试回执](experiments/terminal-bench-pilot/EASYCLI_408_RETRY_20260929.md)。此前批准的 Core grant 窗口仅到 2026-09-29 13:00；后续真实窗口须在授权有效期内另行明确批准，TB43 usage unknown 请求不重放。
+
+**2026-09-28 当前选定任务：先恢复 Pinaic API 权限，再启动独立 TB 窗口。** 新 key 的 OpenAI 模型列表 GET 与 Anthropic Messages POST（`x-api-key` 和 Bearer 两种认证）都返回 `permission_error`；此前三次 Responses POST 也返回403。价目为用户提供并已接入成本账本，但这些失败请求的计费状态未知。需 Pinaic 账户侧检查 key scope、账号状态、来源/IP 限制和模型/API 权限；确认可用后建立全新 evaluation identity。无 Harbor job 或成绩；此前 32 项定向回归中31通过、1项平台专属跳过。详见 [TB37 回执](experiments/terminal-bench-pilot/TB37_PINAIC_GPT6_LUNA_20260927.md)与 [Anthropic 诊断](experiments/terminal-bench-pilot/PINAIC_MESSAGES_DIAGNOSTIC_20260928.md)。
+
+**2026-09-26 TB32 已结束。** MiMo 专用有界流补 id 路径的本地回归通过，但 TB32 真实补齐次数 0；Dynamic 因 8192 单次输出上限被截断，未形成可比配对。后续 TB33 另名试验见 [TB32 回执](experiments/terminal-bench-pilot/TB32_MIMO_20260926.md)。
+
+**2026-09-26 TB31 停止点：供应商流式工具身份缺失。** TB31 真实验证 600 秒有限请求超时可结算 147.5 秒及 241.8 秒响应，但 Dynamic 第 140 次流式工具调用缺失 call id，Runtime 按协议失败、无 CTRF；Rolling 未启动。凭据扫描、已授权临时题包清理和回执均已收口。后续 MiMo 专用 host relay 的有界兼容变换只补齐流式关联 id，不在 Core/Runtime 中猜测 effect 身份；TB31 的无成绩和未知用量保持不变。详见 [TB29/TB30 回执](experiments/terminal-bench-pilot/TB29_TB30_MIMO_20260926.md)与 [TB31 回执](experiments/terminal-bench-pilot/TB31_MIMO_20260926.md)。
+
+**2026-09-24 当前选定下一任务：供应商未知用量诊断后再完成 TB 正式配对。** TB14 的固定层 `input_budget` 根因已修，本地行为验证和 Debian12 ELF 通过；TB17 是有效的 64 决策短配对（Dynamic 12/18、Rolling 4/18，均 reward 0），见 [TB14–TB16 回执](experiments/terminal-bench-pilot/TB14_TB16_BUDGET_REPAIR_20260924.md) 和 [TB17–TB18 回执](experiments/terminal-bench-pilot/TB17_TB18_LIVE_20260924.md)。TB18 用完整 400 决策额度开窗，但 Dynamic 第 312 次遇到上游 HTTP 错误且无 usage，Runtime 退出，runner 正确不启动 Rolling；311 次结算之外的一次可能计费，不能称完整成绩或硬费用封顶。新 relay 只增数值状态码与本地冻结原因，已经本地回归，尚无实供应商证据。下一次需新协议身份与当日价格、独立题包/镜像/ELF/relay 摘要、同等有限 Core grant；先分清新上游状态是否可继续，未知用量不自动重试，不把先前失败窗延长。DeepSeek 未给 wire 字节到计费 token 的严格上界；旧密钥账户侧轮换仍是外部事项。
+
+**2026-09-24 TB10 本地优化已收口。** 授权耗尽类型化反馈/有界收尾、400/64 准入拒绝、发送余量内保留更多完整历史以及长回合 Context 增量摄入均已实施；范围和回归见 [TB10 回执](experiments/terminal-bench-pilot/TB10_LOCAL_OPTIMIZATION_20260924.md)。TB9 旧根因与原始失败保留在 [因果核查](experiments/terminal-bench-pilot/TB9_CAUSAL_AUDIT_20260924.md)。
+
+**2026-09-23 选定切片更新：TB 根因修复、预算保护和 B 阶段 token-bounded 复测已本地收口。** TB9 Dynamic→Rolling 各 400 决策；Dynamic 4/18、Rolling 因 requirements 安装失败无 CTRF，reward 均 0。Runtime、凭据隔离、relay 累计 token 预约和预检器均已验证；旧密钥账户侧轮换尚未执行。题包临时缓存已删除，job/receipt、fault variant 和 Docker 镜像保留。当前不把未定价的 token-bounded 窗口写成费用或完整官方 acceptance；范围和证据见 [TB9 回执](experiments/terminal-bench-pilot/TB9_BOUNDED_B_20260923.md)。
+
 有效范围见 [CURRENT.md](CURRENT.md)。本文件只保留本阶段仍需动作的任务；历史缺陷描述、验证日志和已关闭细节只链接到原回执，不复制正文。任务依据：[下一阶段审查](reviews/2026-09-14-next-stage-review-4aaa8bea/REVIEW.md)（T 编号）＋[续审](reviews/2026-09-15-continuation-review-258eb4eb/REVIEW.md)（S 编号；R1–R6 为其发现；T1–T7、S1–S4 已关闭）＋[4f6eb7ff 审查](reviews/2026-09-16-review-4f6eb7ff/REVIEW.md)（V 编号，其 NEXT_ACTIONS 与覆盖表见同目录）＋[d92564bc 审查](reviews/2026-09-16-review-d92564bc/REVIEW.md)（U 编号，其 NEXT_ACTIONS 与覆盖表见同目录）。
 
 ## 接手规则
+
+**2026-09-22 当前选定下一任务 TB：外部高难度小样本评测；TB-4-B bounded pilot 已完成，当前停止扩张。**
+题目、两组条件、预算、无效结果口径及实施顺序见
+[TB 方案](experiments/terminal-bench-pilot/PLAN.md)；题源固定在
+[selection.lock.json](experiments/terminal-bench-pilot/selection.lock.json)。TB-1/TB-2 完成：
+Harbor adapter、外置 Runtime state dir、Windows/WSL 预检和定向回归均已落地；
+WSL 用户级 Harbor 0.23.0、Docker 29.1.3 已安装；WAL、MVCC、session-window、payments、rs-archive、live
+的 oracle/no-op 和分离裁判链路均已实测。A/B 阶段十二个 bounded pilot reward 全为 0；
+distributed-dedup 替补未启动。所有槽位
+最多 20 个模型回合，不能当作方案中 240/400 回合的完整官方评测，也不能从单次槽位推断 Rolling 优于 Dynamic。
+详见 [TB-2 回执](experiments/terminal-bench-pilot/TB2_RECEIPT_20260921.md)。
+六题采用官方裁判；不得从旧 V5 记录继承预算或靠修改题面、资源和裁判获取通过。
 
 **2026-09-21 V5 根因审查（`7224a7b`）的顺序 1–5 已在本地关闭**：合同与裁判统一为受控静止切点下的
 `mode=ro` 读取、成员上限按计算闭包由 256 调整为 1024、裁判补齐 generation/outbox/跨 scope/journal/字节映射不变量、

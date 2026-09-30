@@ -1,3 +1,4 @@
+mod child_env;
 mod host_policies;
 mod proof_runner;
 mod python;

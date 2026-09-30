@@ -1571,6 +1571,17 @@ impl RuntimeActor {
                     settled_attribution.as_ref(),
                 );
                 self.observe_completion_repair_action(&output);
+                if output.failure_class() == Some(agent_contracts::ToolFailureClass::ApprovalDenied)
+                    && let Some(reason) = output.metadata.get("approval_denial")
+                    && let Ok(agent_contracts::ApprovalDenialReason::GrantExhausted {
+                        grant_id,
+                        ..
+                    }) = serde_json::from_value(reason.clone())
+                    && let Some(turn) = self.state.turn.as_mut()
+                {
+                    let count = turn.exhausted_grant_denials.entry(grant_id).or_default();
+                    *count = count.saturating_add(1);
+                }
                 // remember deterministic edit refusals so an
                 // identical retry can be refused without dispatch.
                 if let Some(digest) = completion.argument_digest

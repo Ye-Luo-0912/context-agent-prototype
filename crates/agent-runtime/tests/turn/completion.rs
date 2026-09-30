@@ -2671,6 +2671,160 @@ async fn repair_actions_without_typed_progress_cannot_loop_forever() {
     instance.shutdown().await.unwrap();
 }
 
+#[derive(Debug)]
+struct WorkAfterRefusalModel {
+    rounds: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ModelTransport for WorkAfterRefusalModel {
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::default()
+    }
+
+    async fn complete(&self, request: ModelRequest) -> AgentResult<ModelOutput> {
+        let round = self.rounds.fetch_add(1, Ordering::SeqCst);
+        let tool_calls = if request.tools.is_empty() || round > 8 {
+            Vec::new()
+        } else if round == 0 {
+            vec![ToolCall {
+                id: "premature-completion".into(),
+                name: "task.complete".into(),
+                arguments: json!({"summary": "premature", "artifacts": []}),
+            }]
+        } else {
+            vec![ToolCall {
+                id: format!("read-{round}"),
+                name: "fs.read".into(),
+                arguments: json!({"path": format!("module-{round}.txt")}),
+            }]
+        };
+        Ok(ModelOutput {
+            content: if tool_calls.is_empty() {
+                "work remains for operator review".into()
+            } else {
+                String::new()
+            },
+            tool_calls,
+            usage: Default::default(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WorkAfterRefusalTools {
+    root: std::path::PathBuf,
+    reads: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl ToolDispatcher for WorkAfterRefusalTools {
+    fn specs(&self) -> Vec<ToolSpec> {
+        let mut specs = CompletionToolDispatcher { workspace: None }.specs();
+        specs.push(ToolSpec {
+            name: "fs.read".into(),
+            description: "read a fixture source file".into(),
+            input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
+            risk: ToolRisk::ReadOnly,
+            output_budget: None,
+            roles: Vec::new(),
+        });
+        specs
+    }
+
+    async fn execute(&self, request: ToolExecutionRequest) -> AgentResult<ToolOutcome> {
+        if request.call.name != "fs.read" {
+            return CompletionToolDispatcher { workspace: None }
+                .execute(request)
+                .await;
+        }
+        let path = request.call.arguments["path"].as_str().unwrap();
+        let content = tokio::fs::read_to_string(self.root.join(path))
+            .await
+            .unwrap();
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutcome::Value(ToolOutput {
+            call_id: request.call.id,
+            tool_name: request.call.name,
+            ok: true,
+            summary: format!("read {path}"),
+            model_content: content,
+            artifact_ref: None,
+            metadata: json!({"path": path}),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn ordinary_work_after_one_completion_refusal_retains_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 1..=8 {
+        tokio::fs::write(
+            dir.path().join(format!("module-{index}.txt")),
+            format!("source module {index}"),
+        )
+        .await
+        .unwrap();
+    }
+    let tools = Arc::new(WorkAfterRefusalTools {
+        root: dir.path().into(),
+        reads: AtomicUsize::new(0),
+    });
+    let services = RuntimeServices::new(
+        CoreAuthorityConfig::default(),
+        Arc::new(TestContextEngine),
+        Arc::new(WorkAfterRefusalModel {
+            rounds: AtomicUsize::new(0),
+        }),
+        tools.clone(),
+        Arc::new(PolicyApprovalGate::read_only()),
+        None,
+    );
+    let mut host = ModuleHost::new();
+    host.start().await.unwrap();
+    let instance = RuntimeInstance::spawn(host, services);
+    let handle = instance.handle();
+    let mut events = handle.subscribe();
+    handle.start().await.unwrap();
+    handle
+        .set_focus("implement a multi-file change".into())
+        .await
+        .unwrap();
+    handle
+        .user_message("read the source files and work on the change".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let event = events.recv().await.unwrap().event;
+            assert!(!matches!(event, RuntimeEvent::TaskCompleted { .. }));
+            if matches!(event, RuntimeEvent::TurnCompleted) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let checkpoint = instance.checkpoint().await.unwrap();
+    instance.shutdown().await.unwrap();
+    assert_eq!(
+        tools.reads.load(Ordering::SeqCst),
+        8,
+        "ordinary source reads must survive the six-step completion-repair limit"
+    );
+    let task = checkpoint
+        .tasks
+        .tasks
+        .iter()
+        .find(|task| Some(task.id) == checkpoint.tasks.active)
+        .unwrap();
+    let repair = task.resume.completion_repair.as_ref().unwrap();
+    assert_eq!(repair.refusal_count, 1);
+    assert_eq!(repair.no_progress_steps, 1);
+    assert!(!repair.terminal);
+    assert!(checkpoint.tasks.completed.is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // Runtime-owned proof-refresh transaction: a task whose only remaining
 // completion blockers are proof-shaped (`VerificationNotCurrent` /

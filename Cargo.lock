@@ -231,6 +231,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tool-runtime",
  "tracing",
 ]
 

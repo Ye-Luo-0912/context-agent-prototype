@@ -331,7 +331,10 @@ async fn real_main() -> anyhow::Result<()> {
                 (provider, banner, Some(digest), Some(endpoint))
             }
         };
-    let workspace = Workspace::open(&root).await?;
+    let workspace = match args.state_dir.as_deref() {
+        Some(state_dir) => Workspace::open_with_state_dir(&root, state_dir).await?,
+        None => Workspace::open(&root).await?,
+    };
     // N04: the composition root's stable cache-routing namespace (host
     // workspace + configured endpoint). Demo/mock compositions stay
     // keyless.
@@ -429,14 +432,22 @@ async fn real_main() -> anyhow::Result<()> {
     let checkpoint_dir = workspace.state_dir().join("checkpoints");
     // Unix host-death containment is armed here: this binary's main
     // dispatches on the watchdog marker, so re-entering it is safe.
-    let base_tools = Arc::new(
-        BuiltinToolDispatcher::with_config_recipes_and_host_death_watchdog(
-            workspace.clone(),
-            Default::default(),
-            (*verification_recipes).clone(),
-            true,
-        ),
+    let disable_shell_exec = match std::env::var("AGENT_DISABLE_SHELL_EXEC") {
+        Ok(value) if value == "1" => true,
+        Ok(value) if value == "0" => false,
+        Err(std::env::VarError::NotPresent) => false,
+        _ => anyhow::bail!("AGENT_DISABLE_SHELL_EXEC must be 0 or 1"),
+    };
+    let mut builtin = BuiltinToolDispatcher::with_config_recipes_and_host_death_watchdog(
+        workspace.clone(),
+        Default::default(),
+        (*verification_recipes).clone(),
+        true,
     );
+    if disable_shell_exec {
+        builtin = builtin.without_optional_tool("shell.exec")?;
+    }
+    let base_tools = Arc::new(builtin);
     let artifact_store = Arc::new(workspace.clone());
     let output_broker = Arc::new(WorkspaceOutputBroker::new(workspace.clone().into()));
     // 交互运行默认启用持久预留屏障：路径落在状态目录的权威层，
@@ -508,6 +519,9 @@ async fn real_main() -> anyhow::Result<()> {
 
     if args.is_headless() {
         eprintln!("{serving_banner}");
+        if let Some(task_goal) = args.task_goal.clone() {
+            composed.handle().set_focus(task_goal).await?;
+        }
         let action = if args.continue_task {
             cli::HeadlessAction::Continue
         } else {
